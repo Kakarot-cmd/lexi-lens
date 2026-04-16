@@ -39,3 +39,8 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+supabase.exe
+*.exe
+node_modules/
+.env
