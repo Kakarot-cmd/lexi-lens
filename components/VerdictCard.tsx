@@ -21,13 +21,16 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { EvaluationResult, EvaluateStatus } from "../hooks/useLexiEvaluate";
+import type { MasteryUpdateResult } from "../services/MasteryService";
 
 interface VerdictCardProps {
-  status:     Extract<EvaluateStatus, "match" | "no-match" | "error">;
-  result?:    EvaluationResult | null;
-  error?:     string | null;
-  onContinue: () => void;
-  onTryAgain: () => void;
+  status:         Extract<EvaluateStatus, "match" | "no-match" | "error">;
+  result?:        EvaluationResult | null;
+  error?:         string | null;
+  /** v1.5 — pass masteryResult from useLexiEvaluate; shows "Word Mastered!" banner */
+  masteryResult?: MasteryUpdateResult | null;
+  onContinue:     () => void;
+  onTryAgain:     () => void;
 }
 
 const { height: SCREEN_H } = Dimensions.get("window");
@@ -74,21 +77,30 @@ function PropertyBadge({ word, passes, reasoning }: {
 // ─── XP counter ───────────────────────────────────────────────────────────────
 
 function XPCounter({ xp }: { xp: number }) {
-  const countAnim = useRef(new Animated.Value(0)).current;
+  const [display, setDisplay] = React.useState(0);
   const scaleAnim = useRef(new Animated.Value(0.6)).current;
 
   useEffect(() => {
-    Animated.parallel([
-      Animated.spring(scaleAnim, { toValue: 1, useNativeDriver: true, tension: 80, friction: 6 }),
-      Animated.timing(countAnim, { toValue: xp, duration: 900, useNativeDriver: false }),
-    ]).start();
+    Animated.spring(scaleAnim, {
+      toValue: 1, useNativeDriver: true, tension: 80, friction: 6,
+    }).start();
+
+    // Integer counter — no decimal flicker
+    const steps = 20;
+    const interval = 900 / steps;
+    let current = 0;
+    const timer = setInterval(() => {
+      current += 1;
+      setDisplay(Math.round((current / steps) * xp));
+      if (current >= steps) clearInterval(timer);
+    }, interval);
+
+    return () => clearInterval(timer);
   }, [xp]);
 
   return (
     <Animated.View style={[styles.xpBadge, { transform: [{ scale: scaleAnim }] }]}>
-      <Animated.Text style={styles.xpNum}>
-        {countAnim.interpolate({ inputRange: [0, xp || 1], outputRange: ["0", String(xp)] })}
-      </Animated.Text>
+      <Text style={styles.xpNum}>{display}</Text>
       <Text style={styles.xpLbl}>XP</Text>
     </Animated.View>
   );
@@ -96,7 +108,7 @@ function XPCounter({ xp }: { xp: number }) {
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export function VerdictCard({ status, result, error, onContinue, onTryAgain }: VerdictCardProps) {
+export function VerdictCard({ status, result, error, masteryResult, onContinue, onTryAgain }: VerdictCardProps) {
   const insets   = useSafeAreaInsets();
   const slideAnim = useRef(new Animated.Value(CARD_H)).current;
 
@@ -140,6 +152,11 @@ export function VerdictCard({ status, result, error, onContinue, onTryAgain }: V
                 <Text style={styles.feedbackText}>
                   Something got in the way of the magic. Point at the object again and try!
                 </Text>
+				{!!error && (
+    <Text style={{ color: "#fca5a5", fontSize: 11, marginTop: 8 }}>
+      {error}
+    </Text>
+  )}
               </View>
               <TouchableOpacity style={styles.retryBtn} onPress={onTryAgain}>
                 <Text style={styles.retryBtnText}>Try again</Text>
@@ -166,8 +183,24 @@ export function VerdictCard({ status, result, error, onContinue, onTryAgain }: V
 
               {/* XP badge — only shown when something found */}
               {somethingFound && totalXpEarned > 0 && (
-                <XPCounter xp={totalXpEarned} />
-              )}
+  <>
+    {passingProps.length >= 2 && (
+      <View style={{
+        alignSelf: "center",
+        backgroundColor: "#7c3aed",
+        borderRadius: 20,
+        paddingHorizontal: 14,
+        paddingVertical: 4,
+        marginBottom: 6,
+      }}>
+        <Text style={{ color: "#fff", fontSize: 13, fontWeight: "700" }}>
+          {passingProps.length === 2 ? "1.5× bonus!" : "2× bonus!"}
+        </Text>
+      </View>
+    )}
+    <XPCounter xp={totalXpEarned} />
+  </>
+)}
 
               {/* Claude's child-friendly feedback */}
               <View style={styles.feedbackBox}>
@@ -199,6 +232,21 @@ export function VerdictCard({ status, result, error, onContinue, onTryAgain }: V
                 <View style={styles.hintBox}>
                   <Text style={styles.hintLabel}>Hint from the tome</Text>
                   <Text style={styles.hintText}>{result.nudgeHint}</Text>
+                </View>
+              )}
+
+              {/* v1.5 — Word Mastered! banner */}
+              {masteryResult?.justRetired && (
+                <View style={styles.masteryBanner}>
+                  <Text style={styles.masteryIcon}>🌟</Text>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.masteryTitle}>Word Mastered!</Text>
+                    <Text style={styles.masteryBody}>
+                      {masteryResult.synonym
+                        ? `You've truly learned "${masteryResult.word}". Your next challenge: "${masteryResult.synonym.synonym}"!`
+                        : `You've truly learned "${masteryResult.word}". Amazing work, Scholar!`}
+                    </Text>
+                  </View>
                 </View>
               )}
 
@@ -308,4 +356,20 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: P.cardBorder,
   },
   retryBtnText: { fontSize: 15, fontWeight: "600", color: P.textMuted },
+
+  // v1.5 — Mastery banner
+  masteryBanner: {
+    flexDirection:   "row",
+    alignItems:      "center",
+    gap:             12,
+    backgroundColor: "#1a1200",
+    borderColor:     "#f59e0b",
+    borderWidth:     1.5,
+    borderRadius:    12,
+    padding:         14,
+    marginTop:       12,
+  },
+  masteryIcon:  { fontSize: 28 },
+  masteryTitle: { fontSize: 14, fontWeight: "700", color: "#fbbf24", marginBottom: 2 },
+  masteryBody:  { fontSize: 13, color: "#fde68a", lineHeight: 18 },
 });

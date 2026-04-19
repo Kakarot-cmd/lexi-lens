@@ -2,19 +2,26 @@
  * ParentDashboard.tsx
  * Lexi-Lens — parent-facing screen.
  *
+ * v2.3 additions:
+ *   • Streak stat card in stats grid (current streak + "2× XP" badge at ≥7 days)
+ *   • StreakHeatmap section — 28-day calendar showing daily quest completions
+ *   • Notification toggle — schedules / cancels daily push reminder at 6 PM
+ *   • loadStreakData() fetched alongside dashboard data
+ *
  * Deliberately different aesthetic from the child's dark dungeon UI:
  * warm cream/amber tones, illuminated-manuscript feel, no gamification pressure.
- * Parents see what their child is actually learning, not just XP numbers.
  *
  * Sections:
- *   1. Child selector (if multiple children under the account)
- *   2. Stats row — level, words mastered, quests completed, streak
- *   3. Word Tome — searchable list of every vocabulary word the child has used
- *   4. Recent activity — last 5 scan attempts with outcomes
+ *   1. Child selector (if multiple children)
+ *   2. Child profile + XP bar
+ *   3. Stats row — level, words mastered, quests done, 🔥 streak
+ *   4. Word Tome — searchable list
+ *   5. Streak Heatmap — 28-day calendar
+ *   6. Recent quests
+ *   7. Notification preference toggle
  *
  * Dependencies:
- *   npx expo install @supabase/supabase-js
- *   npx expo install expo-haptics
+ *   npx expo install expo-notifications   (for notification toggle)
  */
 
 import React, { useState, useEffect, useCallback } from "react";
@@ -27,11 +34,12 @@ import {
   StyleSheet,
   ActivityIndicator,
   RefreshControl,
-  FlatList,
+  Switch,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
+import { StreakHeatmap } from "../components/StreakHeatmap";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -55,12 +63,17 @@ interface WordTomeEntry {
 }
 
 interface QuestCompletion {
-  id:           string;
-  quest_id:     string;
-  total_xp:     number;
+  id:            string;
+  quest_id:      string;
+  total_xp:      number;
   attempt_count: number;
-  completed_at: string;
+  completed_at:  string;
   quests: { name: string; enemy_emoji: string };
+}
+
+interface StreakInfo {
+  currentStreak: number;
+  longestStreak: number;
 }
 
 interface DashboardData {
@@ -73,22 +86,25 @@ interface DashboardData {
 // ─── Palette ──────────────────────────────────────────────────────────────────
 
 const P = {
-  cream:      "#fdf8f0",
-  parchment:  "#f5edda",
-  warmBorder: "#e8d5b0",
-  inkBrown:   "#3d2a0f",
-  inkMid:     "#6b4c1e",
-  inkLight:   "#9c7540",
-  inkFaint:   "#c4a97a",
-  amberAccent:"#d97706",
-  amberLight: "#fef3c7",
-  amberBorder:"#fde68a",
-  greenBadge: "#166534",
-  greenBg:    "#f0fdf4",
-  greenBorder:"#86efac",
+  cream:       "#fdf8f0",
+  parchment:   "#f5edda",
+  warmBorder:  "#e8d5b0",
+  inkBrown:    "#3d2a0f",
+  inkMid:      "#6b4c1e",
+  inkLight:    "#9c7540",
+  inkFaint:    "#c4a97a",
+  amberAccent: "#d97706",
+  amberLight:  "#fef3c7",
+  amberBorder: "#fde68a",
+  greenBadge:  "#166534",
+  greenBg:     "#f0fdf4",
+  greenBorder: "#86efac",
   purpleAccent:"#7c3aed",
   purpleLight: "#f5f3ff",
   purpleBorder:"#ddd6fe",
+  fire:        "#f97316",
+  fireBg:      "#fff7ed",
+  fireBorder:  "#fed7aa",
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -132,9 +148,9 @@ function ChildTab({
   selected,
   onPress,
 }: {
-  child: ChildProfile;
+  child:    ChildProfile;
   selected: boolean;
-  onPress: () => void;
+  onPress:  () => void;
 }) {
   return (
     <TouchableOpacity
@@ -153,10 +169,39 @@ function ChildTab({
 
 // ─── Stat card ────────────────────────────────────────────────────────────────
 
-function StatCard({ value, label, accent = false }: { value: string | number; label: string; accent?: boolean }) {
+function StatCard({
+  value,
+  label,
+  accent = false,
+  fire = false,
+  badge,
+}: {
+  value:   string | number;
+  label:   string;
+  accent?: boolean;
+  fire?:   boolean;
+  badge?:  string;           // v2.3 — e.g. "2× XP"
+}) {
   return (
-    <View style={[styles.statCard, accent && styles.statCardAccent]}>
-      <Text style={[styles.statValue, accent && styles.statValueAccent]}>{value}</Text>
+    <View
+      style={[
+        styles.statCard,
+        accent && styles.statCardAccent,
+        fire   && styles.statCardFire,
+      ]}
+    >
+      {badge && (
+        <View style={styles.statBadge}>
+          <Text style={styles.statBadgeText}>{badge}</Text>
+        </View>
+      )}
+      <Text style={[
+        styles.statValue,
+        accent && styles.statValueAccent,
+        fire   && styles.statValueFire,
+      ]}>
+        {value}
+      </Text>
       <Text style={styles.statLabel}>{label}</Text>
     </View>
   );
@@ -229,17 +274,21 @@ function QuestCard({ completion }: { completion: QuestCompletion }) {
 export function ParentDashboard() {
   const insets = useSafeAreaInsets();
 
-  const [children, setChildren]         = useState<ChildProfile[]>([]);
-  const [selectedId, setSelectedId]     = useState<string | null>(null);
-  const [dashboard, setDashboard]       = useState<DashboardData | null>(null);
-  const [loading, setLoading]           = useState(true);
-  const [refreshing, setRefreshing]     = useState(false);
-  const [search, setSearch]             = useState("");
-  const [error, setError]               = useState<string | null>(null);
+  const [children, setChildren]     = useState<ChildProfile[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [dashboard, setDashboard]   = useState<DashboardData | null>(null);
+  const [loading, setLoading]       = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [search, setSearch]         = useState("");
+  const [error, setError]           = useState<string | null>(null);
+
+  // v2.3 — streak + notification state
+  const [streakInfo, setStreakInfo]       = useState<StreakInfo>({ currentStreak: 0, longestStreak: 0 });
+  const [notifEnabled, setNotifEnabled]   = useState(false);
 
   const selectedChild = dashboard?.child ?? null;
 
-  // ── Fetch children list ─────────────────────────────────────
+  // ── Fetch children list ─────────────────────────────────────────────────────
   useEffect(() => {
     async function fetchChildren() {
       const { data, error } = await supabase
@@ -254,7 +303,25 @@ export function ParentDashboard() {
     fetchChildren();
   }, []);
 
-  // ── Fetch dashboard data for selected child ─────────────────
+  // ── Fetch streak info for selected child ────────────────────────────────────
+  const fetchStreakData = useCallback(async (childId: string) => {
+    const { data } = await supabase
+      .from("child_streaks")
+      .select("current_streak, longest_streak")
+      .eq("child_id", childId)
+      .maybeSingle();
+
+    if (data) {
+      setStreakInfo({
+        currentStreak: data.current_streak ?? 0,
+        longestStreak: data.longest_streak ?? 0,
+      });
+    } else {
+      setStreakInfo({ currentStreak: 0, longestStreak: 0 });
+    }
+  }, []);
+
+  // ── Fetch full dashboard for selected child ─────────────────────────────────
   const fetchDashboard = useCallback(async (childId: string) => {
     setLoading(true);
     setError(null);
@@ -295,15 +362,21 @@ export function ParentDashboard() {
   }, []);
 
   useEffect(() => {
-    if (selectedId) fetchDashboard(selectedId);
-  }, [selectedId, fetchDashboard]);
+    if (selectedId) {
+      fetchDashboard(selectedId);
+      fetchStreakData(selectedId);
+    }
+  }, [selectedId, fetchDashboard, fetchStreakData]);
 
   const onRefresh = () => {
     setRefreshing(true);
-    if (selectedId) fetchDashboard(selectedId);
+    if (selectedId) {
+      fetchDashboard(selectedId);
+      fetchStreakData(selectedId);
+    }
   };
 
-  // ── Filter Word Tome by search ──────────────────────────────
+  // ── Filter Word Tome ────────────────────────────────────────────────────────
   const filteredTome = (dashboard?.wordTome ?? []).filter(
     (w) =>
       search.trim() === "" ||
@@ -311,7 +384,24 @@ export function ParentDashboard() {
       w.exemplar_object.toLowerCase().includes(search.toLowerCase())
   );
 
-  // ── Render ──────────────────────────────────────────────────
+  // ── Notification toggle handler ─────────────────────────────────────────────
+  // Dynamic import — avoids loading expo-notifications native module at startup
+  const handleNotifToggle = async (val: boolean) => {
+    setNotifEnabled(val);
+    try {
+      if (val) {
+        const { scheduleDailyQuestReminder } = await import("../lib/notifications");
+        await scheduleDailyQuestReminder(18, 0, selectedChild?.display_name ?? "");
+      } else {
+        const { cancelDailyReminder } = await import("../lib/notifications");
+        await cancelDailyReminder();
+      }
+    } catch (e) {
+      console.warn("[notifications] toggle failed:", e);
+    }
+  };
+
+  // ── Render ──────────────────────────────────────────────────────────────────
   if (error) {
     return (
       <View style={[styles.center, { paddingTop: insets.top }]}>
@@ -320,6 +410,8 @@ export function ParentDashboard() {
       </View>
     );
   }
+
+  const has2xXp = streakInfo.currentStreak >= 7;
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
@@ -330,7 +422,6 @@ export function ParentDashboard() {
           <Text style={styles.headerTitle}>Word Tome</Text>
           <Text style={styles.headerSub}>Parent view</Text>
         </View>
-        {/* Child tabs (only shown if multiple children) */}
         {children.length > 1 && (
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.childTabs}>
             {children.map((c) => (
@@ -352,7 +443,7 @@ export function ParentDashboard() {
       ) : dashboard ? (
         <ScrollView
           style={styles.scroll}
-          contentContainerStyle={{ paddingBottom: insets.bottom + 24 }}
+          contentContainerStyle={{ paddingBottom: insets.bottom + 40 }}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={P.amberAccent} />}
           showsVerticalScrollIndicator={false}
         >
@@ -364,7 +455,6 @@ export function ParentDashboard() {
               <Text style={styles.profileMeta}>
                 Level {selectedChild?.level} · {ageLabel(selectedChild?.age_band ?? "")}
               </Text>
-              {/* XP progress bar */}
               <View style={styles.xpBarTrack}>
                 <View
                   style={[
@@ -379,12 +469,28 @@ export function ParentDashboard() {
             </View>
           </View>
 
-          {/* ── Stats row ─────────────────────────────────── */}
+          {/* ── Stats grid ────────────────────────────────── */}
           <View style={styles.statsGrid}>
-            <StatCard value={dashboard.wordTome.length} label="Words mastered" accent />
-            <StatCard value={selectedChild?.level ?? 1}  label="Level" />
-            <StatCard value={dashboard.questCompletions.length} label="Quests done" />
-            <StatCard value={`${selectedChild?.total_xp ?? 0}`} label="Total XP" />
+            <StatCard
+              value={dashboard.wordTome.length}
+              label="Words mastered"
+              accent
+            />
+            <StatCard
+              value={selectedChild?.level ?? 1}
+              label="Level"
+            />
+            <StatCard
+              value={dashboard.questCompletions.length}
+              label="Quests done"
+            />
+            {/* v2.3 — Streak stat card */}
+            <StatCard
+              value={`${streakInfo.currentStreak}🔥`}
+              label="Day streak"
+              fire={has2xXp}
+              badge={has2xXp ? "2× XP" : undefined}
+            />
           </View>
 
           {/* ── Word Tome ─────────────────────────────────── */}
@@ -422,7 +528,19 @@ export function ParentDashboard() {
             )}
           </View>
 
-          {/* ── Recent quests ──────────────────────────────── */}
+          {/* ── v2.3: Streak Heatmap ──────────────────────── */}
+          {selectedChild && (
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Quest Streak</Text>
+              <StreakHeatmap
+                childId={selectedChild.id}
+                currentStreak={streakInfo.currentStreak}
+                longestStreak={streakInfo.longestStreak}
+              />
+            </View>
+          )}
+
+          {/* ── Recent quests ─────────────────────────────── */}
           {dashboard.questCompletions.length > 0 && (
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>Recent quests</Text>
@@ -431,6 +549,26 @@ export function ParentDashboard() {
               ))}
             </View>
           )}
+
+          {/* ── v2.3: Notification toggle ─────────────────── */}
+          <View style={[styles.section, styles.notifSection]}>
+            <View style={styles.notifRow}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.notifLabel}>Daily Quest Reminder</Text>
+                <Text style={styles.notifSub}>
+                  Send {selectedChild?.display_name ?? "your child"} a nudge at 6:00 PM each day
+                </Text>
+              </View>
+              <Switch
+                value={notifEnabled}
+                onValueChange={handleNotifToggle}
+                trackColor={{ false: P.warmBorder, true: P.amberAccent }}
+                thumbColor={notifEnabled ? P.inkBrown : P.parchment}
+                ios_backgroundColor={P.warmBorder}
+              />
+            </View>
+          </View>
+
         </ScrollView>
       ) : null}
     </View>
@@ -440,9 +578,9 @@ export function ParentDashboard() {
 // ─── Styles ───────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
-  root:  { flex: 1, backgroundColor: P.cream },
-  center:{ flex: 1, alignItems: "center", justifyContent: "center", gap: 8 },
-  scroll:{ flex: 1 },
+  root:   { flex: 1, backgroundColor: P.cream },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", gap: 8 },
+  scroll: { flex: 1 },
 
   // Header
   header: {
@@ -458,43 +596,43 @@ const styles = StyleSheet.create({
   // Child tabs
   childTabs: { marginTop: 10 },
   childTab: {
-    flexDirection:    "row",
-    alignItems:       "center",
-    gap:              6,
+    flexDirection:     "row",
+    alignItems:        "center",
+    gap:               6,
     paddingHorizontal: 12,
-    paddingVertical:  7,
-    borderRadius:     20,
-    backgroundColor:  P.parchment,
-    marginRight:      8,
-    borderWidth:      1,
-    borderColor:      P.warmBorder,
+    paddingVertical:   7,
+    borderRadius:      20,
+    backgroundColor:   P.parchment,
+    marginRight:       8,
+    borderWidth:       1,
+    borderColor:       P.warmBorder,
   },
-  childTabSelected: { backgroundColor: P.amberLight, borderColor: P.amberBorder },
-  childTabName:     { fontSize: 13, color: P.inkMid, fontWeight: "500" },
+  childTabSelected:     { backgroundColor: P.amberLight, borderColor: P.amberBorder },
+  childTabName:         { fontSize: 13, color: P.inkMid, fontWeight: "500" },
   childTabNameSelected: { color: P.amberAccent },
 
   // Avatar
   avatar: {
-    backgroundColor:  P.parchment,
-    borderWidth:      1,
-    borderColor:      P.warmBorder,
-    alignItems:       "center",
-    justifyContent:   "center",
+    backgroundColor: P.parchment,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+    alignItems:      "center",
+    justifyContent:  "center",
   },
 
   // Profile row
   profileRow: {
-    flexDirection:    "row",
-    alignItems:       "flex-start",
-    gap:              14,
-    margin:           20,
-    marginBottom:     12,
+    flexDirection: "row",
+    alignItems:    "flex-start",
+    gap:           14,
+    margin:        20,
+    marginBottom:  12,
   },
-  profileName:   { fontSize: 18, fontWeight: "700", color: P.inkBrown },
-  profileMeta:   { fontSize: 13, color: P.inkLight, marginBottom: 8 },
-  xpBarTrack:    { height: 6, backgroundColor: P.warmBorder, borderRadius: 3, overflow: "hidden" },
-  xpBarFill:     { height: 6, backgroundColor: P.amberAccent, borderRadius: 3 },
-  xpToNext:      { fontSize: 11, color: P.inkFaint, marginTop: 4 },
+  profileName: { fontSize: 18, fontWeight: "700", color: P.inkBrown },
+  profileMeta: { fontSize: 13, color: P.inkLight, marginBottom: 8 },
+  xpBarTrack:  { height: 6, backgroundColor: P.warmBorder, borderRadius: 3, overflow: "hidden" },
+  xpBarFill:   { height: 6, backgroundColor: P.amberAccent, borderRadius: 3 },
+  xpToNext:    { fontSize: 11, color: P.inkFaint, marginTop: 4 },
 
   // Stats grid
   statsGrid: {
@@ -505,45 +643,68 @@ const styles = StyleSheet.create({
     marginBottom:      8,
   },
   statCard: {
-    flex:              1,
-    minWidth:          "44%",
-    backgroundColor:   P.parchment,
-    borderRadius:      12,
-    padding:           14,
-    borderWidth:       1,
-    borderColor:       P.warmBorder,
-    alignItems:        "center",
+    flex:            1,
+    minWidth:        "44%",
+    backgroundColor: P.parchment,
+    borderRadius:    12,
+    padding:         14,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+    alignItems:      "center",
+    position:        "relative",
   },
-  statCardAccent:     { backgroundColor: P.amberLight, borderColor: P.amberBorder },
-  statValue:          { fontSize: 26, fontWeight: "700", color: P.inkBrown },
-  statValueAccent:    { color: P.amberAccent },
-  statLabel:          { fontSize: 12, color: P.inkLight, marginTop: 2 },
+  statCardAccent: { backgroundColor: P.amberLight, borderColor: P.amberBorder },
+  // v2.3 — fire stat card for ≥7 streak
+  statCardFire: {
+    backgroundColor: P.fireBg,
+    borderColor:     P.fire,
+    borderWidth:     1.5,
+  },
+  statValue:      { fontSize: 26, fontWeight: "700", color: P.inkBrown },
+  statValueAccent:{ color: P.amberAccent },
+  statValueFire:  { color: P.fire },
+  statLabel:      { fontSize: 12, color: P.inkLight, marginTop: 2 },
+  // v2.3 — "2× XP" badge on the streak card
+  statBadge: {
+    position:          "absolute",
+    top:               -8,
+    right:             -8,
+    backgroundColor:   P.fire,
+    borderRadius:      6,
+    paddingHorizontal: 6,
+    paddingVertical:   2,
+  },
+  statBadgeText: { color: "#fff", fontSize: 9, fontWeight: "800", letterSpacing: 0.4 },
 
   // Section
   section: {
-    marginHorizontal:  20,
-    marginTop:         24,
+    marginHorizontal: 20,
+    marginTop:        24,
   },
   sectionHeader: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 4 },
   sectionTitle:  { fontSize: 16, fontWeight: "700", color: P.inkBrown },
   sectionDesc:   { fontSize: 13, color: P.inkLight, lineHeight: 19, marginBottom: 12 },
   wordCountBadge:{
-    backgroundColor: P.amberLight, borderRadius: 10, paddingHorizontal: 8,
-    paddingVertical: 2, borderWidth: 1, borderColor: P.amberBorder,
+    backgroundColor:   P.amberLight,
+    borderRadius:      10,
+    paddingHorizontal: 8,
+    paddingVertical:   2,
+    borderWidth:       1,
+    borderColor:       P.amberBorder,
   },
   wordCountText: { fontSize: 12, fontWeight: "600", color: P.amberAccent },
 
   // Search
   searchInput: {
-    backgroundColor:  P.parchment,
-    borderRadius:     10,
-    borderWidth:      1,
-    borderColor:      P.warmBorder,
+    backgroundColor:   P.parchment,
+    borderRadius:      10,
+    borderWidth:       1,
+    borderColor:       P.warmBorder,
     paddingHorizontal: 14,
-    paddingVertical:  10,
-    fontSize:         14,
-    color:            P.inkBrown,
-    marginBottom:     10,
+    paddingVertical:   10,
+    fontSize:          14,
+    color:             P.inkBrown,
+    marginBottom:      10,
   },
 
   // Word entry
@@ -556,50 +717,70 @@ const styles = StyleSheet.create({
     overflow:        "hidden",
   },
   wordEntryHeader: {
-    flexDirection:    "row",
-    alignItems:       "center",
-    padding:          14,
+    flexDirection: "row",
+    alignItems:    "center",
+    padding:       14,
   },
   wordEntryLeft:  { flex: 1 },
   wordText:       { fontSize: 16, fontWeight: "700", color: P.inkBrown },
   exemplarText:   { fontSize: 12, color: P.inkLight, marginTop: 2 },
   wordEntryRight: { flexDirection: "row", alignItems: "center", gap: 8 },
   timesUsedBadge: {
-    backgroundColor: P.purpleLight, borderRadius: 8, paddingHorizontal: 7,
-    paddingVertical: 2, borderWidth: 1, borderColor: P.purpleBorder,
+    backgroundColor:   P.purpleLight,
+    borderRadius:      8,
+    paddingHorizontal: 7,
+    paddingVertical:   2,
+    borderWidth:       1,
+    borderColor:       P.purpleBorder,
   },
-  timesUsedText:  { fontSize: 11, color: P.purpleAccent, fontWeight: "600" },
-  wordDate:       { fontSize: 11, color: P.inkFaint },
-  chevron:        { fontSize: 10, color: P.inkFaint },
+  timesUsedText:      { fontSize: 11, color: P.purpleAccent, fontWeight: "600" },
+  wordDate:           { fontSize: 11, color: P.inkFaint },
+  chevron:            { fontSize: 10, color: P.inkFaint },
   wordDefinition: {
-    borderTopWidth:   1,
-    borderTopColor:   P.warmBorder,
-    padding:          14,
-    backgroundColor:  P.parchment,
+    borderTopWidth:  1,
+    borderTopColor:  P.warmBorder,
+    padding:         14,
+    backgroundColor: P.parchment,
   },
   wordDefinitionText: { fontSize: 14, color: P.inkMid, lineHeight: 21 },
   wordDefinitionMeta: { fontSize: 11, color: P.inkFaint, marginTop: 6 },
 
   // Empty state
-  emptyTome: { alignItems: "center", paddingVertical: 32 },
+  emptyTome:     { alignItems: "center", paddingVertical: 32 },
   emptyTomeText: { fontSize: 14, color: P.inkFaint, textAlign: "center" },
 
   // Quest card
   questCard: {
-    flexDirection:    "row",
-    alignItems:       "center",
-    gap:              12,
-    backgroundColor:  "#fff",
-    borderRadius:     12,
-    borderWidth:      1,
-    borderColor:      P.warmBorder,
-    padding:          14,
-    marginBottom:     8,
+    flexDirection:   "row",
+    alignItems:      "center",
+    gap:             12,
+    backgroundColor: "#fff",
+    borderRadius:    12,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+    padding:         14,
+    marginBottom:    8,
   },
   questEmoji: { fontSize: 24 },
   questName:  { fontSize: 14, fontWeight: "600", color: P.inkBrown },
   questMeta:  { fontSize: 12, color: P.inkLight, marginTop: 2 },
   questXp:    { fontSize: 13, fontWeight: "700", color: P.amberAccent },
+
+  // v2.3 — Notification toggle section
+  notifSection: { marginBottom: 8 },
+  notifRow: {
+    flexDirection:   "row",
+    alignItems:      "center",
+    justifyContent:  "space-between",
+    backgroundColor: P.parchment,
+    borderRadius:    12,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+    padding:         14,
+    gap:             12,
+  },
+  notifLabel: { fontSize: 14, fontWeight: "600", color: P.inkBrown },
+  notifSub:   { fontSize: 12, color: P.inkLight, marginTop: 3, lineHeight: 17 },
 
   // Error
   errorText: { fontSize: 16, fontWeight: "600", color: P.inkBrown },

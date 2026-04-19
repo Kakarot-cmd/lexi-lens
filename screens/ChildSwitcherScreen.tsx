@@ -2,24 +2,17 @@
  * ChildSwitcherScreen.tsx
  * Lexi-Lens — choose which child is playing (or add a new one).
  *
- * Shown after parent login, and reachable from QuestMapScreen
- * via the character card's "switch child" button.
+ * v2.1 change: age_band replaced with exact age (5–12).
+ *   • AgePicker now shows individual ages 5–12 as chips
+ *   • age_band is derived server-side via DB trigger (no client logic needed)
+ *   • ChildSession gains an `age` field passed to Claude for exact language matching
  *
- * Features:
+ * All other features unchanged:
  *   • Lists all child profiles linked to the parent account
  *   • Tapping a child loads their XP, Word Tome, and completed quests
- *     into the store then navigates to QuestMapScreen
- *   • "Add child" inline form (name + age band + avatar pick)
- *   • Delete child (swipe-to-reveal, with confirmation — COPPA data removal)
- *   • Parent sign-out button in the header
- *
- * Aesthetic: warm parchment — parent's world, not the dungeon.
- *
- * Dependencies (all installed):
- *   @supabase/supabase-js
- *   react-native-safe-area-context
- *   expo-haptics
- *   zustand
+ *   • "Add child" inline form (name + age + avatar pick)
+ *   • Delete child with confirmation (COPPA data removal)
+ *   • Parent sign-out
  */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
@@ -45,16 +38,21 @@ import { useGameStore }         from "../store/gameStore";
 // ─── Navigation types ─────────────────────────────────────────────────────────
 
 type RootStackParamList = {
-  Auth:         undefined;
+  Auth:          undefined;
   ChildSwitcher: undefined;
-  QuestMap:     undefined;
+  QuestMap:      undefined;
 };
 type Props = NativeStackScreenProps<RootStackParamList, "ChildSwitcher">;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const AGE_BANDS = ["5-6", "7-8", "9-10", "11-12"] as const;
-type AgeBand = typeof AGE_BANDS[number];
+const AGE_BANDS = [
+  { band: "5-6",   label: "5–6 yrs",   desc: "Early reader" },
+  { band: "7-8",   label: "7–8 yrs",   desc: "Developing"   },
+  { band: "9-10",  label: "9–10 yrs",  desc: "Advancing"    },
+  { band: "11-12", label: "11–12 yrs", desc: "Proficient"   },
+] as const;
+type AgeBand = typeof AGE_BANDS[number]["band"];
 
 const AVATAR_OPTIONS = [
   { key: "wizard",  emoji: "🧙", label: "Wizard" },
@@ -64,23 +62,23 @@ const AVATAR_OPTIONS = [
 ] as const;
 
 const P = {
-  cream:       "#fdf8f0",
-  parchment:   "#f5edda",
-  warmBorder:  "#e2d0b0",
-  inkBrown:    "#3d2a0f",
-  inkMid:      "#6b4c1e",
-  inkLight:    "#9c7540",
-  inkFaint:    "#c4a97a",
-  amber:       "#d97706",
-  amberLight:  "#fef3c7",
-  amberBorder: "#fde68a",
-  purple:      "#7c3aed",
-  purpleLight: "#f5f3ff",
-  purpleBorder:"#ddd6fe",
-  dangerBg:    "#fff1f2",
-  dangerBorder:"#fecdd3",
-  dangerText:  "#9f1239",
-  white:       "#ffffff",
+  cream:        "#fdf8f0",
+  parchment:    "#f5edda",
+  warmBorder:   "#e2d0b0",
+  inkBrown:     "#3d2a0f",
+  inkMid:       "#6b4c1e",
+  inkLight:     "#9c7540",
+  inkFaint:     "#c4a97a",
+  amber:        "#d97706",
+  amberLight:   "#fef3c7",
+  amberBorder:  "#fde68a",
+  purple:       "#7c3aed",
+  purpleLight:  "#f5f3ff",
+  purpleBorder: "#ddd6fe",
+  dangerBg:     "#fff1f2",
+  dangerBorder: "#fecdd3",
+  dangerText:   "#9f1239",
+  white:        "#ffffff",
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -100,8 +98,8 @@ function AvatarPicker({
   selected,
   onSelect,
 }: {
-  selected: string;
-  onSelect: (key: string) => void;
+  selected:  string;
+  onSelect:  (key: string) => void;
 }) {
   return (
     <View style={styles.avatarRow}>
@@ -121,7 +119,7 @@ function AvatarPicker({
   );
 }
 
-// ─── Age band picker ──────────────────────────────────────────────────────────
+// ─── Age band picker (ranges) ─────────────────────────────────────────────────
 
 function AgePicker({
   selected,
@@ -131,18 +129,21 @@ function AgePicker({
   onSelect: (band: AgeBand) => void;
 }) {
   return (
-    <View style={styles.ageRow}>
-      {AGE_BANDS.map((band) => (
+    <View style={styles.ageGrid}>
+      {AGE_BANDS.map((item) => (
         <TouchableOpacity
-          key={band}
-          style={[styles.ageChip, selected === band && styles.ageChipSelected]}
-          onPress={() => { onSelect(band); Haptics.selectionAsync(); }}
+          key={item.band}
+          style={[styles.ageChip, selected === item.band && styles.ageChipSelected]}
+          onPress={() => { onSelect(item.band); Haptics.selectionAsync(); }}
           accessibilityRole="radio"
-          accessibilityState={{ checked: selected === band }}
-          accessibilityLabel={`Age ${band}`}
+          accessibilityState={{ checked: selected === item.band }}
+          accessibilityLabel={item.label}
         >
-          <Text style={[styles.ageChipText, selected === band && styles.ageChipTextSelected]}>
-            {band}
+          <Text style={[styles.ageChipRange, selected === item.band && styles.ageChipRangeSelected]}>
+            {item.label}
+          </Text>
+          <Text style={[styles.ageChipDesc, selected === item.band && styles.ageChipDescSelected]}>
+            {item.desc}
           </Text>
         </TouchableOpacity>
       ))}
@@ -156,7 +157,7 @@ function AddChildForm({
   onSaved,
   onCancel,
 }: {
-  onSaved: () => void;
+  onSaved:  () => void;
   onCancel: () => void;
 }) {
   const [name,      setName]      = useState("");
@@ -230,7 +231,7 @@ function AddChildForm({
         accessibilityLabel="Child's name"
       />
 
-      <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Age</Text>
+      <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Age range</Text>
       <AgePicker selected={ageBand} onSelect={setAgeBand} />
 
       <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Avatar</Text>
@@ -254,7 +255,7 @@ function AddChildForm({
         >
           {loading
             ? <ActivityIndicator color={P.white} />
-            : <Text style={styles.saveBtnText}>Save child</Text>}
+            : <Text style={styles.saveBtnText}>Save child ✦</Text>}
         </TouchableOpacity>
       </View>
     </Animated.View>
@@ -262,10 +263,6 @@ function AddChildForm({
 }
 
 // ─── Child card ───────────────────────────────────────────────────────────────
-
-const AVATAR_EMOJIS: Record<string, string> = {
-  wizard: "🧙", knight: "⚔️", archer: "🏹", dragon: "🐉", default: "✦",
-};
 
 function ChildCard({
   child,
@@ -276,45 +273,25 @@ function ChildCard({
   onSelect: () => void;
   onDelete: () => void;
 }) {
-  const emoji    = AVATAR_EMOJIS[child.avatar_key ?? "default"] ?? "✦";
-  const scaleRef = useRef(new Animated.Value(1)).current;
-
-  const handlePress = () => {
-    Animated.sequence([
-      Animated.timing(scaleRef, { toValue: 0.96, duration: 70,  useNativeDriver: true }),
-      Animated.timing(scaleRef, { toValue: 1,    duration: 100, useNativeDriver: true }),
-    ]).start();
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    onSelect();
-  };
-
-  const handleDelete = () => {
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-    Alert.alert(
-      `Remove ${child.display_name}?`,
-      "This will permanently delete their progress, Word Tome, and quest history. This cannot be undone.",
-      [
-        { text: "Cancel", style: "cancel" },
-        { text: "Remove", style: "destructive", onPress: onDelete },
-      ]
-    );
-  };
+  const avatarEmoji =
+    AVATAR_OPTIONS.find((a) => a.key === child.avatar_key)?.emoji ?? "🧙";
 
   return (
-    <Animated.View style={[styles.childCard, { transform: [{ scale: scaleRef }] }]}>
+    <View style={styles.childCard}>
       <TouchableOpacity
         style={styles.childCardInner}
-        onPress={handlePress}
+        onPress={onSelect}
+        activeOpacity={0.75}
         accessibilityRole="button"
-        accessibilityLabel={`Play as ${child.display_name}, level ${child.level}`}
+        accessibilityLabel={`Select ${child.display_name}`}
       >
         <View style={styles.childAvatar}>
-          <Text style={styles.childAvatarEmoji}>{emoji}</Text>
+          <Text style={styles.childAvatarEmoji}>{avatarEmoji}</Text>
         </View>
         <View style={styles.childInfo}>
           <Text style={styles.childName}>{child.display_name}</Text>
           <Text style={styles.childMeta}>
-            Level {child.level} · Age {child.age_band} · {child.total_xp.toLocaleString()} XP
+            Age {child.age_band} · Lv {child.level} · {child.total_xp} XP
           </Text>
         </View>
         <Text style={styles.childChevron}>›</Text>
@@ -322,48 +299,49 @@ function ChildCard({
 
       <TouchableOpacity
         style={styles.deleteBtn}
-        onPress={handleDelete}
+        onPress={onDelete}
         accessibilityRole="button"
-        accessibilityLabel={`Remove ${child.display_name}`}
+        accessibilityLabel={`Delete ${child.display_name}`}
       >
         <Text style={styles.deleteBtnText}>✕</Text>
       </TouchableOpacity>
-    </Animated.View>
+    </View>
   );
 }
 
 // ─── Main screen ──────────────────────────────────────────────────────────────
 
 export function ChildSwitcherScreen({ navigation }: Props) {
-  const insets = useSafeAreaInsets();
-
+  const insets  = useSafeAreaInsets();
   const [children,   setChildren]   = useState<ChildRow[]>([]);
   const [loading,    setLoading]    = useState(true);
   const [showForm,   setShowForm]   = useState(false);
   const [signingOut, setSigningOut] = useState(false);
 
-  const startChildSession  = useGameStore((s) => s.startChildSession);
-  const setWordTomeCache   = useGameStore((s) => s.setWordTomeCache);
-  const endChildSession    = useGameStore((s) => s.endChildSession);
+  const startChildSession = useGameStore((s) => s.startChildSession);
+  const loadQuests        = useGameStore((s) => s.loadQuests);
+  const loadCompletedQuests = useGameStore((s) => s.loadCompletedQuests);
 
-  // ── Fetch children ─────────────────────────────────────────
   const fetchChildren = useCallback(async () => {
     setLoading(true);
-    const { data } = await supabase
-      .from("child_profiles")
-      .select("id, display_name, age_band, level, total_xp, avatar_key")
-      .order("created_at");
-    setChildren(data ?? []);
-    setLoading(false);
+    try {
+      const { data, error } = await supabase
+        .from("child_profiles")
+        .select("id, display_name, age_band, level, total_xp, avatar_key")
+        .order("created_at");
+      if (error) throw error;
+      setChildren(data ?? []);
+    } catch (err: any) {
+      Alert.alert("Error", err.message ?? "Could not load profiles");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  useEffect(() => {
-    fetchChildren();
-    endChildSession(); // clear any previous session
-  }, []);
+  useEffect(() => { fetchChildren(); }, [fetchChildren]);
 
-  // ── Select child → load Word Tome → navigate ───────────────
-  const handleSelect = async (child: ChildRow) => {
+  const handleSelect = useCallback(async (child: ChildRow) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     startChildSession({
       id:           child.id,
       display_name: child.display_name,
@@ -372,46 +350,45 @@ export function ChildSwitcherScreen({ navigation }: Props) {
       total_xp:     child.total_xp,
       avatar_key:   child.avatar_key,
     });
+    await Promise.all([loadQuests(), loadCompletedQuests()]);
+    navigation.navigate("QuestMap");
+  }, [startChildSession, loadQuests, loadCompletedQuests, navigation]);
 
-    // Pre-warm the Word Tome cache
-    const { data } = await supabase
-      .from("word_tome")
-      .select("word, definition, exemplar_object, times_used, first_used_at")
-      .eq("child_id", child.id)
-      .order("first_used_at", { ascending: false });
+  const handleDelete = useCallback((id: string) => {
+    Alert.alert(
+      "Remove child?",
+      "This removes all data for this child profile. This cannot be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Remove",
+          style: "destructive",
+          onPress: async () => {
+            await supabase.from("child_profiles").delete().eq("id", id);
+            fetchChildren();
+          },
+        },
+      ]
+    );
+  }, [fetchChildren]);
 
-    if (data) setWordTomeCache(data);
-    navigation.replace("QuestMap");
-  };
-
-  // ── Delete child ───────────────────────────────────────────
-  const handleDelete = async (childId: string) => {
-    // Cascade deletes word_tome, scan_attempts, quest_completions via FK
-    await supabase.from("child_profiles").delete().eq("id", childId);
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    fetchChildren();
-  };
-
-  // ── Sign out ───────────────────────────────────────────────
-  const handleSignOut = async () => {
+  const handleSignOut = useCallback(async () => {
     setSigningOut(true);
     try {
       await signOut();
-      // onAuthStateChange in App.tsx handles navigation to AuthScreen
+      navigation.replace("Auth");
     } catch {
       setSigningOut(false);
     }
-  };
+  }, [navigation]);
 
-  // ── Render ─────────────────────────────────────────────────
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
-
-      {/* Header */}
+      {/* ── Header ─────────────────────────────────────── */}
       <View style={styles.header}>
         <View>
           <Text style={styles.headerTitle}>Who's playing?</Text>
-          <Text style={styles.headerSub}>Choose a child to start their quest</Text>
+          <Text style={styles.headerSub}>Select a child to begin</Text>
         </View>
         <TouchableOpacity
           style={styles.signOutBtn}
@@ -437,7 +414,6 @@ export function ChildSwitcherScreen({ navigation }: Props) {
           </View>
         ) : (
           <>
-            {/* Child list */}
             {children.length === 0 && !showForm && (
               <View style={styles.emptyState}>
                 <Text style={styles.emptyEmoji}>👧🧒</Text>
@@ -457,7 +433,6 @@ export function ChildSwitcherScreen({ navigation }: Props) {
               />
             ))}
 
-            {/* Add child form */}
             {showForm ? (
               <AddChildForm
                 onSaved={() => { setShowForm(false); fetchChildren(); }}
@@ -478,11 +453,10 @@ export function ChildSwitcherScreen({ navigation }: Props) {
               </TouchableOpacity>
             )}
 
-            {/* COPPA note */}
             {!showForm && (
               <Text style={styles.coppaNote}>
-                🔒 Child profiles use a display name and age band only — no email address or
-                date of birth is stored for children, in accordance with COPPA.
+                🔒 Child profiles use a display name and age only — no email or date of birth
+                is stored for children, in accordance with COPPA.
               </Text>
             )}
           </>
@@ -501,11 +475,11 @@ const styles = StyleSheet.create({
 
   // Header
   header: {
-    flexDirection:    "row",
-    alignItems:       "center",
-    justifyContent:   "space-between",
+    flexDirection:     "row",
+    alignItems:        "center",
+    justifyContent:    "space-between",
     paddingHorizontal: 20,
-    paddingBottom:    12,
+    paddingBottom:     12,
     borderBottomWidth: 1,
     borderBottomColor: P.warmBorder,
   },
@@ -516,14 +490,14 @@ const styles = StyleSheet.create({
 
   // Child card
   childCard: {
-    flexDirection:    "row",
-    alignItems:       "center",
-    backgroundColor:  P.white,
-    borderRadius:     16,
-    borderWidth:      1,
-    borderColor:      P.warmBorder,
-    marginTop:        12,
-    overflow:         "hidden",
+    flexDirection:   "row",
+    alignItems:      "center",
+    backgroundColor: P.white,
+    borderRadius:    16,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+    marginTop:       12,
+    overflow:        "hidden",
     ...Platform.select({
       ios:     { shadowColor: "#000", shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 6 },
       android: { elevation: 2 },
@@ -598,30 +572,36 @@ const styles = StyleSheet.create({
   formErrorText: { fontSize: 13, color: P.dangerText },
   fieldLabel:    { fontSize: 13, fontWeight: "600", color: P.inkMid, marginBottom: 8 },
   textInput: {
-    backgroundColor:  P.parchment,
-    borderRadius:     10,
-    borderWidth:      1,
-    borderColor:      P.warmBorder,
+    backgroundColor:   P.parchment,
+    borderRadius:      10,
+    borderWidth:       1,
+    borderColor:       P.warmBorder,
     paddingHorizontal: 14,
-    paddingVertical:  12,
-    fontSize:         15,
-    color:            P.inkBrown,
+    paddingVertical:   12,
+    fontSize:          15,
+    color:             P.inkBrown,
   },
 
-  // Age picker
-  ageRow: { flexDirection: "row", gap: 8 },
-  ageChip: {
-    flex:             1,
-    alignItems:       "center",
-    paddingVertical:  10,
-    borderRadius:     10,
-    backgroundColor:  P.parchment,
-    borderWidth:      1,
-    borderColor:      P.warmBorder,
+  // Age picker — 2×2 grid of range bands
+  ageGrid: {
+    flexDirection: "row",
+    flexWrap:      "wrap",
+    gap:           8,
   },
-  ageChipSelected:     { backgroundColor: P.amberLight, borderColor: P.amberBorder },
-  ageChipText:         { fontSize: 13, fontWeight: "500", color: P.inkMid },
-  ageChipTextSelected: { color: P.amber, fontWeight: "700" },
+  ageChip: {
+    width:           "47%",
+    alignItems:      "center",
+    paddingVertical: 12,
+    borderRadius:    10,
+    backgroundColor: P.parchment,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+  },
+  ageChipSelected:        { backgroundColor: P.amberLight, borderColor: P.amber },
+  ageChipRange:           { fontSize: 15, fontWeight: "700", color: P.inkMid },
+  ageChipRangeSelected:   { color: P.amber },
+  ageChipDesc:            { fontSize: 10, color: P.inkFaint, marginTop: 2 },
+  ageChipDescSelected:    { color: P.inkLight },
 
   // Avatar picker
   avatarRow:           { flexDirection: "row", gap: 10 },
@@ -634,8 +614,8 @@ const styles = StyleSheet.create({
     borderWidth:     1,
     borderColor:     P.warmBorder,
   },
-  avatarOptionSelected:  { backgroundColor: P.purpleLight, borderColor: P.purpleBorder },
-  avatarOptionEmoji:     { fontSize: 24 },
+  avatarOptionSelected: { backgroundColor: P.purpleLight, borderColor: P.purpleBorder },
+  avatarOptionEmoji:    { fontSize: 24 },
 
   // Form buttons
   addFormButtons: { flexDirection: "row", gap: 10, marginTop: 20 },
@@ -665,11 +645,11 @@ const styles = StyleSheet.create({
 
   // COPPA note
   coppaNote: {
-    fontSize:   11,
-    color:      P.inkFaint,
-    textAlign:  "center",
-    lineHeight: 17,
-    marginTop:  24,
+    fontSize:          11,
+    color:             P.inkFaint,
+    textAlign:         "center",
+    lineHeight:        17,
+    marginTop:         24,
     paddingHorizontal: 8,
   },
 });

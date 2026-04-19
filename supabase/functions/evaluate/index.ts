@@ -2,21 +2,19 @@
  * supabase/functions/evaluate/index.ts
  * Lexi-Lens — Supabase Edge Function (Deno runtime)
  *
- * This is the secure gateway between the React Native client and Claude.
- * The ANTHROPIC_API_KEY never touches the device — it lives here only.
- *
- * Deploy:
- *   supabase functions deploy evaluate --no-verify-jwt
- *   supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
- *
- * Local dev:
- *   supabase functions serve evaluate --env-file .env.local
+ * Fix log:
+ *   • EvaluateRequest gains alreadyFoundWords: string[] — context for Claude
+ *   • User message rewritten: no more "ALL must pass" confusion
+ *   • Explicit instruction: childFeedback MUST mention every passing property
+ *   • overallMatch now means "all PENDING properties passed this scan"
+ *   • XP only awarded when at least one property passes (partial match support)
+ *   • Model updated to claude-haiku-4-5-20251001 (matches deployed version)
  */
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// ─── Types (mirrors evaluateObject.ts) ───────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface PropertyRequirement {
   word: string;
@@ -45,22 +43,31 @@ interface EvaluateRequest {
   questId: string;
   detectedLabel: string;
   confidence: number;
-  /** Base64 JPEG — optional, improves accuracy */
   frameBase64?: string | null;
   requiredProperties: PropertyRequirement[];
   childAge: number;
   failedAttempts?: number;
   questName?: string;
+  /**
+   * Words the child has already found in previous scans this session.
+   * Passed so Claude can acknowledge progress without re-evaluating them.
+   */
+  alreadyFoundWords?: string[];
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const PROPERTY_PASS_THRESHOLD = 0.7;
+const PROPERTY_PASS_THRESHOLD = 0.88;
 const XP_FIRST_TRY = 40;
-const XP_RETRY = 20;
-const XP_LATE = 10;
-const MODEL = "claude-sonnet-4-20250514";
-const MAX_TOKENS = 600;
+const XP_RETRY     = 20;
+const XP_LATE      = 10;
+
+// Bonus multipliers for finding multiple properties in one scan
+const XP_MULTI_2 = 1.5;  // 2 properties in one scan → 1.5x
+const XP_MULTI_3 = 2.0;  // 3 properties in one scan → 2x
+
+const MODEL      = "claude-haiku-4-5-20251001";
+const MAX_TOKENS = 700;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -84,6 +91,15 @@ CRITICAL SAFETY RULES:
 - If the camera frame shows anything inappropriate, respond ONLY with:
   {"error":"unable_to_evaluate"}
 
+FEEDBACK CONSISTENCY RULES (strictly follow these):
+- Your childFeedback MUST explicitly mention EVERY property that passes (score >= 0.88).
+  If 2 properties pass, celebrate BOTH by name. If 1 passes, celebrate that 1.
+  Never write "found a property" without naming which one(s).
+- Do NOT reference properties that have already been found in previous scans.
+- Do NOT say "all components found" unless every property in the list below passes.
+- Match your feedback to your scores — if you score a property above 0.88, you MUST
+  celebrate it in childFeedback. There must be no contradiction.
+
 RESPONSE FORMAT: Valid JSON only. No markdown. No explanation outside JSON.
 {
   "resolvedObjectName": string,
@@ -106,15 +122,24 @@ async function callClaude(req: EvaluateRequest): Promise<Omit<EvaluationResult, 
     )
     .join("\n");
 
+  const alreadyFound = (req.alreadyFoundWords ?? []);
+  const alreadyFoundLine = alreadyFound.length > 0
+    ? `\nAlready found in previous scans (do NOT re-evaluate or mention these): ${alreadyFound.join(", ")}`
+    : "\nThis is the first scan — no components found yet.";
+
   const textContent = {
     type: "text",
     text: `Detected object: "${req.detectedLabel}" (confidence: ${(req.confidence * 100).toFixed(0)}%).
+${alreadyFoundLine}
 
-Required properties (ALL must pass):
+Properties to evaluate for THIS scan (evaluate each independently):
 ${propertyList}
 
-Failed attempts so far: ${req.failedAttempts ?? 0}
-${(req.failedAttempts ?? 0) >= 2 ? "Include a gentle nudgeHint." : "Set nudgeHint to null."}`,
+Failed attempts on current component: ${req.failedAttempts ?? 0}
+${(req.failedAttempts ?? 0) >= 2 ? "Include a gentle nudgeHint that guides without naming the answer." : "Set nudgeHint to null."}
+
+IMPORTANT: Set overallMatch to true ONLY if every property listed above passes.
+Your childFeedback MUST name every property that passes. If 2 pass, mention both.`,
   };
 
   const content = req.frameBase64
@@ -157,14 +182,46 @@ ${(req.failedAttempts ?? 0) >= 2 ? "Include a gentle nudgeHint." : "Set nudgeHin
     throw new Error("Frame could not be evaluated safely.");
   }
 
-  // Enforce pass threshold server-side (don't trust Claude's boolean)
+  // Enforce pass threshold server-side (authoritative — don't trust Claude's boolean)
   parsed.properties = parsed.properties.map((p: PropertyScore) => ({
     ...p,
     passes: p.score >= PROPERTY_PASS_THRESHOLD,
   }));
+  // overallMatch = all PENDING properties passed (not the whole quest)
   parsed.overallMatch = parsed.properties.every((p: PropertyScore) => p.passes);
 
   return parsed;
+}
+
+// ─── XP calculation ───────────────────────────────────────────────────────────
+//
+// Formula: (base_per_property × passingCount) × multi_bonus
+//
+// Examples (first try):
+//   1 property  found: (40 × 1) × 1.0  =  40 XP
+//   2 properties found: (40 × 2) × 1.5  = 120 XP
+//   3 properties found: (40 × 3) × 2.0  = 240 XP
+//
+// This always makes finding more in one scan worth MORE than separate scans:
+//   3 separate scans:  40 + 40 + 40 = 120 XP
+//   All 3 in one scan: 240 XP  ✓
+
+function calcXp(passingCount: number, failedAttempts: number): number {
+  if (passingCount === 0) return 0;
+
+  const basePerProperty = failedAttempts === 0
+    ? XP_FIRST_TRY
+    : failedAttempts === 1
+      ? XP_RETRY
+      : XP_LATE;
+
+  const multBonus = passingCount >= 3
+    ? XP_MULTI_3
+    : passingCount === 2
+      ? XP_MULTI_2
+      : 1.0;
+
+  return Math.round(basePerProperty * passingCount * multBonus);
 }
 
 // ─── Supabase helpers ─────────────────────────────────────────────────────────
@@ -198,33 +255,33 @@ async function persistResult(
   xpAwarded: number,
   latencyMs: number
 ) {
-  // Record the scan attempt (no camera frame stored)
   await supabase.from("scan_attempts").insert({
-    child_id: req.childId,
-    quest_id: req.questId,
-    detected_label: req.detectedLabel,
+    child_id:          req.childId,
+    quest_id:          req.questId,
+    detected_label:    req.detectedLabel,
     vision_confidence: req.confidence,
-    resolved_name: result.resolvedObjectName,
-    overall_match: result.overallMatch,
-    property_scores: result.properties,
-    child_feedback: result.childFeedback,
-    xp_awarded: xpAwarded,
+    resolved_name:     result.resolvedObjectName,
+    overall_match:     result.overallMatch,
+    property_scores:   result.properties,
+    child_feedback:    result.childFeedback,
+    xp_awarded:        xpAwarded,
     claude_latency_ms: latencyMs,
   });
 
-  if (!result.overallMatch) return;
+  const passingProps = result.properties.filter((p) => p.passes);
+  if (passingProps.length === 0) return;
 
-  // Award XP and update level
+  // Award XP for any passing properties
   await supabase.rpc("award_xp", { p_child_id: req.childId, p_xp: xpAwarded });
 
   // Update Word Tome for each passing property
-  for (const prop of result.properties.filter((p) => p.passes)) {
+  for (const prop of passingProps) {
     const requirement = req.requiredProperties.find((r) => r.word === prop.word);
     if (!requirement) continue;
     await supabase.rpc("record_word_learned", {
-      p_child_id: req.childId,
-      p_word: prop.word,
-      p_definition: requirement.definition,
+      p_child_id:        req.childId,
+      p_word:            prop.word,
+      p_definition:      requirement.definition,
       p_exemplar_object: result.resolvedObjectName,
     });
   }
@@ -233,7 +290,6 @@ async function persistResult(
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
 serve(async (req: Request) => {
-  // Handle CORS preflight
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: CORS_HEADERS });
   }
@@ -265,7 +321,7 @@ serve(async (req: Request) => {
       });
     }
 
-    // ── Parse & validate request body ─────────────────────────
+    // ── Parse & validate ──────────────────────────────────────
     const body: EvaluateRequest = await req.json();
     const { childId, questId, detectedLabel, confidence, requiredProperties, childAge } = body;
 
@@ -276,7 +332,6 @@ serve(async (req: Request) => {
       });
     }
 
-    // Ensure this parent actually owns this child profile
     const isOwner = await verifyChildOwnership(supabase, childId, user.id);
     if (!isOwner) {
       return new Response(JSON.stringify({ error: "Forbidden" }), {
@@ -286,17 +341,15 @@ serve(async (req: Request) => {
     }
 
     // ── Call Claude ───────────────────────────────────────────
-    const claudeStart = Date.now();
-    const result = await callClaude(body);
+    const claudeStart  = Date.now();
+    const result       = await callClaude(body);
     const claudeLatency = Date.now() - claudeStart;
 
-    // ── Compute XP server-side ────────────────────────────────
-    const attempts = body.failedAttempts ?? 0;
-    const xpAwarded = result.overallMatch
-      ? attempts === 0 ? XP_FIRST_TRY : attempts === 1 ? XP_RETRY : XP_LATE
-      : 0;
+    // ── Compute XP (partial match aware) ─────────────────────
+    const passingCount = result.properties.filter((p) => p.passes).length;
+    const xpAwarded    = calcXp(passingCount, body.failedAttempts ?? 0);
 
-    // ── Persist (fire-and-forget, don't block response) ───────
+    // ── Persist (fire-and-forget) ─────────────────────────────
     persistResult(supabase, body, result, xpAwarded, claudeLatency).catch(console.error);
 
     // ── Respond ───────────────────────────────────────────────
@@ -309,7 +362,6 @@ serve(async (req: Request) => {
 
   } catch (err) {
     console.error("evaluate function error:", err);
-
     const isKnownError = err instanceof Error && err.message.includes("safely");
     return new Response(
       JSON.stringify({ error: isKnownError ? err.message : "Internal server error" }),
