@@ -1,11 +1,17 @@
 /**
  * ScanScreen.tsx — Lexi-Lens main gameplay screen
  *
+ * v3.1 additions:
+ *   • LiveLabelChip — floating chip on camera showing what ML Kit currently sees
+ *     ("📦 cushion · 94%"). Updates every 1.5s. Disappears when scanning.
+ *   • liveLabel + liveConfidence destructured from useObjectScanner
+ *   • StatusBanner receives liveLabel + liveConfidence for idle state text
+ *   • onDetection now receives ML Kit label as primary.label — Claude only
+ *     evaluates vocabulary properties, not object identification (~50% cheaper)
+ *
  * v1.4 changes:
- *   • All required_properties references replaced with activeQuest.effectiveProperties
- *   • Hard mode banner in the top HUD
- *   • markQuestCompletion() called on VictoryScreen dismiss
- *   • Accepts route.params.hardMode to pass through to beginQuest()
+ *   • effectiveProperties for hard mode
+ *   • markQuestCompletion on victory dismiss
  */
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
@@ -29,8 +35,8 @@ import {
   selectCurrentAttempts,
   selectQuestComplete,
 } from "../store/gameStore";
-import { VerdictCard } from "../components/VerdictCard";
-import { StatusBanner } from "../components/StatusBanner";
+import { VerdictCard }        from "../components/VerdictCard";
+import { StatusBanner }       from "../components/StatusBanner";
 import { VictoryFusionScreen } from "../components/VictoryFusionScreen";
 
 type RootStackParamList = {
@@ -54,7 +60,6 @@ const P = {
   textMuted:      "#a78bfa",
   textDim:        "#6b5fa0",
   progressPurple: "#7c3aed",
-  // Hard mode accent
   hardRed:        "#991b1b",
   hardRedText:    "#fca5a5",
 };
@@ -62,13 +67,60 @@ const P = {
 // ─── Camera brackets ──────────────────────────────────────────────────────────
 
 function CameraOverlay() {
-  const cornerColor = "#67e8f9";
   return (
     <View style={StyleSheet.absoluteFill} pointerEvents="none">
       {(["tl", "tr", "bl", "br"] as const).map((c) => (
         <View key={c} style={[styles.corner, styles[c]]} />
       ))}
     </View>
+  );
+}
+
+// ─── v3.1: Live ML Kit label chip ────────────────────────────────────────────
+//
+// Floating chip on the camera showing what ML Kit currently sees.
+// Cyan when confident, dimmer when unsure. Hidden when not scanning.
+
+function LiveLabelChip({
+  label,
+  confidence,
+  visible,
+}: {
+  label:      string | null;
+  confidence: number;
+  visible:    boolean;
+}) {
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.timing(fadeAnim, {
+      toValue:         visible && !!label ? 1 : 0,
+      duration:        250,
+      useNativeDriver: true,
+    }).start();
+  }, [visible, label]);
+
+  if (!label) return null;
+
+  const confPct = Math.round(confidence * 100);
+  // Colour shifts warmer as confidence increases
+  const chipBg = confidence > 0.75
+    ? "rgba(6,40,55,0.92)"
+    : "rgba(20,8,50,0.85)";
+  const textCol = confidence > 0.75 ? "#67e8f9" : "#a78bfa";
+
+  return (
+    <Animated.View style={[styles.liveChipWrap, { opacity: fadeAnim }]} pointerEvents="none">
+      <View style={[styles.liveChip, { backgroundColor: chipBg }]}>
+        <View style={[styles.liveDot, { backgroundColor: textCol }]} />
+        <Text style={[styles.liveChipText, { color: textCol }]}>
+          {label}
+        </Text>
+        <Text style={[styles.liveChipConf, { color: textCol }]}>
+          · {confPct}%
+        </Text>
+      </View>
+    </Animated.View>
   );
 }
 
@@ -117,8 +169,8 @@ function ComponentsStrip({
               key={c.propertyWord}
               style={[
                 styles.chip,
-                c.found      && styles.chipDone,
-                isBrowsed    && styles.chipActive,
+                c.found   && styles.chipDone,
+                isBrowsed && styles.chipActive,
               ]}
               onPress={() => { if (!c.found) onSelectWord(c.propertyWord); }}
               activeOpacity={c.found ? 1 : 0.7}
@@ -162,6 +214,7 @@ function EnemyBar({
   useEffect(() => {
     Animated.timing(anim, { toValue: hp, duration: 600, useNativeDriver: false }).start();
   }, [hp]);
+
   return (
     <View style={[styles.enemyBar, isHardMode && styles.enemyBarHard]}>
       <Text style={{ fontSize: 22 }}>{emoji}</Text>
@@ -181,7 +234,7 @@ function EnemyBar({
               isHardMode && styles.hpFillHard,
               {
                 width: anim.interpolate({
-                  inputRange: [0, 100],
+                  inputRange:  [0, 100],
                   outputRange: ["0%", "100%"],
                 }),
               },
@@ -209,6 +262,7 @@ function QuestIntro({
 }) {
   const scale = useRef(new Animated.Value(0.85)).current;
   const fade  = useRef(new Animated.Value(0)).current;
+
   useEffect(() => {
     Animated.parallel([
       Animated.spring(scale, { toValue: 1, useNativeDriver: true, tension: 70, friction: 9 }),
@@ -260,10 +314,7 @@ function QuestIntro({
   );
 }
 
-// ─── Victory screen ───────────────────────────────────────────────────────────
-
 // ─── Main screen ──────────────────────────────────────────────────────────────
-// VictoryScreen lives in components/VictoryScreen.tsx (1.3 animation preserved)
 
 export function ScanScreen({ route, navigation }: Props) {
   const insets = useSafeAreaInsets();
@@ -276,22 +327,20 @@ export function ScanScreen({ route, navigation }: Props) {
   const currentAttempts  = useGameStore(selectCurrentAttempts);
   const questComplete    = useGameStore(selectQuestComplete);
 
-  const beginQuest             = useGameStore((s) => s.beginQuest);
-  const recordComponentFound   = useGameStore((s) => s.recordComponentFound);
-  const recordMissedScan       = useGameStore((s) => s.recordMissedScan);
-  const completeQuest          = useGameStore((s) => s.completeQuest);
-  const abandonQuest           = useGameStore((s) => s.abandonQuest);
-  const addWordToTome          = useGameStore((s) => s.addWordToTome);
-  const addScanHistory         = useGameStore((s) => s.addScanHistory);
-  const markQuestCompletion    = useGameStore((s) => s.markQuestCompletion);  // v1.4
+  const beginQuest           = useGameStore((s) => s.beginQuest);
+  const recordComponentFound = useGameStore((s) => s.recordComponentFound);
+  const recordMissedScan     = useGameStore((s) => s.recordMissedScan);
+  const completeQuest        = useGameStore((s) => s.completeQuest);
+  const abandonQuest         = useGameStore((s) => s.abandonQuest);
+  const addWordToTome        = useGameStore((s) => s.addWordToTome);
+  const addScanHistory       = useGameStore((s) => s.addScanHistory);
+  const markQuestCompletion  = useGameStore((s) => s.markQuestCompletion);
+  const refreshChildFromDB   = useGameStore((s) => s.refreshChildFromDB);
 
-  const [phase, setPhase]           = useState<ScreenPhase>("quest_intro");
-  const [lastLabel, setLastLabel]   = useState<string | null>(null);
-  // Fix 1: which word the child is currently viewing in the seek card.
-  // Defaults to the first unfound component; child can tap chips to browse others.
+  const [phase, setPhase]             = useState<ScreenPhase>("quest_intro");
+  const [lastLabel, setLastLabel]     = useState<string | null>(null);
   const [browsedWord, setBrowsedWord] = useState<string | null>(null);
 
-  // v1.4: use hardMode from route, begin quest with that flag
   useEffect(() => {
     const quest = questLibrary.find((q) => q.id === questId);
     if (quest && (!activeQuest || activeQuest.quest.id !== questId)) {
@@ -299,27 +348,23 @@ export function ScanScreen({ route, navigation }: Props) {
     }
   }, [questId]);
 
-  // Keep browsedWord pointing at the current unfound component automatically,
-  // unless the child has manually selected a different one.
   useEffect(() => {
     if (currentComponent && !browsedWord) {
       setBrowsedWord(currentComponent.propertyWord);
     }
   }, [currentComponent?.propertyWord]);
 
-  // Derived from store — use effectiveProperties everywhere
   const isHardMode          = activeQuest?.isHardMode ?? false;
   const effectiveProperties = activeQuest?.effectiveProperties ?? [];
 
-  // Fix 2: only send UNFOUND properties to Claude.
-  // Already-found components don't need re-evaluation and confuse Claude's feedback.
   const pendingProperties = effectiveProperties.filter(
     (p) => !activeQuest?.components.find((c) => c.propertyWord === p.word && c.found)
   );
 
   const { status, result, error, evaluate, reset: resetEval } = useLexiEvaluate();
 
-  // ── Core mechanic: save ANY newly passing property ────────
+  // ── Core mechanic: save any newly passing property ────────────────────────
+
   useEffect(() => {
     if (!result || !activeQuest) return;
 
@@ -345,8 +390,6 @@ export function ScanScreen({ route, navigation }: Props) {
             xpAwarded:    xpEach,
             attemptCount: currentAttempts + 1,
           });
-
-          // Look up definition from effectiveProperties (v1.4)
           const req = effectiveProperties.find((r) => r.word === p.word);
           if (req) {
             addWordToTome({
@@ -391,9 +434,6 @@ export function ScanScreen({ route, navigation }: Props) {
     setPhase("scanning");
   }, [resetEval]);
 
-  const refreshChildFromDB = useGameStore((s) => s.refreshChildFromDB);
-
-  // v1.4 — called when the child taps "Quest map" on the victory screen
   const handleVictoryDismiss = useCallback(() => {
     if (!activeQuest || !activeChild) {
       completeQuest();
@@ -404,36 +444,47 @@ export function ScanScreen({ route, navigation }: Props) {
     const mode    = activeQuest.isHardMode ? "hard" : "normal";
     markQuestCompletion(activeQuest.quest.id, mode, totalXp);
     completeQuest();
-    // Sync level bar with server-authoritative XP (fixes point 2)
     refreshChildFromDB();
     navigation.goBack();
   }, [activeQuest, activeChild, markQuestCompletion, completeQuest, refreshChildFromDB, navigation]);
 
-  const { cameraRef, device, hasPermission, frameProcessor, triggerManualScan } =
-    useObjectScanner({
-      enabled: phase === "scanning" && status === "idle",
-      onDetection: async ({ primary, frameBase64 }) => {
-        if (!activeChild || !activeQuest) return;
-        setLastLabel(primary?.label ?? "object");
-        setPhase("verdict");
-        await evaluate({
-          childId:             activeChild.id,
-          questId:             activeQuest.quest.id,
-          questName:           activeQuest.quest.name,
-          detectedLabel:       primary?.label ?? "object",
-          confidence:          primary?.confidence ?? 0.9,
-          frameBase64Already:  frameBase64 ?? undefined,
-          // Only unfound properties — Claude evaluates what's still needed
-          requiredProperties:  pendingProperties,
-          // Context: what's already been found this session
-          alreadyFoundWords:   activeQuest.components
-            .filter((c) => c.found)
-            .map((c) => c.propertyWord),
-          childAge:            parseInt(activeChild.age_band.split("-")[1], 10),
-          failedAttempts:      currentAttempts,
-        });
-      },
-    });
+  // ── v3.1: ML Kit scanner ──────────────────────────────────────────────────
+
+  const {
+    cameraRef,
+    device,
+    hasPermission,
+    frameProcessor,
+    triggerManualScan,
+    liveLabel,       // v3.1
+    liveConfidence,  // v3.1
+  } = useObjectScanner({
+    enabled: phase === "scanning" && status === "idle",
+    onDetection: async ({ primary, frameBase64 }) => {
+      if (!activeChild || !activeQuest) return;
+
+      // primary.label is now the ML Kit label (or "object" fallback)
+      setLastLabel(primary?.label ?? "object");
+      setPhase("verdict");
+
+      await evaluate({
+        childId:            activeChild.id,
+        questId:            activeQuest.quest.id,
+        questName:          activeQuest.quest.name,
+        detectedLabel:      primary?.label ?? "object",
+        confidence:         primary?.confidence ?? 0.9,
+        frameBase64Already: frameBase64 ?? undefined,
+        requiredProperties: pendingProperties,
+        alreadyFoundWords:  activeQuest.components
+          .filter((c) => c.found)
+          .map((c) => c.propertyWord),
+        childAge:           parseInt(activeChild.age_band.split("-")[1], 10),
+        failedAttempts:     currentAttempts,
+      });
+    },
+  });
+
+  // ── Guards ────────────────────────────────────────────────────────────────
 
   if (!hasPermission) {
     return (
@@ -455,6 +506,8 @@ export function ScanScreen({ route, navigation }: Props) {
   const enemyHp    = activeQuest?.enemyHp ?? 100;
   const totalXp    = components.reduce((s, c) => s + c.xpEarned, 0);
 
+  // ── Render ────────────────────────────────────────────────────────────────
+
   return (
     <View style={styles.root}>
       <Camera
@@ -470,8 +523,14 @@ export function ScanScreen({ route, navigation }: Props) {
         <>
           <CameraOverlay />
 
+          {/* v3.1 — live ML Kit label chip, centred on camera */}
+          <LiveLabelChip
+            label={liveLabel}
+            confidence={liveConfidence}
+            visible={phase === "scanning" && status === "idle"}
+          />
+
           <View style={[styles.topHud, { paddingTop: insets.top + 8 }]}>
-            {/* v1.4: hard mode banner above enemy bar */}
             {isHardMode && <HardModeBanner />}
             {quest && (
               <EnemyBar
@@ -484,7 +543,6 @@ export function ScanScreen({ route, navigation }: Props) {
           </View>
 
           <View style={[styles.bottomHud, { paddingBottom: insets.bottom + 12 }]}>
-            {/* Seek card — shows the browsed word's definition (tappable chips change this) */}
             {browsedWord && !activeQuest?.components.find(c => c.propertyWord === browsedWord && c.found) && (
               <View style={[styles.seekCard, isHardMode && styles.seekCardHard]}>
                 <Text style={styles.seekLabel}>
@@ -528,7 +586,13 @@ export function ScanScreen({ route, navigation }: Props) {
             </TouchableOpacity>
           </View>
 
-          <StatusBanner status={status} detectedLabel={lastLabel} />
+          {/* v3.1 — pass liveLabel to StatusBanner for idle state text */}
+          <StatusBanner
+            status={status}
+            detectedLabel={lastLabel}
+            liveLabel={liveLabel}
+            liveConfidence={liveConfidence}
+          />
 
           {phase === "component_win" && (
             <View style={styles.winFlash} pointerEvents="none">
@@ -589,20 +653,46 @@ const styles = StyleSheet.create({
   permText: { fontSize: 18, fontWeight: "700", color: P.textPrimary, textAlign: "center" },
 
   corner: { position: "absolute", width: 22, height: 22, borderColor: "#67e8f9", borderStyle: "solid", borderWidth: 0 },
-  tl: { top: 80, left: 20, borderTopWidth: 2.5, borderLeftWidth: 2.5, borderTopLeftRadius: 4 },
-  tr: { top: 80, right: 20, borderTopWidth: 2.5, borderRightWidth: 2.5, borderTopRightRadius: 4 },
-  bl: { bottom: 290, left: 20, borderBottomWidth: 2.5, borderLeftWidth: 2.5, borderBottomLeftRadius: 4 },
-  br: { bottom: 290, right: 20, borderBottomWidth: 2.5, borderRightWidth: 2.5, borderBottomRightRadius: 4 },
+  tl: { top: 80,    left: 20,  borderTopWidth: 2.5,    borderLeftWidth: 2.5,  borderTopLeftRadius: 4 },
+  tr: { top: 80,    right: 20, borderTopWidth: 2.5,    borderRightWidth: 2.5, borderTopRightRadius: 4 },
+  bl: { bottom: 290, left: 20, borderBottomWidth: 2.5, borderLeftWidth: 2.5,  borderBottomLeftRadius: 4 },
+  br: { bottom: 290, right: 20,borderBottomWidth: 2.5, borderRightWidth: 2.5, borderBottomRightRadius: 4 },
 
-  // Hard mode banner
-  hardBanner: {
-    backgroundColor: P.hardRed,
-    borderRadius: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-    alignSelf: "center",
-    marginBottom: 6,
+  // v3.1 — live label chip
+  liveChipWrap: {
+    position:   "absolute",
+    top:        "38%",
+    left:       0,
+    right:      0,
+    alignItems: "center",
+    zIndex:     50,
   },
+  liveChip: {
+    flexDirection:     "row",
+    alignItems:        "center",
+    gap:               6,
+    paddingHorizontal: 14,
+    paddingVertical:   7,
+    borderRadius:      30,
+    borderWidth:       1,
+    borderColor:       "rgba(103,232,249,0.3)",
+  },
+  liveDot: {
+    width:        7,
+    height:       7,
+    borderRadius: 3.5,
+  },
+  liveChipText: {
+    fontSize:   14,
+    fontWeight: "600",
+  },
+  liveChipConf: {
+    fontSize:   12,
+    fontWeight: "500",
+    opacity:    0.7,
+  },
+
+  hardBanner:     { backgroundColor: P.hardRed, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 5, alignSelf: "center", marginBottom: 6 },
   hardBannerText: { fontSize: 11, fontWeight: "700", color: "#fff", letterSpacing: 0.5 },
 
   topHud:    { position: "absolute", top: 0, left: 0, right: 0, paddingHorizontal: 12 },
@@ -649,25 +739,21 @@ const styles = StyleSheet.create({
 
   overlayFull: { ...StyleSheet.absoluteFillObject, backgroundColor: P.deepPurple, justifyContent: "center", padding: 20 },
 
-  introWrap:    { alignItems: "center" },
-  introHardBadge: {
-    backgroundColor: P.hardRed, borderRadius: 16,
-    paddingHorizontal: 16, paddingVertical: 6, marginBottom: 14,
-  },
+  introWrap:          { alignItems: "center" },
+  introHardBadge:     { backgroundColor: P.hardRed, borderRadius: 16, paddingHorizontal: 16, paddingVertical: 6, marginBottom: 14 },
   introHardBadgeText: { fontSize: 13, color: "#fff", fontWeight: "800", letterSpacing: 0.8 },
-  introName:    { fontSize: 26, fontWeight: "800", color: P.textPrimary, textAlign: "center" },
-  introRoom:    { fontSize: 13, color: P.textMuted, marginTop: 4, marginBottom: 16 },
-  introDivider: { height: 0.5, backgroundColor: P.cardBorder, width: "100%", marginBottom: 16 },
-  introHeading: { fontSize: 14, color: P.textDim, fontWeight: "600", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 },
-  introHint:    { fontSize: 12, color: P.textDim, textAlign: "center", marginBottom: 16, lineHeight: 18 },
-  introPropRow: { flexDirection: "row", gap: 10, marginBottom: 12, alignItems: "flex-start", width: "100%" },
-  introPropWord:{ fontSize: 16, fontWeight: "700", color: P.gold },
-  introPropDef: { fontSize: 13, color: P.textMuted, marginTop: 2, lineHeight: 18 },
-  beginBtn:     { marginTop: 24, backgroundColor: "#7c3aed", borderRadius: 16, paddingVertical: 16, paddingHorizontal: 48, alignItems: "center" },
-  beginBtnHard: { backgroundColor: P.hardRed },
-  beginBtnText: { fontSize: 17, fontWeight: "700", color: "#fff" },
+  introName:          { fontSize: 26, fontWeight: "800", color: P.textPrimary, textAlign: "center" },
+  introRoom:          { fontSize: 13, color: P.textMuted, marginTop: 4, marginBottom: 16 },
+  introDivider:       { height: 0.5, backgroundColor: P.cardBorder, width: "100%", marginBottom: 16 },
+  introHeading:       { fontSize: 14, color: P.textDim, fontWeight: "600", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 },
+  introHint:          { fontSize: 12, color: P.textDim, textAlign: "center", marginBottom: 16, lineHeight: 18 },
+  introPropRow:       { flexDirection: "row", gap: 10, marginBottom: 12, alignItems: "flex-start", width: "100%" },
+  introPropWord:      { fontSize: 16, fontWeight: "700", color: P.gold },
+  introPropDef:       { fontSize: 13, color: P.textMuted, marginTop: 2, lineHeight: 18 },
+  beginBtn:           { marginTop: 24, backgroundColor: "#7c3aed", borderRadius: 16, paddingVertical: 16, paddingHorizontal: 48, alignItems: "center" },
+  beginBtnHard:       { backgroundColor: P.hardRed },
+  beginBtnText:       { fontSize: 17, fontWeight: "700", color: "#fff" },
 
   winFlash: { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(34,197,94,0.15)", pointerEvents: "none" as any },
   winText:  { fontSize: 36, fontWeight: "800", color: "#86efac" },
-  // Victory styles live in components/VictoryScreen.tsx
 });
