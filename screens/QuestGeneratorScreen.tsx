@@ -110,6 +110,7 @@ interface GeneratedQuest {
   weapon_emoji:        string;
   spell_description:   string;
   required_properties: PropertyRequirement[];
+  hard_mode_properties?: PropertyRequirement[];  // taxonomy-generated upward synonyms
 }
 
 // ─── Props ────────────────────────────────────────────────────────────────────
@@ -557,10 +558,55 @@ export default function QuestGeneratorScreen({ visible, onClose, defaultAgeBand 
     setError(null);
 
     try {
+      // ── Fetch child's word_tome for uniqueness + mastery context ────────────
+      // If a specific child is targeted, fetch their vocabulary.
+      // If generating for all children, skip (no single mastery profile to use).
+      let knownWords:    string[] = [];
+      let masteryProfile: Array<{
+        word:        string;
+        mastery:     number;
+        masteryTier: string;
+        timesUsed:   number;
+      }> = [];
+
+      const childId = targetChild?.id ?? null;
+      if (childId) {
+        const { data: tomeData } = await supabase
+          .from("word_tome")
+          .select("word, mastery_score, times_used")
+          .eq("child_id", childId);
+
+        if (tomeData && tomeData.length > 0) {
+          knownWords = tomeData.map((r: any) => r.word as string);
+
+          // Build mastery profile matching the MasteryEntry shape
+          masteryProfile = tomeData.map((r: any) => {
+            const score: number = r.mastery_score ?? 0;
+            const tier =
+              score >= 0.8 ? "expert"
+              : score >= 0.6 ? "proficient"
+              : score >= 0.3 ? "developing"
+              : "novice";
+            return {
+              word:        r.word,
+              mastery:     Math.round(score * 100) / 100,
+              masteryTier: tier,
+              timesUsed:   r.times_used ?? 1,
+            };
+          });
+        }
+      }
+
       // Use supabase.functions.invoke() — handles JWT automatically, avoids
       // UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM from the Edge Runtime
       const { data, error: fnError } = await supabase.functions.invoke("generate-quest", {
-        body: { theme: inputTheme, ageBand: inputBand, tier: inputTier },
+        body: {
+          theme:         inputTheme,
+          ageBand:       inputBand,
+          tier:          inputTier,
+          knownWords,
+          masteryProfile,
+        },
       });
 
       if (fnError) throw new Error(fnError.message ?? "Generation failed");
@@ -573,7 +619,7 @@ export default function QuestGeneratorScreen({ visible, onClose, defaultAgeBand 
       setStep("input");
       Alert.alert("Generation failed", err.message ?? "Please try again.");
     }
-  }, []);
+  }, [targetChild]);
 
   // ── Save to Supabase ──────────────────────────────────
   const handleSave = useCallback(async (quest: GeneratedQuest) => {
@@ -593,7 +639,7 @@ export default function QuestGeneratorScreen({ visible, onClose, defaultAgeBand 
         xp_reward_first_try: 40,
         xp_reward_retry:     20,
         required_properties: quest.required_properties,
-        hard_mode_properties:[],
+        hard_mode_properties: quest.hard_mode_properties ?? [],
         age_band_properties: {},
         spell_name:          quest.spell_name,
         weapon_emoji:        quest.weapon_emoji,

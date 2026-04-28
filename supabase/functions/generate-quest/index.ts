@@ -1,255 +1,411 @@
 /**
  * supabase/functions/generate-quest/index.ts
- * Lexi-Lens — Phase 3.3: AI Quest Generator for Parents
+ * Lexi-Lens — AI Quest Generator (Phase 4.2 rewrite)
  *
- * POST body:
+ * POST /functions/v1/generate-quest
+ *
+ * WHAT CHANGED FROM THE ORIGINAL:
+ *   • Full vocabulary taxonomy baked into the prompt — age band now enforces
+ *     syllable ceilings, property-count limits, word register, and object concreteness.
+ *   • knownWords[] passed from the child's word_tome — Claude explicitly avoids
+ *     them so every quest introduces fresh vocabulary.
+ *   • masteryProfile passed from evaluate payload — for Archmage tier Claude
+ *     targets the child's weakest known words first (novice → developing), not
+ *     random advanced words.
+ *   • hard_mode_properties now enforced as true upward synonyms — same physical
+ *     property at a higher vocabulary register (rigid → inflexible → inelastic).
+ *   • Feedback vocabulary ceiling enforced per age band in the eval prompt too
+ *     (see evaluateObject.ts).
+ *
+ * REQUEST BODY:
  *   {
- *     theme:    string   — parent's description, e.g. "ocean creatures" or "kitchen magic"
- *     ageBand:  string   — "5-6" | "7-8" | "9-10" | "11-12"
- *     tier:     string   — "apprentice" | "scholar" | "sage" | "archmage"
+ *     theme:          string,          // parent-supplied, e.g. "ocean creatures"
+ *     ageBand:        "5-6"|"7-8"|"9-10"|"11-12",
+ *     tier:           "apprentice"|"scholar"|"sage"|"archmage",
+ *     knownWords?:    string[],        // words already in the child's word_tome
+ *     masteryProfile?: Array<{         // child's mastery data from word_tome
+ *       word:         string;
+ *       mastery:      number;          // 0.0–1.0
+ *       masteryTier:  "novice"|"developing"|"proficient"|"expert";
+ *       timesUsed:    number;
+ *     }>;
  *   }
  *
- * Response:
- *   GeneratedQuest — a complete quest object ready to preview + save
+ * RESPONSE:
+ *   { quest: GeneratedQuest }
  *
- * Security:
- *   • Requires valid Supabase JWT (parent must be signed in)
- *   • Rate-limited to 10 generations per parent per day via DB check
+ * DEPLOY:
+ *   supabase functions deploy generate-quest --no-verify-jwt
  */
 
-import { serve }        from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-// ─── CORS ────────────────────────────────────────────────────────────────────
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 
 const CORS = {
   "Access-Control-Allow-Origin":  "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+} as const;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface GenerateRequest {
-  theme:   string;
-  ageBand: string;
-  tier:    string;
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...CORS, "Content-Type": "application/json" },
+  });
 }
 
-interface PropertyRequirement {
-  word:             string;
-  definition:       string;
-  evaluationHints:  string;
-}
+// ─── Vocabulary taxonomy ───────────────────────────────────────────────────────
+// This is the source of truth for what words/properties belong at each
+// age band × tier combination. The taxonomy is embedded in the Claude prompt.
 
-interface GeneratedQuest {
-  name:                 string;
-  enemy_name:           string;
-  enemy_emoji:          string;
-  room_label:           string;
-  spell_name:           string;
-  weapon_emoji:         string;
-  spell_description:    string;
-  required_properties:  PropertyRequirement[];
-}
+const TAXONOMY: Record<string, {
+  propertyType:    string;
+  wordPool:        string[];
+  hardModePool:    string;
+  maxSyllables:    number;
+  propertyCount:   Record<string, number>;
+  objectExamples:  string;
+  feedbackCeiling: string;
+}> = {
+  "5-6": {
+    propertyType:  "basic sensory",
+    wordPool: [
+      "hard", "soft", "rough", "smooth", "heavy", "light", "shiny", "dull",
+      "wet", "dry", "hot", "cold", "bumpy", "flat", "fuzzy", "sticky",
+      "squishy", "crunchy", "slippery", "stretchy",
+    ],
+    hardModePool: `
+      hard → solid
+      soft → squishy → pliable
+      shiny → gleaming → lustrous (pick ONE next step up, not both)
+      heavy → weighty
+      rough → bumpy → textured
+      stretchy → flexible`,
+    maxSyllables:  2,
+    propertyCount: { apprentice: 1, scholar: 1, sage: 1, archmage: 1 },
+    objectExamples: "spoon, pillow, stone, leaf, sock, cup, pencil, crayon, toy block, blanket",
+    feedbackCeiling: `
+      - Maximum sentence length: 8 words.
+      - No compound sentences ("and", "but", "because" are fine; semicolons are not).
+      - Use ONLY words a 5-year-old knows. If in doubt, use a simpler word.
+      - Forbidden in feedback: any word longer than 2 syllables, science terms, adjectives above this list.`,
+  },
 
-// ─── Age band vocab guide ─────────────────────────────────────────────────────
+  "7-8": {
+    propertyType:  "physical state",
+    wordPool: [
+      "transparent", "opaque", "flexible", "rigid", "magnetic", "hollow",
+      "solid", "absorbent", "porous", "waterproof", "fragile", "durable",
+      "elastic", "dense", "lightweight", "reflective", "insulating",
+    ],
+    hardModePool: `
+      transparent → see-through → clear → translucent (pick one step up)
+      flexible → bendable → pliable
+      rigid → stiff → inflexible
+      magnetic → attracted-to-magnets → ferromagnetic (use only for age 11-12)
+      absorbent → sponge-like → porous
+      reflective → mirror-like → glossy`,
+    maxSyllables:  3,
+    propertyCount: { apprentice: 1, scholar: 2, sage: 2, archmage: 2 },
+    objectExamples: "mirror, sponge, ruler, candle, coin, balloon, rubber band, plastic bottle, glass",
+    feedbackCeiling: `
+      - Use simple sentences. Some compound sentences are fine.
+      - Vocabulary of a confident 7-year-old reader.
+      - Avoid words above 3 syllables in feedback.
+      - Science terms must be explained in parentheses if used: "transparent (you can see right through it)".`,
+  },
 
-const AGE_VOCAB_GUIDE: Record<string, string> = {
-  "5-6":   "very simple words (2–3 syllables max). Examples: soft, heavy, rough, shiny, round.",
-  "7-8":   "everyday descriptive words. Examples: transparent, flexible, smooth, hollow, magnetic.",
-  "9-10":  "intermediate vocabulary. Examples: porous, luminous, rigid, absorbent, reflective.",
-  "11-12": "advanced vocabulary. Examples: opaque, malleable, translucent, combustible, conductive.",
+  "9-10": {
+    propertyType:  "material science",
+    wordPool: [
+      "conductive", "elastic", "reflective", "dense", "crystalline", "fibrous",
+      "grainy", "brittle", "buoyant", "permeable", "insulating", "translucent",
+      "malleable", "adhesive", "coarse", "granular", "layered", "porous",
+    ],
+    hardModePool: `
+      elastic → resilient → springy
+      conductive → transmissive
+      brittle → fragile → friable
+      dense → compact
+      translucent → semi-transparent → pellucid (save pellucid for age 11-12)
+      fibrous → filamentous
+      malleable → workable → ductile (save ductile for age 11-12)
+      buoyant → floatable → hydrophobic`,
+    maxSyllables:  4,
+    propertyCount: { apprentice: 1, scholar: 2, sage: 3, archmage: 3 },
+    objectExamples: "cork, aluminium foil, rubber eraser, copper wire, clay, gravel, felt, mesh, wax candle",
+    feedbackCeiling: `
+      - Standard vocabulary for age 9-10.
+      - Words up to 4 syllables are fine.
+      - Can introduce one new vocabulary word per feedback, defined in context.
+      - Science terms should be explained once, then used freely.`,
+  },
+
+  "11-12": {
+    propertyType:  "advanced physical science",
+    wordPool: [
+      "translucent", "malleable", "ductile", "viscous", "lustrous",
+      "hygroscopic", "thermoplastic", "ferromagnetic", "pellucid",
+      "iridescent", "crystalline", "refractive", "permeable", "cohesive",
+      "tensile", "laminated", "amorphous", "porosity",
+    ],
+    hardModePool: `
+      translucent → pellucid (Latin-origin, same meaning, higher register)
+      malleable → ductile (more specific: ductile = drawn into wire)
+      lustrous → specular → iridescent
+      viscous → viscid → tenacious
+      ferromagnetic → paramagnetic (different but related — explain distinction)
+      hygroscopic → deliquescent (extreme case of hygroscopic)
+      refractive → diffractive (introduce optical nuance)`,
+    maxSyllables:  5,
+    propertyCount: { apprentice: 2, scholar: 3, sage: 3, archmage: 3 },
+    objectExamples: "copper pipe, glass rod, wax block, felt sheet, resin block, polished metal, mica flake, salt crystal",
+    feedbackCeiling: `
+      - Rich vocabulary. Age 11-12 level.
+      - Can introduce etymology: "Pellucid comes from Latin pellucēre — to shine through."
+      - Can use richer synonyms in feedback to plant seeds for the next level.
+      - Archmage feedback should always introduce one word from the NEXT level up.`,
+  },
 };
 
-const TIER_GUIDE: Record<string, string> = {
-  apprentice: "straightforward, concrete properties a child can easily verify visually or by touch",
-  scholar:    "slightly more abstract properties requiring some observation or thought",
-  sage:       "nuanced properties combining two concepts or requiring inference",
-  archmage:   "sophisticated, multi-layered properties that challenge advanced readers",
-};
+// ─── System prompt builder ────────────────────────────────────────────────────
 
-// ─── Claude prompt ────────────────────────────────────────────────────────────
+function buildSystemPrompt(
+  ageBand:       string,
+  tier:          string,
+  knownWords:    string[],
+  masteryProfile: Array<{ word: string; mastery: number; masteryTier: string; timesUsed: number }>
+): string {
+  const tax = TAXONOMY[ageBand] ?? TAXONOMY["7-8"];
+  const propCount = tax.propertyCount[tier] ?? 2;
 
-function buildPrompt(theme: string, ageBand: string, tier: string): string {
-  const vocabGuide = AGE_VOCAB_GUIDE[ageBand] ?? AGE_VOCAB_GUIDE["7-8"];
-  const tierGuide  = TIER_GUIDE[tier]         ?? TIER_GUIDE["apprentice"];
+  const knownWordsSection = knownWords.length > 0
+    ? `\nWORDS ALREADY IN THE CHILD'S VOCABULARY (DO NOT use any of these):
+${knownWords.map(w => `  • ${w}`).join("\n")}
+These words are retired — the child has already learned them. Introducing them again wastes the quest.`
+    : "";
 
-  return `You are a creative game designer for Lexi-Lens, a vocabulary RPG for children aged 5–12.
-Parents can create custom quests for their children. Your job is to generate one complete quest
-based on the parent's theme.
+  const masterySection = masteryProfile.length > 0
+    ? `\nCHILD'S MASTERY PROFILE (use to calibrate difficulty):
+${masteryProfile.map(m =>
+  `  • "${m.word}" — ${m.masteryTier} tier (score: ${m.mastery.toFixed(2)}, used ${m.timesUsed}×)`
+).join("\n")}
+For ARCHMAGE tier: prioritise words that are upward synonyms of the child's DEVELOPING-tier words.
+For SAGE tier: pick from the upper half of the age-band word pool, not words already PROFICIENT.
+For SCHOLAR/APPRENTICE: use words from the lower-mid pool regardless of mastery.`
+    : "";
 
-THEME: "${theme}"
-CHILD AGE BAND: ${ageBand} years old
+  return `You are a vocabulary curriculum designer for Lexi-Lens, a children's AR vocabulary RPG.
+Your job is to generate a single vocabulary quest that children complete by finding a real physical
+object that matches specific word properties with their device camera.
+
+AGE BAND: ${ageBand} years old
 DIFFICULTY TIER: ${tier}
 
-VOCABULARY LEVEL: Use ${vocabGuide}
-PROPERTY COMPLEXITY: Properties should be ${tierGuide}.
+VOCABULARY TAXONOMY FOR THIS AGE BAND (${ageBand}):
+  Property type: ${tax.propertyType}
+  Word pool (choose FROM these or close synonyms): ${tax.wordPool.join(", ")}
+  Max syllables per vocabulary word: ${tax.maxSyllables}
+  Number of required_properties for this tier: EXACTLY ${propCount}
+  Target object concreteness: ${tax.objectExamples}
 
-RULES:
-- The enemy should relate to the theme creatively (e.g. theme "ocean" → "The Coral Kraken")
-- The room should be a fantasy location that fits the theme (e.g. "The Sunken Reef Chamber")
-- Each property MUST be something a child can find by looking at real household objects
-- The evaluationHints guide the AI evaluator — be specific about what to look for
-- All 3 properties must be DIFFERENT aspects (e.g. texture, transparency, shape — not all texture)
-- The spell should have a magical name that fits the theme
-- Definitions must be simple enough for the child's age band
+TIER BEHAVIOUR:
+  apprentice — Use the simplest words from the pool. One-syllable preferred. Very common objects.
+  scholar    — Middle of the pool. Objects children encounter regularly.
+  sage       — Upper half of pool. Slightly less common objects but still findable at home/school.
+  archmage   — Top of pool + one preview word from the NEXT age band up (with clear definition).
+               Current band (${ageBand}) max syllables: ${tax.maxSyllables}. Preview word may have ${tax.maxSyllables + 1} syllables.
 
-RESPOND WITH ONLY VALID JSON — no markdown, no explanation, no text outside the JSON object:
+HARD MODE PROPERTIES (hard_mode_properties array):
+  Generate exactly ${propCount} hard-mode properties — one for each required property.
+  Each hard-mode word MUST be an UPWARD SYNONYM of its base word:
+    • Same physical property as the base word
+    • Higher vocabulary register (more technical, more specific, or Latin/Greek origin)
+    • Never a different property — "hard → dense" is WRONG. "hard → rigid → inflexible" is CORRECT.
+  Hard-mode synonym guide:
+${tax.hardModePool}
+
+FEEDBACK CEILING (used in childFeedback field):
+${tax.feedbackCeiling}
+${knownWordsSection}
+${masterySection}
+
+UNIQUENESS RULES:
+  1. Never use a word from the "known words" list above as a required_property or hard_mode_property.
+  2. Choose vocabulary words that are genuinely useful for the child's real-world vocabulary.
+  3. Pick objects that are findable in a typical home or classroom — not rare collector items.
+
+RESPONSE: Return ONLY valid JSON. No markdown, no prose outside JSON.
+
 {
-  "name": "Quest name (e.g. 'The Frost Golem Siege')",
-  "enemy_name": "Enemy display name (e.g. 'Frost Golem')",
-  "enemy_emoji": "Single emoji that best represents the enemy",
-  "room_label": "Fantasy room name (e.g. 'The Glacial Keep')",
-  "spell_name": "Magical spell name (e.g. 'Arctic Shatter Beam')",
-  "weapon_emoji": "Single emoji for the spell's weapon or effect",
-  "spell_description": "One exciting sentence describing the spell (age-appropriate)",
+  "name":               "Quest name (RPG fantasy style, 3-6 words)",
+  "enemy_name":         "Fantasy enemy name (2-3 words)",
+  "enemy_emoji":        "Single emoji for the enemy",
+  "room_label":         "Fantasy room name (2-4 words)",
+  "spell_name":         "Name of the spell the child casts (2-4 words)",
+  "weapon_emoji":       "Single emoji for the weapon/spell",
+  "spell_description":  "One sentence: what the spell does in fantasy terms",
   "required_properties": [
     {
-      "word": "vocabulary word",
-      "definition": "child-friendly definition matching age band ${ageBand}",
-      "evaluationHints": "specific guidance for the AI evaluator on how to verify this property"
-    },
+      "word":             "vocabulary word (from the taxonomy pool)",
+      "definition":       "child-appropriate definition, ${ageBand} reading level",
+      "evaluationHints":  "one sentence: what Claude's vision model should look for in an object to verify this property"
+    }
+  ],
+  "hard_mode_properties": [
     {
-      "word": "second vocabulary word",
-      "definition": "child-friendly definition",
-      "evaluationHints": "specific guidance for evaluation"
-    },
-    {
-      "word": "third vocabulary word",
-      "definition": "child-friendly definition",
-      "evaluationHints": "specific guidance for evaluation"
+      "word":             "upward synonym of the base word",
+      "definition":       "definition at the higher register, ${ageBand}+1 reading level",
+      "evaluationHints":  "same or more specific than the base hint"
     }
   ]
-}`;
 }
 
-// ─── Main handler ─────────────────────────────────────────────────────────────
+CRITICAL: required_properties.length === ${propCount} and hard_mode_properties.length === ${propCount}.
+Both arrays must have exactly ${propCount} item(s). Never more, never fewer.`;
+}
 
-serve(async (req: Request) => {
-  if (req.method === "OPTIONS") {
-    return new Response(null, { headers: CORS });
-  }
+// ─── User message builder ──────────────────────────────────────────────────────
 
-  if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Method not allowed" }), {
-      status: 405,
-      headers: { ...CORS, "Content-Type": "application/json" },
-    });
-  }
+function buildUserMessage(theme: string, ageBand: string, tier: string): string {
+  return `Create a vocabulary quest with theme: "${theme}"
+
+Age band: ${ageBand} | Tier: ${tier}
+
+Design an immersive RPG quest where finding and scanning the right real-world object
+defeats the enemy. The vocabulary words must come from the taxonomy specified in the system prompt.
+Make the quest feel exciting and magical while staying true to the age-appropriate vocabulary constraints.`;
+}
+
+// ─── Main handler ──────────────────────────────────────────────────────────────
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
+  if (req.method !== "POST")    return json({ error: "POST only" }, 405);
+
+  // ── Parse body ─────────────────────────────────────────────────────────────
+  let body: {
+    theme?:          unknown;
+    ageBand?:        unknown;
+    tier?:           unknown;
+    knownWords?:     unknown;
+    masteryProfile?: unknown;
+  };
 
   try {
-    // ── Auth ──────────────────────────────────────────────
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return new Response(JSON.stringify({ error: "Missing authorization" }), {
-        status: 401, headers: { ...CORS, "Content-Type": "application/json" },
-      });
-    }
+    body = await req.json();
+  } catch {
+    return json({ error: "Request body must be valid JSON." }, 400);
+  }
 
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-      { global: { headers: { Authorization: authHeader } } }
-    );
+  const theme      = typeof body.theme   === "string" ? body.theme.trim()   : "";
+  const ageBand    = typeof body.ageBand === "string" ? body.ageBand        : "7-8";
+  const tier       = typeof body.tier    === "string" ? body.tier           : "apprentice";
+  const knownWords = Array.isArray(body.knownWords)
+    ? (body.knownWords as string[]).filter(w => typeof w === "string")
+    : [];
+  const masteryProfile = Array.isArray(body.masteryProfile)
+    ? body.masteryProfile as Array<{ word: string; mastery: number; masteryTier: string; timesUsed: number }>
+    : [];
 
-    const { data: { user }, error: authErr } = await supabase.auth.getUser();
-    if (authErr || !user) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401, headers: { ...CORS, "Content-Type": "application/json" },
-      });
-    }
+  if (theme.length < 3) {
+    return json({ error: "theme must be at least 3 characters." }, 400);
+  }
+  if (!TAXONOMY[ageBand]) {
+    return json({ error: `Unknown ageBand: ${ageBand}. Use 5-6, 7-8, 9-10, or 11-12.` }, 400);
+  }
 
-    // ── Parse body ────────────────────────────────────────
-    const body: GenerateRequest = await req.json();
-    const { theme, ageBand, tier } = body;
+  // ── Call Claude ────────────────────────────────────────────────────────────
+  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
+  if (!apiKey) return json({ error: "ANTHROPIC_API_KEY not configured." }, 500);
 
-    if (!theme?.trim() || !ageBand || !tier) {
-      return new Response(JSON.stringify({ error: "theme, ageBand, and tier are required" }), {
-        status: 400, headers: { ...CORS, "Content-Type": "application/json" },
-      });
-    }
+  const systemPrompt = buildSystemPrompt(ageBand, tier, knownWords, masteryProfile);
+  const userMessage  = buildUserMessage(theme, ageBand, tier);
 
-    if (theme.trim().length > 200) {
-      return new Response(JSON.stringify({ error: "Theme too long (max 200 chars)" }), {
-        status: 400, headers: { ...CORS, "Content-Type": "application/json" },
-      });
-    }
-
-    // ── Rate limit — 10 generations per parent per day ────
-    const today = new Date().toISOString().split("T")[0];
-    const { count } = await supabase
-      .from("quests")
-      .select("id", { count: "exact", head: true })
-      .eq("created_by", user.id)
-      .gte("created_at", `${today}T00:00:00Z`);
-
-    if ((count ?? 0) >= 10) {
-      return new Response(JSON.stringify({ error: "Daily quest generation limit reached (10/day). Try again tomorrow!" }), {
-        status: 429, headers: { ...CORS, "Content-Type": "application/json" },
-      });
-    }
-
-    // ── Call Claude ───────────────────────────────────────
-    const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-    if (!apiKey) throw new Error("ANTHROPIC_API_KEY not configured");
-
-    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
+  let raw: string;
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method:  "POST",
       headers: {
+        "Content-Type":      "application/json",
         "x-api-key":         apiKey,
         "anthropic-version": "2023-06-01",
-        "content-type":      "application/json",
       },
       body: JSON.stringify({
         model:      "claude-haiku-4-5-20251001",
         max_tokens: 1200,
-        messages:   [{ role: "user", content: buildPrompt(theme.trim(), ageBand, tier) }],
+        system:     systemPrompt,
+        messages:   [{ role: "user", content: userMessage }],
       }),
     });
 
-    if (!claudeRes.ok) {
-      const err = await claudeRes.text();
-      throw new Error(`Claude API error ${claudeRes.status}: ${err}`);
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "(unreadable)");
+      console.error("[generate-quest] Anthropic error:", response.status, errText);
+      return json({ error: `AI service error (${response.status}). Please try again.` }, 502);
     }
 
-    const claudeData = await claudeRes.json();
-    const rawText: string = claudeData.content
-      .filter((b: { type: string }) => b.type === "text")
-      .map((b: { text: string }) => b.text)
+    const apiResponse = await response.json() as {
+      content: Array<{ type: string; text?: string }>;
+    };
+
+    raw = apiResponse.content
+      .filter(b => b.type === "text")
+      .map(b => b.text ?? "")
       .join("");
 
-    // Strip markdown fences if Claude adds them
-    const clean = rawText.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
-    const quest: GeneratedQuest = JSON.parse(clean);
-
-    // ── Validate shape ────────────────────────────────────
-    if (
-      !quest.name || !quest.enemy_name || !quest.enemy_emoji ||
-      !quest.room_label || !quest.spell_name || !quest.weapon_emoji ||
-      !Array.isArray(quest.required_properties) ||
-      quest.required_properties.length < 3
-    ) {
-      throw new Error("Generated quest is missing required fields");
-    }
-
-    // Normalise — ensure exactly 3 properties and all fields present
-    quest.required_properties = quest.required_properties.slice(0, 3).map((p) => ({
-      word:            (p.word            ?? "").trim(),
-      definition:      (p.definition      ?? "").trim(),
-      evaluationHints: (p.evaluationHints ?? "").trim(),
-    }));
-
-    return new Response(JSON.stringify({ quest }), {
-      status: 200,
-      headers: { ...CORS, "Content-Type": "application/json" },
-    });
-
-  } catch (err) {
-    console.error("[generate-quest]", err);
-    return new Response(JSON.stringify({ error: "Failed to generate quest. Please try again." }), {
-      status: 500,
-      headers: { ...CORS, "Content-Type": "application/json" },
-    });
+  } catch (err: any) {
+    console.error("[generate-quest] fetch error:", err.message);
+    return json({ error: "Could not reach AI service. Please try again." }, 502);
   }
+
+  // ── Parse & validate response ──────────────────────────────────────────────
+  let quest: {
+    name:                string;
+    enemy_name:          string;
+    enemy_emoji:         string;
+    room_label:          string;
+    spell_name:          string;
+    weapon_emoji:        string;
+    spell_description:   string;
+    required_properties: Array<{ word: string; definition: string; evaluationHints: string }>;
+    hard_mode_properties: Array<{ word: string; definition: string; evaluationHints: string }>;
+  };
+
+  try {
+    const clean = raw.replace(/```json|```/g, "").trim();
+    quest = JSON.parse(clean);
+  } catch (parseErr) {
+    console.error("[generate-quest] JSON parse failed:", raw.slice(0, 300));
+    return json({ error: "AI returned malformed response. Please try again." }, 502);
+  }
+
+  // Validate required shape
+  if (!quest.name || !Array.isArray(quest.required_properties) || quest.required_properties.length === 0) {
+    console.error("[generate-quest] Invalid quest shape:", JSON.stringify(quest).slice(0, 300));
+    return json({ error: "AI returned an incomplete quest. Please try again." }, 502);
+  }
+
+  // Ensure hard_mode_properties exists and matches length
+  if (!Array.isArray(quest.hard_mode_properties)) {
+    quest.hard_mode_properties = [];
+  }
+
+  // Guard: never return a quest where required_property.word is in knownWords
+  if (knownWords.length > 0) {
+    const knownSet = new Set(knownWords.map(w => w.toLowerCase()));
+    const collision = quest.required_properties.find(p => knownSet.has(p.word.toLowerCase()));
+    if (collision) {
+      console.warn(`[generate-quest] Claude used a known word: "${collision.word}" — returning error`);
+      return json({
+        error: `The AI reused a word the child already knows ("${collision.word}"). Please try generating again.`
+      }, 422);
+    }
+  }
+
+  console.log(`[generate-quest] Generated quest "${quest.name}" for age ${ageBand} tier ${tier}. ` +
+    `Properties: ${quest.required_properties.map(p => p.word).join(", ")}`);
+
+  return json({ quest });
 });

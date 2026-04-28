@@ -8,6 +8,15 @@
  *   • Notification toggle — schedules / cancels daily push reminder at 6 PM
  *   • loadStreakData() fetched alongside dashboard data
  *
+ * v2.4 — Phase 4.1 COPPA + GDPR-K compliance additions:
+ *   • Account & Privacy section (pinned at the bottom of the scroll)
+ *       – "Privacy Policy" → opens PrivacyPolicyScreen in a Modal
+ *       – "Delete Account" → opens DataDeletionScreen in a Modal
+ *         (multi-step: summary → reason → type "DELETE" → confirmed)
+ *   • onDeleted() handler: signs out via supabase.auth.signOut() and
+ *     navigates to Auth screen. Child data is wiped immediately by the
+ *     Edge Function; parent account is purged 30 days later by pg_cron.
+ *
  * Deliberately different aesthetic from the child's dark dungeon UI:
  * warm cream/amber tones, illuminated-manuscript feel, no gamification pressure.
  *
@@ -19,6 +28,7 @@
  *   5. Streak Heatmap — 28-day calendar
  *   6. Recent quests
  *   7. Notification preference toggle
+ *   8. Account & Privacy (v2.4)
  *
  * Dependencies:
  *   npx expo install expo-notifications   (for notification toggle)
@@ -35,13 +45,17 @@ import {
   ActivityIndicator,
   RefreshControl,
   Switch,
+  Modal,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
 import { StreakHeatmap }         from "../components/StreakHeatmap";
-import QuestGeneratorScreen from "./QuestGeneratorScreen";
+import QuestGeneratorScreen     from "./QuestGeneratorScreen";
+// v2.4 — Phase 4.1 COPPA + GDPR-K
+import { DataDeletionScreen }   from "../components/DataDeletionScreen";
+import { PrivacyPolicyScreen }  from "../components/PrivacyPolicyScreen";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -114,6 +128,7 @@ const P = {
 type RootStackParamList = {
   QuestMap:        undefined;
   ParentDashboard: undefined;
+  Auth:            undefined;    // v2.4 — navigate here after account deletion
 };
 type Props = NativeStackScreenProps<RootStackParamList, "ParentDashboard">;
 
@@ -295,6 +310,12 @@ export function ParentDashboard({ navigation }: Props) {
   const [notifEnabled, setNotifEnabled]     = useState(false);
   const [showGenerator, setShowGenerator]   = useState(false);
 
+  // v2.4 — Phase 4.1 COPPA + GDPR-K modals
+  const [showPrivacyPolicy,    setShowPrivacyPolicy]    = useState(false);
+  const [showDeleteScreen,     setShowDeleteScreen]     = useState(false);
+  const [deletionScheduledAt,  setDeletionScheduledAt]  = useState<string | null>(null);
+  const [cancellingDeletion,   setCancellingDeletion]   = useState(false);
+
   const selectedChild = dashboard?.child ?? null;
 
   // ── Fetch children list ─────────────────────────────────────────────────────
@@ -309,7 +330,15 @@ export function ParentDashboard({ navigation }: Props) {
       setChildren(data ?? []);
       if (data?.length) setSelectedId(data[0].id);
     }
+
+    async function checkDeletionStatus() {
+      const { data: { user } } = await supabase.auth.getUser();
+      const scheduled = user?.app_metadata?.deletion_scheduled_at ?? null;
+      setDeletionScheduledAt(scheduled);
+    }
+
     fetchChildren();
+    checkDeletionStatus();
   }, []);
 
   // ── Fetch streak info for selected child ────────────────────────────────────
@@ -410,6 +439,37 @@ export function ParentDashboard({ navigation }: Props) {
     }
   };
 
+  // ── v2.4: Post-deletion cleanup ─────────────────────────────────────────────
+  // Called by DataDeletionScreen after the Edge Function succeeds.
+  // Child data is already wiped; parent account is scheduled for purge in 30 days.
+  // We sign out immediately so the deleted JWT cannot be reused.
+  const handleAccountDeleted = useCallback(async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch (e) {
+      console.warn("[auth] signOut after deletion failed:", e);
+    } finally {
+      // Navigate to Auth screen and reset the navigation stack so the user
+      // cannot press the back button and land on a deleted dashboard.
+      navigation.reset({ index: 0, routes: [{ name: "Auth" }] });
+    }
+  }, [navigation]);
+
+  // ── v2.4: Cancel scheduled deletion ─────────────────────────────────────────
+  const handleCancelDeletion = useCallback(async () => {
+    setCancellingDeletion(true);
+    try {
+      const { error } = await supabase.functions.invoke("cancel-deletion", {});
+      if (error) throw error;
+      setDeletionScheduledAt(null);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (err: any) {
+      alert("Could not cancel deletion: " + (err?.message ?? "Unknown error"));
+    } finally {
+      setCancellingDeletion(false);
+    }
+  }, []);
+
   // ── Render ──────────────────────────────────────────────────────────────────
   if (error) {
     return (
@@ -468,6 +528,25 @@ export function ParentDashboard({ navigation }: Props) {
         visible={showGenerator}
         onClose={() => setShowGenerator(false)}
         defaultAgeBand={(selectedChild?.age_band as any) ?? "7-8"}
+      />
+
+      {/* ── v2.4: Privacy Policy Modal ──────────────────── */}
+      {/*   Opened from Account & Privacy section below       */}
+      <Modal
+        visible={showPrivacyPolicy}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setShowPrivacyPolicy(false)}
+      >
+        <PrivacyPolicyScreen onClose={() => setShowPrivacyPolicy(false)} />
+      </Modal>
+
+      {/* ── v2.4: Data Deletion Modal ────────────────────── */}
+      {/*   Multi-step: Summary → Reason → type DELETE → Done */}
+      <DataDeletionScreen
+        visible={showDeleteScreen}
+        onClose={() => setShowDeleteScreen(false)}
+        onDeleted={handleAccountDeleted}
       />
 
       {loading && !refreshing ? (
@@ -600,6 +679,100 @@ export function ParentDashboard({ navigation }: Props) {
                 thumbColor={notifEnabled ? P.inkBrown : P.parchment}
                 ios_backgroundColor={P.warmBorder}
               />
+            </View>
+          </View>
+
+          {/* ── v2.4: Deletion-pending banner ─────────────── */}
+          {deletionScheduledAt && (
+            <View style={styles.deletionBanner}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.deletionBannerTitle}>⏳ Account deletion pending</Text>
+                <Text style={styles.deletionBannerSub}>
+                  Scheduled for {new Date(deletionScheduledAt).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}.
+                  All data will be permanently removed. New child profiles cannot be added.
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={[styles.cancelDeletionBtn, cancellingDeletion && { opacity: 0.6 }]}
+                onPress={handleCancelDeletion}
+                disabled={cancellingDeletion}
+                accessibilityLabel="Cancel account deletion"
+              >
+                <Text style={styles.cancelDeletionBtnText}>
+                  {cancellingDeletion ? "Cancelling…" : "Keep account"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* ── v2.4: Account & Privacy ───────────────────── */}
+          {/* COPPA + GDPR-K: parents must be able to access    */}
+          {/* the privacy policy and delete their account from  */}
+          {/* within the app at any time (COPPA §312.6,         */}
+          {/* GDPR Art. 17, Apple Kids Cat. 5.1.4).             */}
+          <View style={[styles.section, styles.privacySection]}>
+            <Text style={styles.sectionTitle}>Account &amp; Privacy</Text>
+            <Text style={styles.sectionDesc}>
+              Manage your data and review how Lexi-Lens protects your child's information.
+            </Text>
+
+            {/* Privacy Policy row */}
+            <TouchableOpacity
+              style={styles.privacyRow}
+              onPress={() => {
+                Haptics.selectionAsync();
+                setShowPrivacyPolicy(true);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="View Privacy Policy"
+            >
+              <View style={styles.privacyRowLeft}>
+                <Text style={styles.privacyRowIcon}>🔒</Text>
+                <View>
+                  <Text style={styles.privacyRowTitle}>Privacy Policy</Text>
+                  <Text style={styles.privacyRowSub}>
+                    How we collect, use, and protect your data
+                  </Text>
+                </View>
+              </View>
+              <Text style={styles.privacyRowChevron}>›</Text>
+            </TouchableOpacity>
+
+            {/* Divider */}
+            <View style={styles.privacyDivider} />
+
+            {/* Delete Account row */}
+            <TouchableOpacity
+              style={styles.privacyRow}
+              onPress={() => {
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                setShowDeleteScreen(true);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Delete account and all child data"
+            >
+              <View style={styles.privacyRowLeft}>
+                <Text style={styles.privacyRowIcon}>🗑️</Text>
+                <View>
+                  <Text style={[styles.privacyRowTitle, styles.privacyRowTitleDanger]}>
+                    Delete Account
+                  </Text>
+                  <Text style={styles.privacyRowSub}>
+                    Permanently removes all children's data within 24 hours
+                  </Text>
+                </View>
+              </View>
+              <Text style={styles.privacyRowChevron}>›</Text>
+            </TouchableOpacity>
+
+            {/* COPPA compliance note */}
+            <View style={styles.coppaNote}>
+              <Text style={styles.coppaNoteText}>
+                🛡️  Lexi-Lens complies with COPPA and GDPR-K. No personal data is
+                shared with third parties or used for advertising. Your child's
+                scans are processed by AI to identify object labels only — images
+                are never stored.
+              </Text>
             </View>
           </View>
 
@@ -835,6 +1008,84 @@ const styles = StyleSheet.create({
   },
   notifLabel: { fontSize: 14, fontWeight: "600", color: P.inkBrown },
   notifSub:   { fontSize: 12, color: P.inkLight, marginTop: 3, lineHeight: 17 },
+
+  // v2.4 — Account & Privacy section
+  privacySection: { marginBottom: 40 },
+
+  privacyRow: {
+    flexDirection:  "row",
+    alignItems:     "center",
+    justifyContent: "space-between",
+    paddingVertical: 14,
+    paddingHorizontal: 4,
+  },
+  privacyRowLeft: {
+    flexDirection: "row",
+    alignItems:    "center",
+    gap:           12,
+    flex:          1,
+  },
+  privacyRowIcon:  { fontSize: 20 },
+  privacyRowTitle: { fontSize: 14, fontWeight: "600", color: P.inkBrown },
+  privacyRowTitleDanger: { color: "#dc2626" },   // red-600 — clear visual weight for destructive action
+  privacyRowSub:   { fontSize: 12, color: P.inkLight, marginTop: 2, lineHeight: 17 },
+  privacyRowChevron: { fontSize: 18, color: P.inkFaint, marginLeft: 8 },
+
+  privacyDivider: {
+    height:          1,
+    backgroundColor: P.warmBorder,
+    marginHorizontal: 4,
+  },
+
+  coppaNote: {
+    marginTop:       16,
+    backgroundColor: P.amberLight,
+    borderRadius:    10,
+    borderWidth:     1,
+    borderColor:     P.amberBorder,
+    padding:         14,
+  },
+  coppaNoteText: {
+    fontSize:   12,
+    color:      P.inkMid,
+    lineHeight: 18,
+  },
+
+  // v2.4 — Deletion-pending banner
+  deletionBanner: {
+    marginHorizontal: 20,
+    marginTop:        24,
+    backgroundColor:  "#fef2f2",      // red-50
+    borderRadius:     12,
+    borderWidth:      1.5,
+    borderColor:      "#fca5a5",      // red-300
+    padding:          16,
+    gap:              12,
+  },
+  deletionBannerTitle: {
+    fontSize:    14,
+    fontWeight:  "600",
+    color:       "#991b1b",           // red-800
+    marginBottom: 4,
+  },
+  deletionBannerSub: {
+    fontSize:   12,
+    color:      "#b91c1c",            // red-700
+    lineHeight: 18,
+  },
+  cancelDeletionBtn: {
+    backgroundColor:   "#166534",     // green-800
+    borderRadius:      8,
+    paddingHorizontal: 14,
+    paddingVertical:   9,
+    alignSelf:         "flex-start",
+    marginTop:         4,
+  },
+  cancelDeletionBtnText: {
+    color:      "#fff",
+    fontSize:   13,
+    fontWeight: "600",
+  },
 
   // Error
   errorText: { fontSize: 16, fontWeight: "600", color: P.inkBrown },

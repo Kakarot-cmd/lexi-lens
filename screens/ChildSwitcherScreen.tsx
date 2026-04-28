@@ -188,6 +188,22 @@ function AddChildForm({
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("Not signed in");
 
+      // ── Deletion-pending guard ─────────────────────────────────────────────
+      // Block child creation if the parent account is scheduled for deletion.
+      // Creating new child profiles during the 30-day purge window would leave
+      // orphaned data and violates the intent of the erasure request.
+      const scheduledAt = user.app_metadata?.deletion_scheduled_at;
+      if (scheduledAt) {
+        const daysLeft = Math.ceil(
+          (new Date(scheduledAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)
+        );
+        setError(
+          `Your account is scheduled for deletion in ${daysLeft} day${daysLeft !== 1 ? "s" : ""}. ` +
+          `New child profiles cannot be added. Contact privacy@lexi-lens.app to cancel the deletion.`
+        );
+        return;
+      }
+
       const selectedBand = AGE_BANDS.find((b) => b.band === ageBand)!;
       const { error: insertErr } = await supabase.from("child_profiles").insert({
         parent_id:    user.id,
