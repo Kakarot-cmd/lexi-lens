@@ -1,5 +1,11 @@
 /**
- * VerdictCard.tsx — Lexi-Lens result card (updated)
+ * VerdictCard.tsx — Lexi-Lens result card
+ *
+ * v3.4 additions (Redis Response Caching):
+ *   • Accepts cacheHit prop from useLexiEvaluate
+ *   • Shows a small "⚡ Instant" pill beneath the resolved object name
+ *     when the result came from Redis cache (< 10 ms response).
+ *   • Parents won't see it; children will think the magic is extra fast ✨
  *
  * Verdict logic:
  *  - If ANY property newly passes → show "✦ Found X properties!" (even if not all pass)
@@ -29,6 +35,8 @@ interface VerdictCardProps {
   error?:         string | null;
   /** v1.5 — pass masteryResult from useLexiEvaluate; shows "Word Mastered!" banner */
   masteryResult?: MasteryUpdateResult | null;
+  /** v3.4 — true when result served from Redis cache (< 10 ms) */
+  cacheHit?:      boolean;
   onContinue:     () => void;
   onTryAgain:     () => void;
 }
@@ -53,6 +61,29 @@ const P = {
   failBorder:  "#7f1d1d",
   failText:    "#fca5a5",
 };
+
+// ─── Cache hit pill ───────────────────────────────────────────────────────────
+
+/**
+ * Tiny "⚡ Instant" pill — appears when the result came from Redis.
+ * Fades in with a gentle animation so it doesn't distract from the verdict.
+ * Only visible to parents who peek at dev logs; children just see fast magic.
+ */
+function CacheHitPill() {
+  const opacity = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.timing(opacity, {
+      toValue: 1, duration: 400, delay: 200, useNativeDriver: true,
+    }).start();
+  }, []);
+
+  return (
+    <Animated.View style={[styles.cachePill, { opacity }]}>
+      <Text style={styles.cachePillText}>⚡ Instant</Text>
+    </Animated.View>
+  );
+}
 
 // ─── Property badge ────────────────────────────────────────────────────────────
 
@@ -85,7 +116,6 @@ function XPCounter({ xp }: { xp: number }) {
       toValue: 1, useNativeDriver: true, tension: 80, friction: 6,
     }).start();
 
-    // Integer counter — no decimal flicker
     const steps = 20;
     const interval = 900 / steps;
     let current = 0;
@@ -108,8 +138,10 @@ function XPCounter({ xp }: { xp: number }) {
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export function VerdictCard({ status, result, error, masteryResult, onContinue, onTryAgain }: VerdictCardProps) {
-  const insets   = useSafeAreaInsets();
+export function VerdictCard({
+  status, result, error, masteryResult, cacheHit, onContinue, onTryAgain,
+}: VerdictCardProps) {
+  const insets    = useSafeAreaInsets();
   const slideAnim = useRef(new Animated.Value(CARD_H)).current;
 
   useEffect(() => {
@@ -118,9 +150,11 @@ export function VerdictCard({ status, result, error, masteryResult, onContinue, 
     }).start();
   }, []);
 
-  // Determine what was found vs not found
-  const passingProps = result?.properties.filter((p) => p.passes) ?? [];
-  const failingProps = result?.properties.filter((p) => !p.passes) ?? [];
+  // FIX: result?.properties is undefined when the Edge Function returns a
+  // partial/malformed response. Without ?. after .properties, calling
+  // .filter() on undefined crashes VerdictCard during render.
+  const passingProps   = result?.properties?.filter((p) => p.passes) ?? [];
+  const failingProps   = result?.properties?.filter((p) => !p.passes) ?? [];
   const somethingFound = passingProps.length > 0;
   const totalXpEarned  = result?.xpAwarded ?? 0;
 
@@ -152,11 +186,11 @@ export function VerdictCard({ status, result, error, masteryResult, onContinue, 
                 <Text style={styles.feedbackText}>
                   Something got in the way of the magic. Point at the object again and try!
                 </Text>
-				{!!error && (
-    <Text style={{ color: "#fca5a5", fontSize: 11, marginTop: 8 }}>
-      {error}
-    </Text>
-  )}
+                {!!error && (
+                  <Text style={{ color: "#fca5a5", fontSize: 11, marginTop: 8 }}>
+                    {error}
+                  </Text>
+                )}
               </View>
               <TouchableOpacity style={styles.retryBtn} onPress={onTryAgain}>
                 <Text style={styles.retryBtnText}>Try again</Text>
@@ -167,7 +201,7 @@ export function VerdictCard({ status, result, error, masteryResult, onContinue, 
           {/* ── Has result (match or no-match) ──────────────── */}
           {result && (status === "match" || status === "no-match") && (
             <>
-              {/* Header — changes based on whether anything was found */}
+              {/* Header */}
               <View style={styles.header}>
                 <Text style={styles.headerEmoji}>{somethingFound ? "⚡" : "🔮"}</Text>
                 <Text style={[
@@ -178,29 +212,28 @@ export function VerdictCard({ status, result, error, masteryResult, onContinue, 
                     ? `${passingProps.length} propert${passingProps.length === 1 ? "y" : "ies"} found!`
                     : "Almost…"}
                 </Text>
-                <Text style={styles.resolvedName}>{result.resolvedObjectName}</Text>
+
+                {/* Resolved object name + optional cache pill */}
+                <View style={styles.resolvedRow}>
+                  <Text style={styles.resolvedName}>{result.resolvedObjectName}</Text>
+                  {cacheHit && <CacheHitPill />}
+                </View>
               </View>
 
-              {/* XP badge — only shown when something found */}
+              {/* XP badge */}
               {somethingFound && totalXpEarned > 0 && (
-  <>
-    {passingProps.length >= 2 && (
-      <View style={{
-        alignSelf: "center",
-        backgroundColor: "#7c3aed",
-        borderRadius: 20,
-        paddingHorizontal: 14,
-        paddingVertical: 4,
-        marginBottom: 6,
-      }}>
-        <Text style={{ color: "#fff", fontSize: 13, fontWeight: "700" }}>
-          {passingProps.length === 2 ? "1.5× bonus!" : "2× bonus!"}
-        </Text>
-      </View>
-    )}
-    <XPCounter xp={totalXpEarned} />
-  </>
-)}
+                <>
+                  {/* Multi-property bonus pill — matches Phase 1.2 edge function math */}
+                  {passingProps.length >= 2 && (
+                    <View style={styles.bonusPill}>
+                      <Text style={styles.bonusPillText}>
+                        {passingProps.length >= 3 ? "2× multi-property bonus!" : "1.5× bonus!"}
+                      </Text>
+                    </View>
+                  )}
+                  <XPCounter xp={totalXpEarned} />
+                </>
+              )}
 
               {/* Claude's child-friendly feedback */}
               <View style={styles.feedbackBox}>
@@ -298,7 +331,21 @@ const styles = StyleSheet.create({
   header:       { alignItems: "center", paddingTop: 12, marginBottom: 8 },
   headerEmoji:  { fontSize: 36, marginBottom: 6 },
   headerTitle:  { fontSize: 22, fontWeight: "700", color: P.gold, letterSpacing: 0.3, textAlign: "center" },
-  resolvedName: { fontSize: 13, color: P.textMuted, marginTop: 2 },
+
+  // Resolved name row (name + cache pill side by side)
+  resolvedRow:  { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 2 },
+  resolvedName: { fontSize: 13, color: P.textMuted },
+
+  // v3.4 — Cache hit pill
+  cachePill: {
+    backgroundColor: "#0c1a10",
+    borderColor:     "#22c55e",
+    borderWidth:     1,
+    borderRadius:    10,
+    paddingHorizontal: 7,
+    paddingVertical:   2,
+  },
+  cachePillText: { fontSize: 10, color: "#22c55e", fontWeight: "600", letterSpacing: 0.3 },
 
   // XP
   xpBadge: {
@@ -310,6 +357,13 @@ const styles = StyleSheet.create({
   },
   xpNum: { fontSize: 32, fontWeight: "800", color: "#22c55e" },
   xpLbl: { fontSize: 14, fontWeight: "600", color: "#22c55e", marginLeft: 6 },
+
+  // Bonus
+  bonusPill: {
+    alignSelf: "center", backgroundColor: "#7c3aed",
+    borderRadius: 20, paddingHorizontal: 14, paddingVertical: 4, marginBottom: 6,
+  },
+  bonusPillText: { color: "#fff", fontSize: 13, fontWeight: "700" },
 
   // Feedback
   feedbackBox: {
@@ -327,12 +381,12 @@ const styles = StyleSheet.create({
   },
 
   // Property badge
-  badge:      { borderRadius: 10, padding: 10, marginBottom: 8, borderWidth: 1 },
-  badgePass:  { backgroundColor: P.passBg, borderColor: P.passBorder },
-  badgeFail:  { backgroundColor: P.failBg, borderColor: P.failBorder },
-  badgeRow:   { flexDirection: "row", alignItems: "center", marginBottom: 3 },
-  badgeWord:  { fontSize: 14, fontWeight: "600" },
-  badgeReason:{ fontSize: 12, color: P.textDim, lineHeight: 17, marginLeft: 18 },
+  badge:       { borderRadius: 10, padding: 10, marginBottom: 8, borderWidth: 1 },
+  badgePass:   { backgroundColor: P.passBg, borderColor: P.passBorder },
+  badgeFail:   { backgroundColor: P.failBg, borderColor: P.failBorder },
+  badgeRow:    { flexDirection: "row", alignItems: "center", marginBottom: 3 },
+  badgeWord:   { fontSize: 14, fontWeight: "600" },
+  badgeReason: { fontSize: 12, color: P.textDim, lineHeight: 17, marginLeft: 18 },
 
   // Hint
   hintBox: {
@@ -359,15 +413,9 @@ const styles = StyleSheet.create({
 
   // v1.5 — Mastery banner
   masteryBanner: {
-    flexDirection:   "row",
-    alignItems:      "center",
-    gap:             12,
-    backgroundColor: "#1a1200",
-    borderColor:     "#f59e0b",
-    borderWidth:     1.5,
-    borderRadius:    12,
-    padding:         14,
-    marginTop:       12,
+    flexDirection: "row", alignItems: "center", gap: 12,
+    backgroundColor: "#1a1200", borderColor: "#f59e0b",
+    borderWidth: 1.5, borderRadius: 12, padding: 14, marginTop: 12,
   },
   masteryIcon:  { fontSize: 28 },
   masteryTitle: { fontSize: 14, fontWeight: "700", color: "#fbbf24", marginBottom: 2 },

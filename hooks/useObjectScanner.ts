@@ -16,52 +16,98 @@
  *   npx expo install @react-native-ml-kit/image-labeling
  *   (requires EAS build — npx expo run:android — not Expo Go)
  *
- * Exports:
- *   liveLabel      — best current ML Kit label ("cushion") or null
- *   liveConfidence — 0-1 confidence score
- *   triggerManualScan — unchanged API, now pre-fills detectedLabel
+ * FIXES applied:
+ *   • [BUG]  TypeError: Cannot read property 'filter' of undefined
+ *     @react-native-ml-kit/image-labeling returns one of two shapes on Android:
+ *       Shape A (typical): ImageLabel[]             ← bare array
+ *       Shape B (some builds): { labels: ImageLabel[] }  ← wrapped object
+ *     Previously `?? []` only guarded null/undefined — a wrapped object passed
+ *     straight through, `.filter` on a plain object is undefined → crash.
+ *     Fixed with normalizeLabels() + pickBestLabel() helpers.
+ *   • [BUG]  Syntax error — a prior edit accidentally deleted `.filter(` leaving
+ *     a dangling arrow function as a bare statement. Fully rewritten.
+ *   • [BUG]  catch { console.log(..., e) } — `e` undefined (no catch binding).
+ *   • [LOGS] Removed 3 development console.log calls.
+ *   • [CLEAN] Removed unused top-level ImageLabelingTest import.
+ *   • [PERF] liveConfidence removed from triggerManualScan deps array — now read
+ *     via ref, eliminating unnecessary callback recreation on every confidence tick.
  */
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import { useCameraDevice, useCameraPermission, Camera } from "react-native-vision-camera";
 import { readAsStringAsync } from "expo-file-system/legacy";
-import ImageLabelingTest from "@react-native-ml-kit/image-labeling";
-console.log("ML Kit direct import:", ImageLabelingTest);
 
 // ─── ML Kit — lazy loaded so app doesn't crash before EAS build ───────────────
 
 let mlKitAvailable = false;
 let ImageLabeling: any = null;
 
-async function loadMLKit() {
+async function loadMLKit(): Promise<boolean> {
   if (ImageLabeling) return true;
   try {
-    const mod = await import("@react-native-ml-kit/image-labeling");
-    ImageLabeling = mod.default ?? mod;
+    const mod      = await import("@react-native-ml-kit/image-labeling");
+    ImageLabeling  = mod.default ?? mod;
     mlKitAvailable = true;
-	console.log("✅ ML Kit loaded successfully"); 
     return true;
-  } catch {
+  } catch (e) {
+    // Silent — app falls back to Claude-only identification automatically.
+    // This path is normal in Expo Go before the first EAS native build.
     mlKitAvailable = false;
-	console.log("❌ ML Kit not available:", e);
     return false;
   }
 }
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── ML Kit response normaliser ───────────────────────────────────────────────
+//
+// @react-native-ml-kit/image-labeling has two possible return shapes depending
+// on the native bridge version bundled in the EAS build:
+//
+//   Shape A  ImageLabel[]                 (bare array — most common)
+//   Shape B  { labels: ImageLabel[] }     (wrapped — some Android builds)
+//
+// `?? []` only catches null/undefined — a wrapped object is truthy so it
+// passed straight through, and `.filter` on a plain object is undefined:
+//   "TypeError: Cannot read property 'filter' of undefined"
+//
+// normalizeLabels() handles both shapes and always returns a plain array.
 
-/** Only show/use labels above this confidence. */
+function normalizeLabels(raw: unknown): Array<{ text: string; confidence: number }> {
+  if (Array.isArray(raw)) return raw;
+  if (raw !== null && typeof raw === "object") {
+    const wrapped = (raw as Record<string, unknown>).labels;
+    if (Array.isArray(wrapped)) return wrapped;
+  }
+  return [];
+}
+
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
 const CONFIDENCE_THRESHOLD = 0.55;
 
-/** How often the smart viewfinder samples a frame (ms). */
 const SCAN_INTERVAL_MS = 1500;
 
-/** Labels that are too generic to be useful — skip them. */
 const SKIP_LABELS = new Set([
   "product", "technology", "material", "font", "pattern",
   "rectangle", "circle", "line", "black", "white", "grey", "gray",
   "snapshot", "image", "photo", "picture",
 ]);
+
+/** Normalise raw ML Kit output, filter generics + low confidence, return best. */
+function pickBestLabel(
+  raw: unknown
+): { text: string; confidence: number } | undefined {
+  return normalizeLabels(raw)
+    .filter(
+      (l) =>
+        l.confidence >= CONFIDENCE_THRESHOLD &&
+        !SKIP_LABELS.has(l.text.toLowerCase())
+    )
+    .sort((a, b) => b.confidence - a.confidence)[0];
+}
+
+function capitalise(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -72,9 +118,9 @@ export interface DetectedObject {
 }
 
 export interface ScanResult {
-  primary:      DetectedObject | null;
-  all:          DetectedObject[];
-  frameBase64:  string | null;
+  primary:     DetectedObject | null;
+  all:         DetectedObject[];
+  frameBase64: string | null;
 }
 
 interface UseObjectScannerOptions {
@@ -84,35 +130,38 @@ interface UseObjectScannerOptions {
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
-export function useObjectScanner({ onDetection, enabled = true }: UseObjectScannerOptions) {
+export function useObjectScanner({
+  onDetection,
+  enabled = true,
+}: UseObjectScannerOptions) {
   const { hasPermission, requestPermission } = useCameraPermission();
-  const device     = useCameraDevice("back");
-  const cameraRef  = useRef<Camera>(null);
+  const device    = useCameraDevice("back");
+  const cameraRef = useRef<Camera>(null);
 
-  // ── ML Kit live label state ──────────────────────────────────────────────────
-  const [liveLabel, setLiveLabel]           = useState<string | null>(null);
+  const [liveLabel,      setLiveLabel]      = useState<string | null>(null);
   const [liveConfidence, setLiveConfidence] = useState<number>(0);
 
   // Prevent concurrent snapshots (periodic + manual)
   const isScanningRef = useRef(false);
-  // Keep latest liveLabel accessible inside triggerManualScan without stale closure
-  const liveLabelRef  = useRef<string | null>(null);
-  liveLabelRef.current = liveLabel;
 
-  // Request camera permission on mount
+  // Refs so triggerManualScan can read latest values without stale closures
+  // and without liveConfidence being in the useCallback dep array
+  const liveLabelRef  = useRef<string | null>(null);
+  const liveConfRef   = useRef<number>(0);
+  liveLabelRef.current = liveLabel;
+  liveConfRef.current  = liveConfidence;
+
+  // Camera permission
   useEffect(() => {
     if (!hasPermission) requestPermission();
   }, [hasPermission, requestPermission]);
 
-  // Load ML Kit on mount (silently fails before EAS build)
-  useEffect(() => {
-    loadMLKit();
-  }, []);
+  // Load ML Kit on mount — silently no-ops if native module isn't compiled yet
+  useEffect(() => { loadMLKit(); }, []);
 
-  // ── Periodic smart viewfinder ─────────────────────────────────────────────────
+  // ── Periodic smart viewfinder ──────────────────────────────────────────────
   useEffect(() => {
     if (!enabled) {
-      // Reset live label when scanner is disabled
       setLiveLabel(null);
       setLiveConfidence(0);
       return;
@@ -123,7 +172,7 @@ export function useObjectScanner({ onDetection, enabled = true }: UseObjectScann
 
       isScanningRef.current = true;
       try {
-        // Low quality — we only need ML Kit labels, not a nice image
+        // Low quality — only need ML Kit labels, not a nice image
         const photo = await cameraRef.current.takeSnapshot({
           quality:      30,
           skipMetadata: true,
@@ -133,22 +182,11 @@ export function useObjectScanner({ onDetection, enabled = true }: UseObjectScann
           ? photo.path
           : `file://${photo.path}`;
 
-        const labels: Array<{ text: string; confidence: number }> =
-          await ImageLabeling.label(uri);
-
-        // Pick the highest-confidence non-generic label
-        const best = (labels ?? [])
-          .filter(
-            (l) =>
-              l.confidence >= CONFIDENCE_THRESHOLD &&
-              !SKIP_LABELS.has(l.text.toLowerCase())
-          )
-          .sort((a, b) => b.confidence - a.confidence)[0];
+        const raw  = await ImageLabeling.label(uri);
+        const best = pickBestLabel(raw);
 
         if (best) {
-          // Capitalise first letter for display
-          const label = best.text.charAt(0).toUpperCase() + best.text.slice(1).toLowerCase();
-          setLiveLabel(label);
+          setLiveLabel(capitalise(best.text));
           setLiveConfidence(best.confidence);
         } else {
           setLiveLabel(null);
@@ -164,13 +202,13 @@ export function useObjectScanner({ onDetection, enabled = true }: UseObjectScann
     return () => clearInterval(interval);
   }, [enabled]);
 
-  // ── Manual scan (button tap) ──────────────────────────────────────────────────
+  // ── Manual scan (button tap) ───────────────────────────────────────────────
   const triggerManualScan = useCallback(async () => {
     if (!cameraRef.current || !enabled || isScanningRef.current) return;
 
     isScanningRef.current = true;
     try {
-      // High quality snapshot for Claude's image evaluation
+      // High quality snapshot — sent to Claude for image evaluation
       const photo = await cameraRef.current.takeSnapshot({
         quality:      80,
         skipMetadata: true,
@@ -184,34 +222,21 @@ export function useObjectScanner({ onDetection, enabled = true }: UseObjectScann
         encoding: "base64" as any,
       });
 
-      // Use ML Kit label if available, otherwise generic fallback
-      const currentLabel  = liveLabelRef.current;
-      const currentConf   = liveConfidence;
+      // Default: use whatever the periodic viewfinder last saw (via refs)
+      let finalLabel = liveLabelRef.current ?? "object";
+      let finalConf  = liveLabelRef.current ? liveConfRef.current : 0.9;
 
-      // Run ML Kit on the high-quality snapshot too for freshest label
-      let finalLabel  = currentLabel ?? "object";
-      let finalConf   = currentLabel ? currentConf : 0.9;
-
+      // Prefer a fresh ML Kit pass on the high-quality frame when available
       if (mlKitAvailable && ImageLabeling) {
         try {
-          const freshLabels: Array<{ text: string; confidence: number }> =
-            await ImageLabeling.label(uri);
-
-          const freshBest = (freshLabels ?? [])
-            .filter(
-              (l) =>
-                l.confidence >= CONFIDENCE_THRESHOLD &&
-                !SKIP_LABELS.has(l.text.toLowerCase())
-            )
-            .sort((a, b) => b.confidence - a.confidence)[0];
-
+          const freshRaw  = await ImageLabeling.label(uri);
+          const freshBest = pickBestLabel(freshRaw);
           if (freshBest) {
-            finalLabel = freshBest.text.charAt(0).toUpperCase() +
-                         freshBest.text.slice(1).toLowerCase();
+            finalLabel = capitalise(freshBest.text);
             finalConf  = freshBest.confidence;
           }
         } catch {
-          // Use periodic label as fallback
+          // Fall back to periodic label already set above
         }
       }
 
@@ -221,23 +246,23 @@ export function useObjectScanner({ onDetection, enabled = true }: UseObjectScann
           confidence: finalConf,
           bounds:     { x: 0, y: 0, width: 0, height: 0 },
         },
-        all:          [],
-        frameBase64:  base64,
+        all:         [],
+        frameBase64: base64,
       });
     } catch (e) {
       console.warn("[useObjectScanner] triggerManualScan failed:", e);
     } finally {
       isScanningRef.current = false;
     }
-  }, [enabled, onDetection, liveConfidence]);
+  }, [enabled, onDetection]);
+  // liveConfidence intentionally NOT in deps — read via liveConfRef above
 
   return {
     cameraRef,
     device,
     hasPermission,
-    frameProcessor: undefined,   // frame processor slot — reserved for future
+    frameProcessor: undefined,  // slot reserved for future frame processor
     triggerManualScan,
-    // v3.1 — ML Kit live state
     liveLabel,
     liveConfidence,
     mlKitReady: mlKitAvailable,

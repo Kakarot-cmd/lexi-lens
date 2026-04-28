@@ -1,374 +1,436 @@
 /**
  * supabase/functions/evaluate/index.ts
- * Lexi-Lens — Supabase Edge Function (Deno runtime)
+ * Lexi-Lens — Supabase Edge Function entry point.
  *
- * Fix log:
- *   • EvaluateRequest gains alreadyFoundWords: string[] — context for Claude
- *   • User message rewritten: no more "ALL must pass" confusion
- *   • Explicit instruction: childFeedback MUST mention every passing property
- *   • overallMatch now means "all PENDING properties passed this scan"
- *   • XP only awarded when at least one property passes (partial match support)
- *   • Model updated to claude-haiku-4-5-20251001 (matches deployed version)
+ * Phase 3.5 additions — Rate Limiting + Abuse Prevention:
+ *   • IP-level rate limit: max 20 requests/IP/minute (brute-force shield)
+ *   • Daily child quota: max 50 Claude calls/child/day (get_daily_scan_count RPC)
+ *   • All calls logged to scan_attempts (existing table — real column names)
+ *   • Parent alert flag in response when child hits 80% / 100% of daily quota
+ *   • HTTP 429 with structured body for quota + IP limit errors
+ *
+ * Phase 3.4 — Redis Response Caching:
+ *   • Cache check/set via Upstash Redis (key = hash(label+questId), TTL 7d)
+ *
+ * scan_attempts columns used here:
+ *   child_id, quest_id, detected_label, vision_confidence,
+ *   resolved_name, overall_match, property_scores, child_feedback,
+ *   xp_awarded, claude_latency_ms, ip_hash, rate_limited
+ *
+ * Execution order:
+ *   1. CORS preflight
+ *   2. Parse + validate body
+ *   3. IP rate limit check  (ip_rate_limits table, 20 req/min)
+ *   4. Daily quota check    (get_daily_scan_count RPC, 50/day)
+ *   5. Redis cache check
+ *   6. Claude evaluation
+ *   7. INSERT into scan_attempts
+ *   8. Return result + alert flags
  */
 
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { serve }        from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-interface PropertyRequirement {
-  word: string;
-  definition: string;
-  evaluationHints?: string;
-}
-
-interface PropertyScore {
-  word: string;
-  score: number;
-  reasoning: string;
-  passes: boolean;
-}
-
-interface EvaluationResult {
-  resolvedObjectName: string;
-  properties: PropertyScore[];
-  overallMatch: boolean;
-  childFeedback: string;
-  nudgeHint?: string | null;
-  xpAwarded: number;
-}
-
-interface EvaluateRequest {
-  childId: string;
-  questId: string;
-  detectedLabel: string;
-  confidence: number;
-  frameBase64?: string | null;
-  requiredProperties: PropertyRequirement[];
-  childAge: number;
-  failedAttempts?: number;
-  questName?: string;
-  /**
-   * Words the child has already found in previous scans this session.
-   * Passed so Claude can acknowledge progress without re-evaluating them.
-   */
-  alreadyFoundWords?: string[];
-}
+import { evaluateObject } from "./evaluateObject.ts";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const PROPERTY_PASS_THRESHOLD = 0.88;
-const XP_FIRST_TRY = 40;
-const XP_RETRY     = 20;
-const XP_LATE      = 10;
+const DAILY_SCAN_LIMIT    = 50;
+const ALERT_THRESHOLD_PCT = 0.80;   // 80% → warn parent
+const IP_LIMIT_PER_MINUTE = 20;
+const IP_WINDOW_MS        = 60_000;
 
-// Bonus multipliers for finding multiple properties in one scan
-const XP_MULTI_2 = 1.5;  // 2 properties in one scan → 1.5x
-const XP_MULTI_3 = 2.0;  // 3 properties in one scan → 2x
+// ─── Redis helpers (Upstash — Phase 3.4) ─────────────────────────────────────
 
-const MODEL      = "claude-haiku-4-5-20251001";
-const MAX_TOKENS = 700;
+const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL")   ?? "";
+const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
+const CACHE_TTL_S = 7 * 24 * 60 * 60; // 7 days
+
+async function cacheGet(key: string): Promise<unknown | null> {
+  if (!REDIS_URL) return null;
+  try {
+    const res  = await fetch(`${REDIS_URL}/get/${key}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+    const json = await res.json();
+    if (!json.result) return null;
+
+    const parsed = JSON.parse(json.result);
+
+    // Shape validation — guard against old broken-format cache entries.
+    //
+    // The previous cacheSet sent { value: JSON.stringify(result), ex: TTL }
+    // as a JSON object body to POST /set/{key}. Upstash stored that entire
+    // object as the Redis string value. cacheGet then returned:
+    //   { value: "{...}", ex: 604800 }
+    // — an object with no resolvedObjectName / properties / childFeedback.
+    // VerdictCard spread it, got blank fields, rendered an empty card
+    // with only "Almost..." and the ⚡ Instant badge visible.
+    //
+    // Fix: require the three fields that every valid EvaluationResult must
+    // have. Any entry missing them (old format, corruption, schema change)
+    // is treated as a cache miss — Claude runs fresh and stores correctly.
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.resolvedObjectName !== "string" ||
+      !Array.isArray(parsed.properties) ||
+      typeof parsed.childFeedback !== "string"
+    ) {
+      console.warn("[cacheGet] Stale/invalid cache entry — treating as miss");
+      return null;
+    }
+
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+async function cacheSet(key: string, value: unknown): Promise<void> {
+  if (!REDIS_URL) return;
+  // BUG FIX: previous implementation sent { value, ex } as a JSON object in the
+  // body to POST /set/{key} — that is NOT the Upstash REST API format.
+  // Upstash expects a Redis command array sent to the base URL:
+  //   POST {REDIS_URL}
+  //   Body: ["SET", "key", "serialized_value", "EX", ttl_seconds]
+  // The previous format was silently accepted (HTTP 200) but stored nothing,
+  // so every subsequent GET returned null and the cache never hit.
+  try {
+    await fetch(REDIS_URL, {
+      method:  "POST",
+      headers: {
+        Authorization:  `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["SET", key, JSON.stringify(value), "EX", CACHE_TTL_S]),
+    });
+  } catch { /* non-fatal */ }
+}
+
+function buildCacheKey(detectedLabel: string, questId: string): string {
+  const raw = `${detectedLabel.toLowerCase().trim()}::${questId}`;
+  return `lexi:eval:${btoa(raw).replace(/=/g, "")}`;
+}
+
+// ─── IP rate limit ────────────────────────────────────────────────────────────
+
+async function hashIp(ip: string): Promise<string> {
+  const encoded = new TextEncoder().encode(
+    ip + (Deno.env.get("IP_HASH_SALT") ?? "lexi-lens")
+  );
+  const buf = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 16);
+}
+
+async function checkIpRateLimit(
+  supabase: ReturnType<typeof createClient>,
+  ipHash:   string
+): Promise<{ allowed: boolean; requestCount: number }> {
+  const windowStart = new Date(Date.now() - IP_WINDOW_MS).toISOString();
+
+  const { data: existing } = await supabase
+    .from("ip_rate_limits")
+    .select("request_count, window_start")
+    .eq("ip_hash", ipHash)
+    .maybeSingle();
+
+  if (!existing || existing.window_start < windowStart) {
+    await supabase.from("ip_rate_limits").upsert({
+      ip_hash:       ipHash,
+      request_count: 1,
+      window_start:  new Date().toISOString(),
+    });
+    return { allowed: true, requestCount: 1 };
+  }
+
+  const newCount = existing.request_count + 1;
+  await supabase
+    .from("ip_rate_limits")
+    .update({ request_count: newCount })
+    .eq("ip_hash", ipHash);
+
+  return { allowed: newCount <= IP_LIMIT_PER_MINUTE, requestCount: newCount };
+}
+
+// ─── scan_attempts logger ─────────────────────────────────────────────────────
+//
+// logScanBlocked — call was blocked before Claude ran (rate limit or error)
+// logScanResult  — Claude ran and returned a full evaluation result
+//
+// Column mapping against actual scan_attempts schema:
+//   child_id          ← childId
+//   quest_id          ← questId
+//   detected_label    ← detectedLabel
+//   vision_confidence ← confidence
+//   ip_hash           ← ipHash          (added by Phase 3.5 migration)
+//   rate_limited      ← isRateLimited   (added by Phase 3.5 migration)
+//   resolved_name     ← result.resolvedObjectName
+//   overall_match     ← result.overallMatch
+//   property_scores   ← result.properties  (jsonb)
+//   child_feedback    ← result.childFeedback
+//   xp_awarded        ← result.xpAwarded
+//   claude_latency_ms ← claudeLatencyMs
+
+async function logScanBlocked(
+  supabase: ReturnType<typeof createClient>,
+  opts: {
+    childId:       string;
+    questId?:      string;
+    detectedLabel: string;
+    confidence?:   number;
+    ipHash?:       string;
+    isRateLimited: boolean;
+  }
+) {
+  try {
+    await supabase.from("scan_attempts").insert({
+      child_id:          opts.childId,
+      quest_id:          opts.questId       ?? null,
+      detected_label:    opts.detectedLabel,
+      vision_confidence: opts.confidence    ?? null,
+      ip_hash:           opts.ipHash        ?? null,
+      rate_limited:      opts.isRateLimited,
+      xp_awarded:        0,
+    });
+  } catch (e) {
+    console.error("[evaluate] logScanBlocked INSERT failed:", e);
+  }
+}
+
+async function logScanResult(
+  supabase: ReturnType<typeof createClient>,
+  opts: {
+    childId:         string;
+    questId?:        string;
+    detectedLabel:   string;
+    confidence?:     number;
+    ipHash?:         string;
+    claudeLatencyMs: number;
+    result:          Awaited<ReturnType<typeof evaluateObject>>;
+  }
+) {
+  try {
+    await supabase.from("scan_attempts").insert({
+      child_id:          opts.childId,
+      quest_id:          opts.questId        ?? null,
+      detected_label:    opts.detectedLabel,
+      vision_confidence: opts.confidence     ?? null,
+      ip_hash:           opts.ipHash         ?? null,
+      rate_limited:      false,
+      resolved_name:     opts.result.resolvedObjectName,
+      overall_match:     opts.result.overallMatch,
+      property_scores:   opts.result.properties,
+      child_feedback:    opts.result.childFeedback,
+      xp_awarded:        opts.result.xpAwarded,
+      claude_latency_ms: opts.claudeLatencyMs,
+    });
+  } catch (e) {
+    console.error("[evaluate] logScanResult INSERT failed:", e);
+  }
+}
+
+// ─── Response helpers ─────────────────────────────────────────────────────────
 
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin":  "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// ─── System prompt ────────────────────────────────────────────────────────────
-
-function buildSystemPrompt(childAge: number, questName?: string): string {
-  return `You are a warm, encouraging vocabulary tutor in a fantasy RPG game called Lexi-Lens.
-Children aged 5–12 point their camera at real objects at home to find "material components" for spells.
-${questName ? `Current quest: "${questName}".` : ""}
-The child is approximately ${childAge} years old. Match language complexity to this age.
-
-CRITICAL SAFETY RULES:
-- Only discuss the object's physical properties. Never comment on the child, their home,
-  or anything else visible in the frame.
-- All feedback must be warm, encouraging, and age-appropriate.
-- Never name the correct answer object — guide without spoiling.
-- If the camera frame shows anything inappropriate, respond ONLY with:
-  {"error":"unable_to_evaluate"}
-
-FEEDBACK CONSISTENCY RULES (strictly follow these):
-- Your childFeedback MUST explicitly mention EVERY property that passes (score >= 0.88).
-  If 2 properties pass, celebrate BOTH by name. If 1 passes, celebrate that 1.
-  Never write "found a property" without naming which one(s).
-- Do NOT reference properties that have already been found in previous scans.
-- Do NOT say "all components found" unless every property in the list below passes.
-- Match your feedback to your scores — if you score a property above 0.88, you MUST
-  celebrate it in childFeedback. There must be no contradiction.
-
-RESPONSE FORMAT: Valid JSON only. No markdown. No explanation outside JSON.
-{
-  "resolvedObjectName": string,
-  "properties": [{ "word": string, "score": number, "reasoning": string, "passes": boolean }],
-  "overallMatch": boolean,
-  "childFeedback": string,
-  "nudgeHint": string | null
-}`;
-}
-
-// ─── Claude call ──────────────────────────────────────────────────────────────
-
-async function callClaude(req: EvaluateRequest): Promise<Omit<EvaluationResult, "xpAwarded">> {
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) throw new Error("ANTHROPIC_API_KEY not configured");
-
-  const propertyList = req.requiredProperties
-    .map((p, i) =>
-      `${i + 1}. "${p.word}" — ${p.definition}${p.evaluationHints ? ` | Hint: ${p.evaluationHints}` : ""}`
-    )
-    .join("\n");
-
-  const alreadyFound = (req.alreadyFoundWords ?? []);
-  const alreadyFoundLine = alreadyFound.length > 0
-    ? `\nAlready found in previous scans (do NOT re-evaluate or mention these): ${alreadyFound.join(", ")}`
-    : "\nThis is the first scan — no components found yet.";
-
-  const textContent = {
-    type: "text",
-    text: `Detected object: "${req.detectedLabel}" (confidence: ${(req.confidence * 100).toFixed(0)}%).
-${alreadyFoundLine}
-
-Properties to evaluate for THIS scan (evaluate each independently):
-${propertyList}
-
-Failed attempts on current component: ${req.failedAttempts ?? 0}
-${(req.failedAttempts ?? 0) >= 2 ? "Include a gentle nudgeHint that guides without naming the answer." : "Set nudgeHint to null."}
-
-IMPORTANT: Set overallMatch to true ONLY if every property listed above passes.
-Your childFeedback MUST name every property that passes. If 2 pass, mention both.`,
-  };
-
-  const content = req.frameBase64
-    ? [
-        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: req.frameBase64 } },
-        textContent,
-      ]
-    : [textContent];
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: MAX_TOKENS,
-      system: buildSystemPrompt(req.childAge, req.questName),
-      messages: [{ role: "user", content }],
-    }),
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
   });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`Claude API error ${response.status}: ${err}`);
-  }
-
-  const data = await response.json();
-  const rawText: string = data.content
-    .filter((b: { type: string }) => b.type === "text")
-    .map((b: { text: string }) => b.text)
-    .join("");
-
-  const clean = rawText.replace(/```json|```/g, "").trim();
-  const parsed = JSON.parse(clean);
-
-  if (parsed.error === "unable_to_evaluate") {
-    throw new Error("Frame could not be evaluated safely.");
-  }
-
-  // Enforce pass threshold server-side (authoritative — don't trust Claude's boolean)
-  parsed.properties = parsed.properties.map((p: PropertyScore) => ({
-    ...p,
-    passes: p.score >= PROPERTY_PASS_THRESHOLD,
-  }));
-  // overallMatch = all PENDING properties passed (not the whole quest)
-  parsed.overallMatch = parsed.properties.every((p: PropertyScore) => p.passes);
-
-  return parsed;
 }
 
-// ─── XP calculation ───────────────────────────────────────────────────────────
-//
-// Formula: (base_per_property × passingCount) × multi_bonus
-//
-// Examples (first try):
-//   1 property  found: (40 × 1) × 1.0  =  40 XP
-//   2 properties found: (40 × 2) × 1.5  = 120 XP
-//   3 properties found: (40 × 3) × 2.0  = 240 XP
-//
-// This always makes finding more in one scan worth MORE than separate scans:
-//   3 separate scans:  40 + 40 + 40 = 120 XP
-//   All 3 in one scan: 240 XP  ✓
-
-function calcXp(passingCount: number, failedAttempts: number): number {
-  if (passingCount === 0) return 0;
-
-  const basePerProperty = failedAttempts === 0
-    ? XP_FIRST_TRY
-    : failedAttempts === 1
-      ? XP_RETRY
-      : XP_LATE;
-
-  const multBonus = passingCount >= 3
-    ? XP_MULTI_3
-    : passingCount === 2
-      ? XP_MULTI_2
-      : 1.0;
-
-  return Math.round(basePerProperty * passingCount * multBonus);
+function utcMidnight(): string {
+  const d = new Date();
+  d.setUTCHours(24, 0, 0, 0);
+  return d.toISOString();
 }
 
-// ─── Supabase helpers ─────────────────────────────────────────────────────────
-
-function makeSupabase(authHeader: string | null) {
-  return createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    authHeader ? { global: { headers: { Authorization: authHeader } } } : {}
-  );
-}
-
-async function verifyChildOwnership(
-  supabase: ReturnType<typeof makeSupabase>,
-  childId: string,
-  userId: string
-): Promise<boolean> {
-  const { data } = await supabase
-    .from("child_profiles")
-    .select("id")
-    .eq("id", childId)
-    .eq("parent_id", userId)
-    .single();
-  return !!data;
-}
-
-async function persistResult(
-  supabase: ReturnType<typeof makeSupabase>,
-  req: EvaluateRequest,
-  result: Omit<EvaluationResult, "xpAwarded">,
-  xpAwarded: number,
-  latencyMs: number
-) {
-  await supabase.from("scan_attempts").insert({
-    child_id:          req.childId,
-    quest_id:          req.questId,
-    detected_label:    req.detectedLabel,
-    vision_confidence: req.confidence,
-    resolved_name:     result.resolvedObjectName,
-    overall_match:     result.overallMatch,
-    property_scores:   result.properties,
-    child_feedback:    result.childFeedback,
-    xp_awarded:        xpAwarded,
-    claude_latency_ms: latencyMs,
-  });
-
-  const passingProps = result.properties.filter((p) => p.passes);
-  if (passingProps.length === 0) return;
-
-  // Award XP for any passing properties
-  await supabase.rpc("award_xp", { p_child_id: req.childId, p_xp: xpAwarded });
-
-  // Update Word Tome for each passing property
-  for (const prop of passingProps) {
-    const requirement = req.requiredProperties.find((r) => r.word === prop.word);
-    if (!requirement) continue;
-    await supabase.rpc("record_word_learned", {
-      p_child_id:        req.childId,
-      p_word:            prop.word,
-      p_definition:      requirement.definition,
-      p_exemplar_object: result.resolvedObjectName,
-    });
-  }
-}
-
-// ─── Handler ──────────────────────────────────────────────────────────────────
+// ─── Main handler ─────────────────────────────────────────────────────────────
 
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { headers: CORS_HEADERS });
+    return new Response("ok", { headers: CORS_HEADERS });
   }
 
-  if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Method not allowed" }), {
-      status: 405,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-    });
-  }
+  const startMs = Date.now();
 
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    { auth: { persistSession: false } }
+  );
+
+  // ── 1. Parse + validate ───────────────────────────────────────────────────
+  let body: Record<string, unknown>;
   try {
-    // ── Auth ──────────────────────────────────────────────────
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return new Response(JSON.stringify({ error: "Missing authorization header" }), {
-        status: 401,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
-    }
+    body = await req.json();
+  } catch {
+    return jsonResponse({ error: "Invalid JSON body" }, 400);
+  }
 
-    const supabase = makeSupabase(authHeader);
-    const { data: { user }, error: authError } = await supabase.auth.getUser();
+  const {
+    childId,
+    questId,
+    questName,
+    detectedLabel,
+    confidence,
+    frameBase64,
+    requiredProperties,
+    childAge,
+    failedAttempts,
+    masteryProfile,
+    alreadyFoundWords,
+  } = body as Record<string, unknown>;
 
-    if (authError || !user) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
-    }
+  if (!childId || typeof childId !== "string") {
+    return jsonResponse({ error: "childId is required" }, 400);
+  }
+  if (!detectedLabel || typeof detectedLabel !== "string") {
+    return jsonResponse({ error: "detectedLabel is required" }, 400);
+  }
 
-    // ── Parse & validate ──────────────────────────────────────
-    const body: EvaluateRequest = await req.json();
-    const { childId, questId, detectedLabel, confidence, requiredProperties, childAge } = body;
+  // ── 2. IP rate limit ──────────────────────────────────────────────────────
+  const rawIp  = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
+              ?? req.headers.get("cf-connecting-ip")
+              ?? "unknown";
+  const ipHash = await hashIp(rawIp);
 
-    if (!childId || !questId || !detectedLabel || !requiredProperties?.length || !childAge) {
-      return new Response(JSON.stringify({ error: "Missing required fields" }), {
-        status: 400,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
-    }
+  const { allowed: ipAllowed, requestCount: ipCount } =
+    await checkIpRateLimit(supabase, ipHash);
 
-    const isOwner = await verifyChildOwnership(supabase, childId, user.id);
-    if (!isOwner) {
-      return new Response(JSON.stringify({ error: "Forbidden" }), {
-        status: 403,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      });
-    }
-
-    // ── Call Claude ───────────────────────────────────────────
-    const claudeStart  = Date.now();
-    const result       = await callClaude(body);
-    const claudeLatency = Date.now() - claudeStart;
-
-    // ── Compute XP (partial match aware) ─────────────────────
-    const passingCount = result.properties.filter((p) => p.passes).length;
-    const xpAwarded    = calcXp(passingCount, body.failedAttempts ?? 0);
-
-    // ── Persist (fire-and-forget) ─────────────────────────────
-    persistResult(supabase, body, result, xpAwarded, claudeLatency).catch(console.error);
-
-    // ── Respond ───────────────────────────────────────────────
-    const finalResult: EvaluationResult = { ...result, xpAwarded };
-
-    return new Response(JSON.stringify(finalResult), {
-      status: 200,
-      headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+  if (!ipAllowed) {
+    console.warn(`[evaluate] IP limit hit: hash=${ipHash} count=${ipCount}`);
+    await logScanBlocked(supabase, {
+      childId,
+      questId:       questId as string | undefined,
+      detectedLabel: detectedLabel as string,
+      confidence:    confidence as number | undefined,
+      ipHash,
+      isRateLimited: true,
     });
-
-  } catch (err) {
-    console.error("evaluate function error:", err);
-    const isKnownError = err instanceof Error && err.message.includes("safely");
-    return new Response(
-      JSON.stringify({ error: isKnownError ? err.message : "Internal server error" }),
+    return jsonResponse(
       {
-        status: isKnownError ? 422 : 500,
-        headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-      }
+        error:      "rate_limit_exceeded",
+        code:       "IP_LIMIT",
+        message:    "Too many requests. Please wait a moment before scanning again.",
+        retryAfter: 60,
+      },
+      429
     );
   }
+
+  // ── 3. Daily child quota ──────────────────────────────────────────────────
+  const { data: scanCount, error: rpcError } = await supabase.rpc(
+    "get_daily_scan_count",
+    { p_child_id: childId }
+  );
+
+  if (rpcError) {
+    // Fail open — let the scan through rather than blocking on a DB hiccup
+    console.error("[evaluate] get_daily_scan_count RPC error:", rpcError);
+  }
+
+  const scansToday = (scanCount as number | null) ?? 0;
+
+  if (scansToday >= DAILY_SCAN_LIMIT) {
+    console.warn(`[evaluate] Daily quota exceeded: childId=${childId} scans=${scansToday}`);
+    await logScanBlocked(supabase, {
+      childId,
+      questId:       questId as string | undefined,
+      detectedLabel: detectedLabel as string,
+      confidence:    confidence as number | undefined,
+      ipHash,
+      isRateLimited: true,
+    });
+    return jsonResponse(
+      {
+        error:      "rate_limit_exceeded",
+        code:       "DAILY_QUOTA",
+        scansToday,
+        limit:      DAILY_SCAN_LIMIT,
+        resetsAt:   utcMidnight(),
+        message:    "Daily scan limit reached. Come back tomorrow, brave adventurer!",
+      },
+      429
+    );
+  }
+
+  // ── 4. Redis cache check ──────────────────────────────────────────────────
+  const cacheKey     = buildCacheKey(detectedLabel as string, (questId as string) ?? "");
+  const cachedResult = (failedAttempts as number ?? 0) === 0
+    ? await cacheGet(cacheKey)
+    : null;
+
+  if (cachedResult) {
+    console.log(`[evaluate] ⚡ Cache hit: key=${cacheKey}`);
+    // Cache hits are NOT logged to scan_attempts — the original call was already
+    // logged, and cache hits don't consume a Claude token or count toward quota.
+    return jsonResponse({ ...(cachedResult as object), _cacheHit: true });
+  }
+
+  // ── 5. Call Claude ────────────────────────────────────────────────────────
+  const claudeStart = Date.now();
+  let evaluationResult: Awaited<ReturnType<typeof evaluateObject>>;
+
+  try {
+    evaluationResult = await evaluateObject({
+      detectedLabel:      detectedLabel as string,
+      confidence:         confidence as number,
+      frameBase64:        frameBase64 as string | null | undefined,
+      requiredProperties: requiredProperties as Parameters<typeof evaluateObject>[0]["requiredProperties"],
+      childAge:           childAge as number,
+      failedAttempts:     failedAttempts as number | undefined,
+      questName:          questName as string | undefined,
+      masteryProfile:     masteryProfile as Parameters<typeof evaluateObject>[0]["masteryProfile"],
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Evaluation failed";
+    await logScanBlocked(supabase, {
+      childId,
+      questId:       questId as string | undefined,
+      detectedLabel: detectedLabel as string,
+      confidence:    confidence as number | undefined,
+      ipHash,
+      isRateLimited: false, // Claude errored — not a rate limit
+    });
+    return jsonResponse({ error: msg }, 500);
+  }
+
+  // ── 6. Log full result to scan_attempts ───────────────────────────────────
+  await logScanResult(supabase, {
+    childId,
+    questId:         questId as string | undefined,
+    detectedLabel:   detectedLabel as string,
+    confidence:      confidence as number | undefined,
+    ipHash,
+    claudeLatencyMs: Date.now() - claudeStart,
+    result:          evaluationResult,
+  });
+
+  // ── 7. Cache successful result ────────────────────────────────────────────
+  if ((failedAttempts as number | undefined ?? 0) === 0) {
+    await cacheSet(cacheKey, { ...evaluationResult, _cacheHit: false });
+  }
+
+  // ── 8. Parent alert flags ─────────────────────────────────────────────────
+  const newScansToday = scansToday + 1;
+  const alertFlags = {
+    scansToday:       newScansToday,
+    dailyLimit:       DAILY_SCAN_LIMIT,
+    approachingLimit: newScansToday >= Math.floor(DAILY_SCAN_LIMIT * ALERT_THRESHOLD_PCT),
+    limitReached:     newScansToday >= DAILY_SCAN_LIMIT,
+  };
+
+  return jsonResponse({
+    ...evaluationResult,
+    _cacheHit:  false,
+    _rateLimit: alertFlags,
+  });
 });

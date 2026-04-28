@@ -1,6 +1,15 @@
 /**
  * ScanScreen.tsx — Lexi-Lens main gameplay screen
  *
+ * v3.5 additions (Rate Limiting + Abuse Prevention):
+ *   • Destructures rateLimitCode, scansToday, dailyLimit, approachingLimit,
+ *     resetsAt from useLexiEvaluate
+ *   • status === "rate_limited" → setPhase("verdict") so render tree picks
+ *     it up cleanly (same pattern as "error")
+ *   • RateLimitWall rendered as absoluteFillObject overlay when rate_limited
+ *   • ApproachingLimitBanner shown non-blocking in scanning phase at 80% quota
+ *   • limitBannerDismissed local state so child can clear the warning
+ *
  * v3.1 additions:
  *   • LiveLabelChip — floating chip on camera showing what ML Kit currently sees
  *     ("📦 cushion · 94%"). Updates every 1.5s. Disappears when scanning.
@@ -34,10 +43,12 @@ import {
   selectCurrentComponent,
   selectCurrentAttempts,
   selectQuestComplete,
+  selectStreakMultiplier,
 } from "../store/gameStore";
-import { VerdictCard }        from "../components/VerdictCard";
-import { StatusBanner }       from "../components/StatusBanner";
-import { VictoryFusionScreen } from "../components/VictoryFusionScreen";
+import { VerdictCard }                              from "../components/VerdictCard";
+import { StatusBanner }                             from "../components/StatusBanner";
+import { VictoryFusionScreen }                      from "../components/VictoryFusionScreen";
+import { RateLimitWall, ApproachingLimitBanner }    from "../components/RateLimitWall"; // v3.5
 
 type RootStackParamList = {
   Scan: { questId: string; hardMode?: boolean };
@@ -77,9 +88,6 @@ function CameraOverlay() {
 }
 
 // ─── v3.1: Live ML Kit label chip ────────────────────────────────────────────
-//
-// Floating chip on the camera showing what ML Kit currently sees.
-// Cyan when confident, dimmer when unsure. Hidden when not scanning.
 
 function LiveLabelChip({
   label,
@@ -103,8 +111,7 @@ function LiveLabelChip({
   if (!label) return null;
 
   const confPct = Math.round(confidence * 100);
-  // Colour shifts warmer as confidence increases
-  const chipBg = confidence > 0.75
+  const chipBg  = confidence > 0.75
     ? "rgba(6,40,55,0.92)"
     : "rgba(20,8,50,0.85)";
   const textCol = confidence > 0.75 ? "#67e8f9" : "#a78bfa";
@@ -113,12 +120,8 @@ function LiveLabelChip({
     <Animated.View style={[styles.liveChipWrap, { opacity: fadeAnim }]} pointerEvents="none">
       <View style={[styles.liveChip, { backgroundColor: chipBg }]}>
         <View style={[styles.liveDot, { backgroundColor: textCol }]} />
-        <Text style={[styles.liveChipText, { color: textCol }]}>
-          {label}
-        </Text>
-        <Text style={[styles.liveChipConf, { color: textCol }]}>
-          · {confPct}%
-        </Text>
+        <Text style={[styles.liveChipText, { color: textCol }]}>{label}</Text>
+        <Text style={[styles.liveChipConf, { color: textCol }]}>· {confPct}%</Text>
       </View>
     </Animated.View>
   );
@@ -327,6 +330,7 @@ export function ScanScreen({ route, navigation }: Props) {
   const currentAttempts  = useGameStore(selectCurrentAttempts);
   const questComplete    = useGameStore(selectQuestComplete);
 
+  const streakMultiplier     = useGameStore(selectStreakMultiplier);
   const beginQuest           = useGameStore((s) => s.beginQuest);
   const recordComponentFound = useGameStore((s) => s.recordComponentFound);
   const recordMissedScan     = useGameStore((s) => s.recordMissedScan);
@@ -337,9 +341,10 @@ export function ScanScreen({ route, navigation }: Props) {
   const markQuestCompletion  = useGameStore((s) => s.markQuestCompletion);
   const refreshChildFromDB   = useGameStore((s) => s.refreshChildFromDB);
 
-  const [phase, setPhase]             = useState<ScreenPhase>("quest_intro");
-  const [lastLabel, setLastLabel]     = useState<string | null>(null);
-  const [browsedWord, setBrowsedWord] = useState<string | null>(null);
+  const [phase, setPhase]                         = useState<ScreenPhase>("quest_intro");
+  const [lastLabel, setLastLabel]                 = useState<string | null>(null);
+  const [browsedWord, setBrowsedWord]             = useState<string | null>(null);
+  const [limitBannerDismissed, setLimitBannerDismissed] = useState(false); // v3.5
 
   useEffect(() => {
     const quest = questLibrary.find((q) => q.id === questId);
@@ -361,27 +366,66 @@ export function ScanScreen({ route, navigation }: Props) {
     (p) => !activeQuest?.components.find((c) => c.propertyWord === p.word && c.found)
   );
 
-  const { status, result, error, evaluate, reset: resetEval } = useLexiEvaluate();
+  // v3.5: expanded destructure
+  const {
+    status,
+    result,
+    error,
+    masteryResult,
+    cacheHit,
+    evaluate,
+    reset: resetEval,
+    rateLimitCode,
+    scansToday,
+    dailyLimit,
+    approachingLimit,
+    resetsAt,
+  } = useLexiEvaluate();
 
   // ── Core mechanic: save any newly passing property ────────────────────────
 
   useEffect(() => {
+    // v3.5: rate_limited goes straight to verdict phase so RateLimitWall renders
+    if (status === "rate_limited") {
+      setPhase("verdict");
+      return;
+    }
+
     if (!result || !activeQuest) return;
 
     if (status === "match" || status === "no-match") {
       setPhase("verdict");
 
       const alreadyFound = new Set(
-        activeQuest.components.filter((c) => c.found).map((c) => c.propertyWord)
+        (activeQuest.components ?? []).filter((c) => c.found).map((c) => c.propertyWord)
       );
 
-      const newlyPassing = result.properties.filter(
+      // FIX: result.properties is undefined when Edge Function returns a
+      // partial response (e.g. error shape without properties array).
+      // Guard with ?? [] so the forEach below safely does nothing.
+      const newlyPassing = (result.properties ?? []).filter(
         (p) => p.passes && !alreadyFound.has(p.word)
       );
 
       if (newlyPassing.length > 0) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        const xpEach = Math.max(10, Math.floor((result.xpAwarded || 20) / newlyPassing.length));
+
+        // ── XP calculation (Phase 1.2 + 2.3) ─────────────────────────────
+        //
+        // result.xpAwarded already includes the multi-property bonus from
+        // the Edge Function (1.0× / 1.5× / 2.0× based on passingCount).
+        //
+        // Here we additionally apply the 7-day streak multiplier (1.0× or 2.0×)
+        // from the store — this is the only place that knows both values.
+        //
+        // Previous bug: divided xpAwarded by newlyPassing.length, which cut
+        // XP instead of distributing it. Each property gets the full XP share:
+        //   total = xpAwarded × streakMultiplier
+        //   each  = total / newlyPassing.length   (fair split across properties)
+        //
+        // Minimum 10 XP per property so no find ever feels worthless.
+        const totalXpThisScan = Math.round((result.xpAwarded || 20) * streakMultiplier);
+        const xpEach = Math.max(10, Math.floor(totalXpThisScan / newlyPassing.length));
 
         newlyPassing.forEach((p) => {
           recordComponentFound({
@@ -407,7 +451,7 @@ export function ScanScreen({ route, navigation }: Props) {
           timestamp:     Date.now(),
           detectedLabel: lastLabel ?? result.resolvedObjectName,
           overallMatch:  true,
-          xpAwarded:     xpEach * newlyPassing.length,
+          xpAwarded:     totalXpThisScan,
           questName:     activeQuest.quest.name ?? "",
           feedback:      result.childFeedback,
         });
@@ -442,10 +486,32 @@ export function ScanScreen({ route, navigation }: Props) {
     }
     const totalXp = activeQuest.components.reduce((s, c) => s + c.xpEarned, 0);
     const mode    = activeQuest.isHardMode ? "hard" : "normal";
-    markQuestCompletion(activeQuest.quest.id, mode, totalXp);
-    completeQuest();
-    refreshChildFromDB();
-    navigation.goBack();
+
+    // FIX: markQuestCompletion was not awaited. navigation.goBack() fired while the
+    // upsert was still in-flight. Any focus-triggered DB read in QuestMap would
+    // race the upsert and return stale data, wiping the optimistic update.
+    //
+    // We use .then() (not async/await) so the callback stays () => void as required
+    // by VictoryFusionScreen's onContinue prop type.
+    //
+    // Sequence:
+    //   1. markQuestCompletion() → optimistic set fires immediately (sync) → upsert starts
+    //   2. Upsert completes (~200ms) → loadCompletedQuests() confirms from DB
+    //   3. .then() fires → completeQuest() + navigation.goBack()
+    //   4. QuestMap renders with fully confirmed completedQuestIds → shows "Done" ✓
+    markQuestCompletion(activeQuest.quest.id, mode, totalXp)
+      .then(() => {
+        completeQuest();
+        refreshChildFromDB();
+        navigation.goBack();
+      })
+      .catch(() => {
+        // Upsert failed (network/schema error) — optimistic update is still in
+        // the store and AsyncStorage, so same-session and cold-launch still work.
+        // Navigate away regardless so the child isn't stuck on the victory screen.
+        completeQuest();
+        navigation.goBack();
+      });
   }, [activeQuest, activeChild, markQuestCompletion, completeQuest, refreshChildFromDB, navigation]);
 
   // ── v3.1: ML Kit scanner ──────────────────────────────────────────────────
@@ -456,14 +522,13 @@ export function ScanScreen({ route, navigation }: Props) {
     hasPermission,
     frameProcessor,
     triggerManualScan,
-    liveLabel,       // v3.1
-    liveConfidence,  // v3.1
+    liveLabel,
+    liveConfidence,
   } = useObjectScanner({
     enabled: phase === "scanning" && status === "idle",
     onDetection: async ({ primary, frameBase64 }) => {
       if (!activeChild || !activeQuest) return;
 
-      // primary.label is now the ML Kit label (or "object" fallback)
       setLastLabel(primary?.label ?? "object");
       setPhase("verdict");
 
@@ -523,7 +588,6 @@ export function ScanScreen({ route, navigation }: Props) {
         <>
           <CameraOverlay />
 
-          {/* v3.1 — live ML Kit label chip, centred on camera */}
           <LiveLabelChip
             label={liveLabel}
             confidence={liveConfidence}
@@ -543,6 +607,15 @@ export function ScanScreen({ route, navigation }: Props) {
           </View>
 
           <View style={[styles.bottomHud, { paddingBottom: insets.bottom + 12 }]}>
+            {/* v3.5 — approaching-limit warning strip, dismissible */}
+            {approachingLimit && !limitBannerDismissed && (
+              <ApproachingLimitBanner
+                scansToday={scansToday}
+                dailyLimit={dailyLimit}
+                onDismiss={() => setLimitBannerDismissed(true)}
+              />
+            )}
+
             {browsedWord && !activeQuest?.components.find(c => c.propertyWord === browsedWord && c.found) && (
               <View style={[styles.seekCard, isHardMode && styles.seekCardHard]}>
                 <Text style={styles.seekLabel}>
@@ -586,7 +659,6 @@ export function ScanScreen({ route, navigation }: Props) {
             </TouchableOpacity>
           </View>
 
-          {/* v3.1 — pass liveLabel to StatusBanner for idle state text */}
           <StatusBanner
             status={status}
             detectedLabel={lastLabel}
@@ -616,12 +688,31 @@ export function ScanScreen({ route, navigation }: Props) {
         </View>
       )}
 
+      {/* v3.5 — rate limit wall: full-screen overlay, shown before VerdictCard check */}
+      {phase === "verdict" && status === "rate_limited" && rateLimitCode && (
+        <View style={StyleSheet.absoluteFillObject}>
+          <RateLimitWall
+            code={rateLimitCode}
+            scansToday={scansToday}
+            dailyLimit={dailyLimit}
+            resetsAt={resetsAt}
+            onBack={() => {
+              resetEval();
+              abandonQuest();
+              navigation.goBack();
+            }}
+          />
+        </View>
+      )}
+
       {phase === "verdict" &&
         (status === "match" || status === "no-match" || status === "error") && (
           <VerdictCard
             status={status}
             result={result}
             error={error}
+            masteryResult={masteryResult}
+            cacheHit={cacheHit}
             onContinue={handleContinue}
             onTryAgain={handleTryAgain}
           />
@@ -658,7 +749,6 @@ const styles = StyleSheet.create({
   bl: { bottom: 290, left: 20, borderBottomWidth: 2.5, borderLeftWidth: 2.5,  borderBottomLeftRadius: 4 },
   br: { bottom: 290, right: 20,borderBottomWidth: 2.5, borderRightWidth: 2.5, borderBottomRightRadius: 4 },
 
-  // v3.1 — live label chip
   liveChipWrap: {
     position:   "absolute",
     top:        "38%",
@@ -677,20 +767,9 @@ const styles = StyleSheet.create({
     borderWidth:       1,
     borderColor:       "rgba(103,232,249,0.3)",
   },
-  liveDot: {
-    width:        7,
-    height:       7,
-    borderRadius: 3.5,
-  },
-  liveChipText: {
-    fontSize:   14,
-    fontWeight: "600",
-  },
-  liveChipConf: {
-    fontSize:   12,
-    fontWeight: "500",
-    opacity:    0.7,
-  },
+  liveDot:      { width: 7, height: 7, borderRadius: 3.5 },
+  liveChipText: { fontSize: 14, fontWeight: "600" },
+  liveChipConf: { fontSize: 12, fontWeight: "500", opacity: 0.7 },
 
   hardBanner:     { backgroundColor: P.hardRed, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 5, alignSelf: "center", marginBottom: 6 },
   hardBannerText: { fontSize: 11, fontWeight: "700", color: "#fff", letterSpacing: 0.5 },

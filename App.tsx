@@ -10,6 +10,7 @@ import { AuthScreen } from "./screens/AuthScreen";
 import { ChildSwitcherScreen } from "./screens/ChildSwitcherScreen";
 import { QuestMapScreen } from "./screens/QuestMapScreen";
 import { ParentDashboard } from "./screens/ParentDashboard";
+import SpellBookScreen from "./screens/SpellBookScreen";
 
 function ScanPlaceholder() {
   return (
@@ -47,7 +48,8 @@ function AppNavigator() {
       <AppNav.Screen name="ChildSwitcher" component={ChildSwitcherScreen} />
       <AppNav.Screen name="QuestMap"      component={QuestMapScreen} />
       <AppNav.Screen name="Scan"          component={ScanScreen} />
-      <AppNav.Screen name="Parent"        component={ParentDashboard} />
+      <AppNav.Screen name="ParentDashboard"        component={ParentDashboard} />
+	  <AppNav.Screen name="SpellBook"     component={SpellBookScreen} /> 
     </AppNav.Navigator>
   );
 }

@@ -33,24 +33,26 @@ import * as Haptics             from "expo-haptics";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { supabase, signOut }    from "../lib/supabase";
+import QuestGeneratorScreen     from "./QuestGeneratorScreen";
 import { useGameStore }         from "../store/gameStore";
 
 // ─── Navigation types ─────────────────────────────────────────────────────────
 
 type RootStackParamList = {
-  Auth:          undefined;
-  ChildSwitcher: undefined;
-  QuestMap:      undefined;
+  Auth:            undefined;
+  ChildSwitcher:   undefined;
+  QuestMap:        undefined;
+  ParentDashboard: undefined;
 };
 type Props = NativeStackScreenProps<RootStackParamList, "ChildSwitcher">;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const AGE_BANDS = [
-  { band: "5-6",   label: "5–6 yrs",   desc: "Early reader" },
-  { band: "7-8",   label: "7–8 yrs",   desc: "Developing"   },
-  { band: "9-10",  label: "9–10 yrs",  desc: "Advancing"    },
-  { band: "11-12", label: "11–12 yrs", desc: "Proficient"   },
+  { band: "5-6",   label: "5–6 yrs",   desc: "Early reader", age: 6  },
+  { band: "7-8",   label: "7–8 yrs",   desc: "Developing",   age: 8  },
+  { band: "9-10",  label: "9–10 yrs",  desc: "Advancing",    age: 10 },
+  { band: "11-12", label: "11–12 yrs", desc: "Proficient",   age: 12 },
 ] as const;
 type AgeBand = typeof AGE_BANDS[number]["band"];
 
@@ -119,7 +121,7 @@ function AvatarPicker({
   );
 }
 
-// ─── Age band picker (ranges) ─────────────────────────────────────────────────
+// ─── Age band picker ─────────────────────────────────────────────────────────
 
 function AgePicker({
   selected,
@@ -130,23 +132,26 @@ function AgePicker({
 }) {
   return (
     <View style={styles.ageGrid}>
-      {AGE_BANDS.map((item) => (
-        <TouchableOpacity
-          key={item.band}
-          style={[styles.ageChip, selected === item.band && styles.ageChipSelected]}
-          onPress={() => { onSelect(item.band); Haptics.selectionAsync(); }}
-          accessibilityRole="radio"
-          accessibilityState={{ checked: selected === item.band }}
-          accessibilityLabel={item.label}
-        >
-          <Text style={[styles.ageChipRange, selected === item.band && styles.ageChipRangeSelected]}>
-            {item.label}
-          </Text>
-          <Text style={[styles.ageChipDesc, selected === item.band && styles.ageChipDescSelected]}>
-            {item.desc}
-          </Text>
-        </TouchableOpacity>
-      ))}
+      {AGE_BANDS.map((item) => {
+        const isSelected = selected === item.band;
+        return (
+          <TouchableOpacity
+            key={item.band}
+            style={[styles.ageChip, isSelected && styles.ageChipSelected]}
+            onPress={() => { onSelect(item.band); Haptics.selectionAsync(); }}
+            accessibilityRole="radio"
+            accessibilityState={{ checked: isSelected }}
+            accessibilityLabel={item.label}
+          >
+            <Text style={[styles.ageChipRange, isSelected && styles.ageChipRangeSelected]}>
+              {item.label}
+            </Text>
+            <Text style={[styles.ageChipDesc, isSelected && styles.ageChipDescSelected]}>
+              {item.desc}
+            </Text>
+          </TouchableOpacity>
+        );
+      })}
     </View>
   );
 }
@@ -183,10 +188,12 @@ function AddChildForm({
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("Not signed in");
 
+      const selectedBand = AGE_BANDS.find((b) => b.band === ageBand)!;
       const { error: insertErr } = await supabase.from("child_profiles").insert({
         parent_id:    user.id,
         display_name: name.trim(),
-        age_band:     ageBand,
+        age_band:     ageBand,            // set directly — works with or without trigger
+        age:          selectedBand.age,   // integer for DB trigger compatibility
         avatar_key:   avatarKey,
       });
       if (insertErr) throw insertErr;
@@ -291,7 +298,7 @@ function ChildCard({
         <View style={styles.childInfo}>
           <Text style={styles.childName}>{child.display_name}</Text>
           <Text style={styles.childMeta}>
-            Age {child.age_band} · Lv {child.level} · {child.total_xp} XP
+            {child.age_band ? `Age ${child.age_band}` : "Age —"} · Lv {child.level} · {child.total_xp} XP
           </Text>
         </View>
         <Text style={styles.childChevron}>›</Text>
@@ -313,10 +320,12 @@ function ChildCard({
 
 export function ChildSwitcherScreen({ navigation }: Props) {
   const insets  = useSafeAreaInsets();
-  const [children,   setChildren]   = useState<ChildRow[]>([]);
-  const [loading,    setLoading]    = useState(true);
-  const [showForm,   setShowForm]   = useState(false);
-  const [signingOut, setSigningOut] = useState(false);
+  const [children,      setChildren]      = useState<ChildRow[]>([]);
+  const [loading,       setLoading]       = useState(true);
+  const [showForm,      setShowForm]      = useState(false);
+  const [signingOut,    setSigningOut]    = useState(false);
+  const [showGenerator, setShowGenerator] = useState(false);
+  const [generatorChild,setGeneratorChild] = useState<ChildRow | null>(null);
 
   const startChildSession = useGameStore((s) => s.startChildSession);
   const loadQuests        = useGameStore((s) => s.loadQuests);
@@ -390,17 +399,26 @@ export function ChildSwitcherScreen({ navigation }: Props) {
           <Text style={styles.headerTitle}>Who's playing?</Text>
           <Text style={styles.headerSub}>Select a child to begin</Text>
         </View>
-        <TouchableOpacity
-          style={styles.signOutBtn}
-          onPress={handleSignOut}
-          disabled={signingOut}
-          accessibilityRole="button"
-          accessibilityLabel="Sign out"
-        >
-          {signingOut
-            ? <ActivityIndicator color={P.inkLight} size="small" />
-            : <Text style={styles.signOutText}>Sign out</Text>}
-        </TouchableOpacity>
+        <View style={styles.headerActions}>
+          <TouchableOpacity
+            style={styles.dashboardBtn}
+            onPress={() => navigation.navigate("ParentDashboard")}
+            accessibilityLabel="Parent dashboard"
+          >
+            <Text style={styles.dashboardBtnText}>📊 Word Tome</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.signOutBtn}
+            onPress={handleSignOut}
+            disabled={signingOut}
+            accessibilityRole="button"
+            accessibilityLabel="Sign out"
+          >
+            {signingOut
+              ? <ActivityIndicator color={P.inkLight} size="small" />
+              : <Text style={styles.signOutText}>Sign out</Text>}
+          </TouchableOpacity>
+        </View>
       </View>
 
       <ScrollView
@@ -430,8 +448,21 @@ export function ChildSwitcherScreen({ navigation }: Props) {
                 child={child}
                 onSelect={() => handleSelect(child)}
                 onDelete={() => handleDelete(child.id)}
+                onCreateQuest={() => {
+                  setGeneratorChild(child);
+                  setShowGenerator(true);
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                }}
               />
             ))}
+
+            {/* ── AI Quest Generator Modal ──────────────── */}
+            <QuestGeneratorScreen
+              visible={showGenerator}
+              onClose={() => { setShowGenerator(false); setGeneratorChild(null); }}
+              defaultAgeBand={(generatorChild?.age_band as any) ?? "7-8"}
+              targetChild={generatorChild}
+            />
 
             {showForm ? (
               <AddChildForm
@@ -488,6 +519,26 @@ const styles = StyleSheet.create({
   signOutBtn:  { paddingVertical: 8, paddingHorizontal: 4 },
   signOutText: { fontSize: 14, color: P.inkLight, fontWeight: "500" },
 
+  // Header actions
+  headerActions: {
+    flexDirection: "row",
+    alignItems:    "center",
+  },
+  dashboardBtn: {
+    backgroundColor:   P.purpleLight,
+    borderRadius:      20,
+    paddingHorizontal: 10,
+    paddingVertical:   7,
+    borderWidth:       1,
+    borderColor:       P.purpleBorder,
+    marginRight:       8,
+  },
+  dashboardBtnText: {
+    color:      P.purple,
+    fontSize:   12,
+    fontWeight: "700",
+  },
+
   // Child card
   childCard: {
     flexDirection:   "row",
@@ -508,8 +559,22 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems:    "center",
     padding:       16,
-    gap:           14,
   },
+  cardActions: {
+    flexDirection: "row",
+    alignItems:    "stretch",
+  },
+  questBtn: {
+    paddingHorizontal: 12,
+    paddingVertical:   16,
+    backgroundColor:   P.purpleLight,
+    borderLeftWidth:   1,
+    borderLeftColor:   P.purpleBorder,
+    alignItems:        "center",
+    justifyContent:    "center",
+  },
+  questBtnText: { fontSize: 16 },
+  childAvatarWrap: { marginRight: 14 },
   childAvatar: {
     width:           50,
     height:          50,
@@ -586,7 +651,6 @@ const styles = StyleSheet.create({
   ageGrid: {
     flexDirection: "row",
     flexWrap:      "wrap",
-    gap:           8,
   },
   ageChip: {
     width:           "47%",
@@ -596,6 +660,8 @@ const styles = StyleSheet.create({
     backgroundColor: P.parchment,
     borderWidth:     1,
     borderColor:     P.warmBorder,
+    marginRight:     "3%",
+    marginBottom:    8,
   },
   ageChipSelected:        { backgroundColor: P.amberLight, borderColor: P.amber },
   ageChipRange:           { fontSize: 15, fontWeight: "700", color: P.inkMid },

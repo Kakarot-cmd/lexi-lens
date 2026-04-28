@@ -2,6 +2,14 @@
  * gameStore.ts
  * Lexi-Lens — Zustand store for all client-side game state.
  *
+ * v2.4 additions (Phase 2.4 — Spell Book):
+ *   • SpellUnlock type
+ *   • spellBook: SpellUnlock[]   — all unlocked spells for the active child
+ *   • isLoadingSpells: boolean
+ *   • loadSpellBook()            — queries spell_unlocks VIEW from Supabase
+ *   • markQuestCompletion() now auto-calls loadSpellBook() after DB write
+ *   • spellBook persisted to AsyncStorage (survives cold launch)
+ *
  * v2.3 additions (Phase 2.3 — Daily Quest + 7-day Streak):
  *   • StreakData + DailyQuestState types
  *   • streak, dailyQuest, isDailyQuestComplete state fields
@@ -130,6 +138,10 @@ export interface Quest {
   approved_at:           string | null;
   /** 1-15 within each age band — lower = easier vocabulary */
   sort_order:            number;
+  /** v2.4 — spell book fields (populated via schema_v2_4.sql migration) */
+  spell_name?:           string;
+  weapon_emoji?:         string;
+  spell_description?:    string;
 }
 
 export interface ComponentProgress {
@@ -208,6 +220,28 @@ export interface DailyQuestState {
   isLoaded:  boolean;
 }
 
+// ─── v2.4: Spell Book type ────────────────────────────────────────────────────
+
+/**
+ * A single entry in the child's Spell Book.
+ * Sourced from the spell_unlocks VIEW (schema_v2_4.sql).
+ */
+export interface SpellUnlock {
+  questId:          string;
+  questName:        string;
+  spellName:        string;
+  weaponEmoji:      string;
+  spellDescription: string;
+  enemyName:        string;
+  enemyEmoji:       string;
+  roomLabel:        string;
+  tier:             QuestTier;
+  // Hard-mode badge: checked via hardCompletedQuestIds — not stored in view
+  unlockedAt:       string;   // ISO timestamp string
+  bestXp:           number;
+  completionCount:  number;
+}
+
 // ─── Store shape ──────────────────────────────────────────────────────────────
 
 interface GameState {
@@ -226,6 +260,10 @@ interface GameState {
   streak:               StreakData;
   dailyQuest:           DailyQuestState;
   isDailyQuestComplete: boolean;
+
+  // ── v2.4: spell book ───────────────────────────────────────
+  spellBook:        SpellUnlock[];
+  isLoadingSpells:  boolean;
 
   // UI flags
   isLoadingQuests:      boolean;
@@ -271,6 +309,9 @@ interface GameState {
   loadStreakData:         () => Promise<void>;
   loadDailyQuest:         () => Promise<void>;
   recordDailyCompletion:  (questId: string) => Promise<void>;
+
+  // ── v2.4 actions ───────────────────────────────────────────
+  loadSpellBook: () => Promise<void>;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -334,16 +375,48 @@ export const useGameStore = create<GameState>()(
       dailyQuest:           DEFAULT_DAILY_QUEST,
       isDailyQuestComplete: false,
 
+      // ── v2.4 defaults ─────────────────────────────────────
+      spellBook:       [],
+      isLoadingSpells: false,
+
       // ── Session ────────────────────────────────────────────
-      startChildSession: (child) => set({
-        activeChild:           child,
-        completedQuestIds:     [],
-        hardCompletedQuestIds: [],
-        // Reset streak so loadStreakData() hydrates fresh data for this child
-        streak:               DEFAULT_STREAK,
-        dailyQuest:           DEFAULT_DAILY_QUEST,
-        isDailyQuestComplete: false,
-      }),
+      startChildSession: (child) => {
+        const { activeChild: prev } = get();
+        const isSameChild = prev?.id === child.id;
+
+        // KEY FIX 1: Only wipe completedQuestIds when switching to a DIFFERENT child.
+        //
+        // Previous code always reset completedQuestIds: [] unconditionally.
+        // Problem: zustand-persist immediately writes [] to AsyncStorage, erasing
+        // persisted progress. If loadCompletedQuests() then fails (DB table missing,
+        // RLS blocks, network error), the data is permanently lost — both from
+        // memory and from AsyncStorage.
+        //
+        // Solution: When re-selecting the SAME child (including after app restart),
+        // preserve completedQuestIds. loadCompletedQuests() (called by
+        // ChildSwitcherScreen.handleSelect below) will overwrite with fresh DB data
+        // if the DB is healthy. If DB fails, the AsyncStorage fallback is preserved.
+        //
+        // When switching to a DIFFERENT child, reset as before — we can't show
+        // the wrong child's completions.
+        set({
+          activeChild: child,
+          ...(!isSameChild && {
+            completedQuestIds:     [],
+            hardCompletedQuestIds: [],
+            spellBook:             [],
+          }),
+          streak:               DEFAULT_STREAK,
+          dailyQuest:           DEFAULT_DAILY_QUEST,
+          isDailyQuestComplete: false,
+        });
+
+        // loadCompletedQuests() is awaited by ChildSwitcherScreen.handleSelect
+        // immediately after this call — no need to fire-and-forget here too.
+        // loadStreakData/loadSpellBook have no other caller so they fire here.
+        get().loadStreakData();
+        get().loadSpellBook();
+      },
 
       endChildSession: () =>
         set({
@@ -353,6 +426,7 @@ export const useGameStore = create<GameState>()(
           wordTomeCache:         [],
           completedQuestIds:     [],
           hardCompletedQuestIds: [],
+          spellBook:             [],         // v2.4: clear on session end
           streak:               DEFAULT_STREAK,
           dailyQuest:           DEFAULT_DAILY_QUEST,
           isDailyQuestComplete: false,
@@ -535,15 +609,27 @@ export const useGameStore = create<GameState>()(
         const { activeChild, completedQuestIds, hardCompletedQuestIds } = get();
         if (!activeChild) return;
 
-        // Optimistic local update
+        // Step 1: Optimistic local update — fires synchronously so the UI
+        // shows "Done" instantly without waiting for the network.
         if (mode === "normal" && !completedQuestIds.includes(questId)) {
           set({ completedQuestIds: [...completedQuestIds, questId] });
         } else if (mode === "hard" && !hardCompletedQuestIds.includes(questId)) {
           set({ hardCompletedQuestIds: [...hardCompletedQuestIds, questId] });
         }
 
+        // Step 2: Persist to DB.
+        //
+        // KEY FIX 2a: Supabase client returns { data, error } — it does NOT
+        // throw on DB errors. The previous try/catch NEVER caught anything
+        // because errors were in the returned object, not thrown.
+        // We now explicitly check the error field and log it.
+        //
+        // KEY FIX 2b: Only call loadCompletedQuests() when the upsert
+        // SUCCEEDED. Calling it after a failed upsert would overwrite the
+        // optimistic update with stale DB data (empty), erasing the "Done"
+        // badge right after the child just earned it.
         try {
-          await supabase
+          const { error: upsertError } = await supabase
             .from("quest_completions")
             .upsert(
               {
@@ -555,12 +641,27 @@ export const useGameStore = create<GameState>()(
               },
               { onConflict: "child_id,quest_id,mode" }
             );
-        } catch {
-          // Non-fatal
+
+          if (upsertError) {
+            // Visible in Metro / Logcat — tells you exactly what DB issue exists.
+            // Common causes: quest_completions table missing, RLS blocks INSERT,
+            // unique constraint (child_id, quest_id, mode) not created.
+            console.error("[markQuestCompletion] Upsert failed:", upsertError);
+            // Optimistic update stays — same-session shows Done.
+            // Cross-session: AsyncStorage has it via zustand-persist.
+          } else {
+            // Upsert confirmed — reload from DB to sync store with source of truth.
+            get().loadCompletedQuests();
+          }
+        } catch (e) {
+          console.error("[markQuestCompletion] Unexpected error:", e);
         }
 
         // v2.3: auto-record streak if this was the daily quest
         get().recordDailyCompletion(questId);
+
+        // v2.4: refresh spell book so new card appears immediately
+        get().loadSpellBook();
       },
 
       loadCompletedQuests: async () => {
@@ -574,7 +675,17 @@ export const useGameStore = create<GameState>()(
             .select("quest_id, mode")
             .eq("child_id", activeChild.id);
 
-          if (error) throw error;
+          if (error) {
+            // KEY FIX 3: Log the error so you can see exactly what is failing.
+            // Check Metro / Logcat for this message — it will tell you whether
+            // the table is missing, RLS blocks the read, or auth has expired.
+            console.error("[loadCompletedQuests] DB read failed:", error);
+            set({ isLoadingCompletions: false });
+            // IMPORTANT: do NOT update completedQuestIds on error.
+            // The existing value (from AsyncStorage or the optimistic update)
+            // is preserved as a fallback — progress is not wiped on DB failure.
+            return;
+          }
 
           const normal: string[] = [];
           const hard:   string[] = [];
@@ -588,8 +699,10 @@ export const useGameStore = create<GameState>()(
             hardCompletedQuestIds: hard,
             isLoadingCompletions:  false,
           });
-        } catch {
+        } catch (e) {
+          console.error("[loadCompletedQuests] Exception:", e);
           set({ isLoadingCompletions: false });
+          // Do NOT update completedQuestIds — preserve existing data.
         }
       },
 
@@ -648,15 +761,14 @@ export const useGameStore = create<GameState>()(
         }
 
         set({
-          dailyQuest: { questId, questDate: today, isLoaded: true },
+          dailyQuest: {
+            questId,
+            questDate: today,
+            isLoaded:  true,
+          },
         });
       },
 
-      /**
-       * Call after child finishes ANY quest.
-       * Only counts if it matches today's daily quest ID.
-       * Idempotent — safe to call multiple times.
-       */
       recordDailyCompletion: async (questId: string) => {
         const { activeChild, dailyQuest, isDailyQuestComplete } = get();
         if (!activeChild)                    return;
@@ -690,6 +802,52 @@ export const useGameStore = create<GameState>()(
           // Non-fatal — isDailyQuestComplete stays false; retried next session
         }
       },
+
+      // ── v2.4: Spell Book ───────────────────────────────────
+
+      /**
+       * Load all spell unlocks for the active child from the spell_unlocks VIEW.
+       * Called on SpellBookScreen mount and auto-called after markQuestCompletion().
+       * Requires schema_v2_4.sql to have been applied.
+       */
+      loadSpellBook: async () => {
+        const { activeChild } = get();
+        if (!activeChild) return;
+
+        set({ isLoadingSpells: true });
+        try {
+          const { data, error } = await supabase
+            .from("spell_unlocks")
+            .select(
+              "quest_id, quest_name, spell_name, weapon_emoji, spell_description, " +
+              "enemy_name, enemy_emoji, room_label, tier, " +
+              "first_unlocked_at, best_xp, completion_count"
+            )
+            .eq("child_id", activeChild.id)
+            .order("first_unlocked_at", { ascending: false });
+
+          if (error) throw error;
+
+          const unlocks: SpellUnlock[] = (data ?? []).map((row: any) => ({
+            questId:          row.quest_id,
+            questName:        row.quest_name,
+            spellName:        row.spell_name        ?? row.quest_name,
+            weaponEmoji:      row.weapon_emoji       ?? "⚔️",
+            spellDescription: row.spell_description  ?? "",
+            enemyName:        row.enemy_name,
+            enemyEmoji:       row.enemy_emoji,
+            roomLabel:        row.room_label,
+            tier:             row.tier               as QuestTier,
+            unlockedAt:       row.first_unlocked_at,
+            bestXp:           row.best_xp            ?? 0,
+            completionCount:  row.completion_count   ?? 1,
+          }));
+
+          set({ spellBook: unlocks, isLoadingSpells: false });
+        } catch {
+          set({ isLoadingSpells: false });
+        }
+      },
     }),
 
     {
@@ -703,6 +861,8 @@ export const useGameStore = create<GameState>()(
         // v2.3: persist streak so it shows on cold launch before DB fetch
         streak:               state.streak,
         isDailyQuestComplete: state.isDailyQuestComplete,
+        // v2.4: persist spell book so it shows on cold launch before DB fetch
+        spellBook:            state.spellBook,
       }),
     }
   )
@@ -799,3 +959,23 @@ export const selectDailyQuest = (state: GameState): Quest | null =>
   state.dailyQuest.questId
     ? (state.questLibrary.find((q) => q.id === state.dailyQuest.questId) ?? null)
     : null;
+
+// ── v2.4 Spell Book selectors ─────────────────────────────────────────────────
+
+/**
+ * Number of unique quests cleared (ignores hard/normal duplication).
+ * Used for the global progress bar in SpellBookScreen.
+ */
+export const selectSpellsUnlockedCount = (state: GameState): number => {
+  const unique = new Set(state.spellBook.map((s) => s.questId));
+  return unique.size;
+};
+
+/**
+ * All spell unlocks for a given tier, newest first.
+ */
+export const selectSpellsByTier = (
+  state: GameState,
+  tier: QuestTier
+): SpellUnlock[] =>
+  state.spellBook.filter((s) => s.tier === tier);

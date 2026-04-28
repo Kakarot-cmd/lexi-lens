@@ -37,9 +37,11 @@ import {
   Switch,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
-import { StreakHeatmap } from "../components/StreakHeatmap";
+import { StreakHeatmap }         from "../components/StreakHeatmap";
+import QuestGeneratorScreen from "./QuestGeneratorScreen";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -108,6 +110,12 @@ const P = {
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+type RootStackParamList = {
+  QuestMap:        undefined;
+  ParentDashboard: undefined;
+};
+type Props = NativeStackScreenProps<RootStackParamList, "ParentDashboard">;
 
 function xpToNextLevel(currentXp: number, level: number): number {
   const nextThreshold = Math.pow(level, 2) * 50;
@@ -271,7 +279,7 @@ function QuestCard({ completion }: { completion: QuestCompletion }) {
 
 // ─── Main screen ──────────────────────────────────────────────────────────────
 
-export function ParentDashboard() {
+export function ParentDashboard({ navigation }: Props) {
   const insets = useSafeAreaInsets();
 
   const [children, setChildren]     = useState<ChildProfile[]>([]);
@@ -284,7 +292,8 @@ export function ParentDashboard() {
 
   // v2.3 — streak + notification state
   const [streakInfo, setStreakInfo]       = useState<StreakInfo>({ currentStreak: 0, longestStreak: 0 });
-  const [notifEnabled, setNotifEnabled]   = useState(false);
+  const [notifEnabled, setNotifEnabled]     = useState(false);
+  const [showGenerator, setShowGenerator]   = useState(false);
 
   const selectedChild = dashboard?.child ?? null;
 
@@ -418,9 +427,27 @@ export function ParentDashboard() {
 
       {/* ── Header ─────────────────────────────────────────── */}
       <View style={styles.header}>
-        <View>
-          <Text style={styles.headerTitle}>Word Tome</Text>
-          <Text style={styles.headerSub}>Parent view</Text>
+        <View style={styles.headerTop}>
+          <TouchableOpacity
+            onPress={() => navigation.goBack()}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+          >
+            <Text style={styles.backArrow}>←</Text>
+          </TouchableOpacity>
+          <View style={{ flex: 1, marginLeft: 12 }}>
+            <Text style={styles.headerTitle}>Word Tome</Text>
+            <Text style={styles.headerSub}>Parent view</Text>
+          </View>
+          <TouchableOpacity
+            style={styles.createQuestBtn}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+              setShowGenerator(true);
+            }}
+            accessibilityLabel="Create AI quest"
+          >
+            <Text style={styles.createQuestBtnText}>✨ Create Quest</Text>
+          </TouchableOpacity>
         </View>
         {children.length > 1 && (
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.childTabs}>
@@ -435,6 +462,13 @@ export function ParentDashboard() {
           </ScrollView>
         )}
       </View>
+
+      {/* ── Quest Generator Modal ───────────────────────── */}
+      <QuestGeneratorScreen
+        visible={showGenerator}
+        onClose={() => setShowGenerator(false)}
+        defaultAgeBand={(selectedChild?.age_band as any) ?? "7-8"}
+      />
 
       {loading && !refreshing ? (
         <View style={styles.center}>
@@ -590,7 +624,27 @@ const styles = StyleSheet.create({
     borderBottomColor: P.warmBorder,
     backgroundColor:   P.cream,
   },
+  headerTop: {
+    flexDirection:  "row",
+    alignItems:     "center",
+    justifyContent: "space-between",
+    marginBottom:   4,
+  },
+  backArrow:   { fontSize: 22, color: P.amberAccent, fontWeight: "600" },
   headerTitle: { fontSize: 22, fontWeight: "700", color: P.inkBrown, letterSpacing: -0.3 },
+  createQuestBtn: {
+    backgroundColor:   P.purpleLight,
+    borderRadius:      20,
+    paddingHorizontal: 14,
+    paddingVertical:   8,
+    borderWidth:       1,
+    borderColor:       P.purpleBorder,
+  },
+  createQuestBtnText: {
+    color:      P.purpleAccent,
+    fontSize:   13,
+    fontWeight: "700",
+  },
   headerSub:   { fontSize: 12, color: P.inkLight, marginTop: 1 },
 
   // Child tabs

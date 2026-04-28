@@ -11,9 +11,15 @@
  *
  * 1.4: isHardMode prop — red/crown theme instead of green/trophy
  *
+ * FIXES applied:
+ *   • [BUG] useAnimatedStyle was called inside .map() — Rules of Hooks violation.
+ *     Extracted WordRow as a standalone component so each row owns its hook calls.
+ *   • [BUG] Lottie autoPlay={weaponTriggered} evaluated only on mount (always false).
+ *     Changed to conditional render: {weaponTriggered && <LottieView autoPlay />}
+ *     so the component mounts—and starts playing—only when the weapon drops.
+ *
  * Dependencies (already in project):
- *   npx expo install react-native-reanimated
- *   (Lottie optional — slot marked below)
+ *   npx expo install react-native-reanimated lottie-react-native expo-haptics
  */
 
 import React, { useEffect } from "react";
@@ -38,9 +44,7 @@ import Animated, {
   runOnJS,
 } from "react-native-reanimated";
 import * as Haptics from "expo-haptics";
-
-// Optional Lottie import — uncomment if you add a hit-effect .json
- import LottieView from "lottie-react-native";
+import LottieView from "lottie-react-native";
 
 const { width: W, height: H } = Dimensions.get("window");
 
@@ -87,8 +91,8 @@ const T = {
 
 interface ParticleProps {
   emoji:    string;
-  fromX:    number; // starting translateX (relative to centre)
-  fromY:    number; // starting translateY
+  fromX:    number;
+  fromY:    number;
   delay:    number;
   onLanded: () => void;
 }
@@ -100,16 +104,23 @@ function FusionParticle({ emoji, fromX, fromY, delay, onLanded }: ParticleProps)
   const op    = useSharedValue(0);
 
   useEffect(() => {
-    // Appear
-    op.value = withDelay(delay, withTiming(1, { duration: 200 }));
-    // Fly to centre
+    // Fade in quickly as particle appears
+    op.value = withDelay(delay, withTiming(1, { duration: 150 }));
+
+    // x/y: withTiming + cubic ease-out — moves with intent, no oscillation.
+    // onLanded fires exactly when the animation ends, not after spring settling.
     x.value = withDelay(
       delay,
-      withSpring(0, { damping: 14, stiffness: 120 }, (finished) => {
+      withTiming(0, { duration: 480, easing: Easing.out(Easing.cubic) }, (finished) => {
         if (finished) runOnJS(onLanded)();
       })
     );
-    y.value = withDelay(delay, withSpring(0, { damping: 14, stiffness: 120 }));
+    y.value = withDelay(
+      delay,
+      withTiming(0, { duration: 480, easing: Easing.out(Easing.cubic) })
+    );
+
+    // Scale: keep the spring pop on arrival — feels like a magnetic snap
     scale.value = withDelay(delay, withSpring(1.1, { damping: 10, stiffness: 100 }));
   }, []);
 
@@ -238,6 +249,44 @@ function EnemyTarget({
   );
 }
 
+// ─── Word row (FIX: was inline in .map() — hooks violation) ──────────────────
+//
+// Previously VictoryContent called useAnimatedStyle() inside components.map().
+// React's Rules of Hooks forbid hook calls inside loops or callbacks.
+// Solution: extract each row into its own component so useAnimatedStyle()
+// is always called at the top level of a function component.
+
+interface WordRowProps {
+  propertyWord: string;
+  objectUsed:   string | null;
+  index:        number;
+  parentOp:     Animated.SharedValue<number>;
+  wordBg:       string;
+  wordColor:    string;
+  objColor:     string;
+}
+
+function WordRow({ propertyWord, objectUsed, index, parentOp, wordBg, wordColor, objColor }: WordRowProps) {
+  // ✅ useAnimatedStyle is at the top level of this component — hooks rules satisfied
+  const style = useAnimatedStyle(() => ({
+    opacity: parentOp.value,
+    transform: [{
+      translateY: interpolate(parentOp.value, [0, 1], [20 + index * 8, 0]),
+    }],
+  }));
+
+  return (
+    <Animated.View style={[styles.wordRow, { backgroundColor: wordBg }, style]}>
+      <Text style={[styles.wordText, { color: wordColor }]}>{propertyWord}</Text>
+      {objectUsed && (
+        <Text style={[styles.objText, { color: objColor }]}>
+          found with: {objectUsed}
+        </Text>
+      )}
+    </Animated.View>
+  );
+}
+
 // ─── Victory content ──────────────────────────────────────────────────────────
 
 function VictoryContent({
@@ -265,13 +314,13 @@ function VictoryContent({
     ty.value = withSpring(0,  { damping: 14, stiffness: 80 });
   }, [visible]);
 
-  const style = useAnimatedStyle(() => ({
+  const wrapStyle = useAnimatedStyle(() => ({
     opacity:   op.value,
     transform: [{ translateY: ty.value }],
   }));
 
   return (
-    <Animated.View style={[styles.contentWrap, style]}>
+    <Animated.View style={[styles.contentWrap, wrapStyle]}>
       <ScrollView
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
@@ -294,29 +343,18 @@ function VictoryContent({
           What you discovered
         </Text>
 
+        {/* FIX: each row is now its own component — no hooks-in-map violation */}
         {components.map((c, i) => (
-          <Animated.View
+          <WordRow
             key={c.propertyWord}
-            style={[
-              styles.wordRow,
-              { backgroundColor: theme.wordBg },
-              useAnimatedStyle(() => ({
-                opacity:   op.value,
-                transform: [{
-                  translateY: interpolate(op.value, [0, 1], [20 + i * 8, 0]),
-                }],
-              })),
-            ]}
-          >
-            <Text style={[styles.wordText, { color: theme.wordColor }]}>
-              {c.propertyWord}
-            </Text>
-            {c.objectUsed && (
-              <Text style={[styles.objText, { color: theme.objColor }]}>
-                found with: {c.objectUsed}
-              </Text>
-            )}
-          </Animated.View>
+            propertyWord={c.propertyWord}
+            objectUsed={c.objectUsed}
+            index={i}
+            parentOp={op}
+            wordBg={theme.wordBg}
+            wordColor={theme.wordColor}
+            objColor={theme.objColor}
+          />
         ))}
 
         <TouchableOpacity
@@ -338,7 +376,6 @@ interface VictoryFusionScreenProps {
     enemy_name:  string;
     enemy_emoji: string;
   };
-  /** Components found this quest — used for flying particles + summary */
   components: Array<{
     propertyWord: string;
     objectUsed:   string | null;
@@ -370,12 +407,11 @@ export function VictoryFusionScreen({
 }: VictoryFusionScreenProps) {
   const theme = isHardMode ? T.hard : T.normal;
 
-  // Animation phase flags
-  const [landedCount,     setLandedCount]     = React.useState(0);
-  const [burstTriggered,  setBurstTriggered]  = React.useState(false);
-  const [weaponTriggered, setWeaponTriggered] = React.useState(false);
-  const [explodeTriggered,setExplodeTriggered]= React.useState(false);
-  const [showContent,     setShowContent]     = React.useState(false);
+  const [landedCount,      setLandedCount]      = React.useState(0);
+  const [burstTriggered,   setBurstTriggered]   = React.useState(false);
+  const [weaponTriggered,  setWeaponTriggered]  = React.useState(false);
+  const [explodeTriggered, setExplodeTriggered] = React.useState(false);
+  const [showContent,      setShowContent]      = React.useState(false);
 
   const particleCount = Math.min(components.length, 5);
 
@@ -384,19 +420,19 @@ export function VictoryFusionScreen({
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   }, []);
 
-  // When all particles land → trigger burst
+  // When all particles land → trigger burst → weapon → explode → content
   useEffect(() => {
     if (landedCount >= particleCount && particleCount > 0) {
       setBurstTriggered(true);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-      // Weapon drops 200ms after burst
+
       setTimeout(() => setWeaponTriggered(true), 200);
-      // Enemy explodes 400ms after weapon
+
       setTimeout(() => {
         setExplodeTriggered(true);
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }, 600);
-      // Victory content appears after explosion
+
       setTimeout(() => setShowContent(true), 1100);
     }
   }, [landedCount, particleCount]);
@@ -418,7 +454,7 @@ export function VictoryFusionScreen({
           <EnemyTarget
             emoji={quest.enemy_emoji}
             name={quest.enemy_name}
-            triggerShake={true}     // shakes immediately on mount
+            triggerShake={true}
             triggerExplode={explodeTriggered}
           />
 
@@ -437,15 +473,20 @@ export function VictoryFusionScreen({
           {/* Weapon drop from above */}
           <WeaponDrop weapon={theme.weapon} trigger={weaponTriggered} />
 
-          {/* Optional Lottie hit effect — uncomment when you have the asset */}
-          {
-          <LottieView
-            source={require("../assets/lottie/Boom.json")}
-            autoPlay={weaponTriggered}
-            loop={false}
-            style={styles.lottie}
-          />
-          }
+          {/*
+           * FIX: Lottie was always rendered with autoPlay={weaponTriggered}.
+           * Because autoPlay is evaluated only on mount (when weaponTriggered
+           * was still false), Lottie never started. Fix: conditionally render
+           * the component so it mounts—and autoPlays—exactly when the weapon fires.
+           */}
+          {weaponTriggered && (
+            <LottieView
+              source={require("../assets/lottie/Boom.json")}
+              autoPlay
+              loop={false}
+              style={styles.lottie}
+            />
+          )}
         </View>
       )}
 
@@ -471,17 +512,15 @@ const styles = StyleSheet.create({
     alignItems:     "center",
   },
 
-  // Stage (animation area)
   stage: {
     ...StyleSheet.absoluteFillObject,
     justifyContent: "center",
     alignItems:     "center",
   },
 
-  // Enemy
   enemyTarget: {
-    alignItems:   "center",
-    position:     "absolute",
+    alignItems: "center",
+    position:   "absolute",
   },
   enemyTargetName: {
     fontSize:   13,
@@ -490,12 +529,10 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
 
-  // Particle
   particle: {
     position: "absolute",
   },
 
-  // Burst
   burst: {
     position:     "absolute",
     width:        120,
@@ -503,53 +540,50 @@ const styles = StyleSheet.create({
     borderRadius: 60,
   },
 
-  // Weapon
   weapon: {
     position: "absolute",
   },
 
-  // Lottie (optional)
   lottie: {
     position: "absolute",
     width:    200,
     height:   200,
   },
 
-  // Victory content
   contentWrap: {
     ...StyleSheet.absoluteFillObject,
   },
   content: {
-    alignItems:  "center",
-    padding:     32,
-    paddingTop:  72,
+    alignItems: "center",
+    padding:    32,
+    paddingTop: 72,
   },
 
   title:      { fontSize: 28, fontWeight: "800", marginBottom: 4, textAlign: "center" },
   sub:        { fontSize: 14, marginBottom: 28 },
 
-  xpBadge:    {
+  xpBadge: {
     borderRadius: 20, paddingHorizontal: 28, paddingVertical: 14,
     alignItems: "center", borderWidth: 1, marginBottom: 28,
   },
-  xpNum:      { fontSize: 38, fontWeight: "800" },
-  xpLbl:      { fontSize: 13, marginTop: 2 },
+  xpNum: { fontSize: 38, fontWeight: "800" },
+  xpLbl: { fontSize: 13, marginTop: 2 },
 
   learnedLbl: {
     fontSize: 10, fontWeight: "700",
     textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 12,
   },
 
-  wordRow:    {
+  wordRow: {
     width: "100%", borderRadius: 10,
     padding: 12, marginBottom: 8,
   },
-  wordText:   { fontSize: 15, fontWeight: "700" },
-  objText:    { fontSize: 11, marginTop: 2 },
+  wordText: { fontSize: 15, fontWeight: "700" },
+  objText:  { fontSize: 11, marginTop: 2 },
 
-  btn:        {
+  btn: {
     marginTop: 28, borderRadius: 16,
     paddingVertical: 15, paddingHorizontal: 48,
   },
-  btnText:    { fontSize: 16, fontWeight: "700" },
+  btnText: { fontSize: 16, fontWeight: "700" },
 });

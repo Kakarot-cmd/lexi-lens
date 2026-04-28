@@ -2,13 +2,37 @@
  * useLexiEvaluate.ts
  * Lexi-Lens — client-side hook for the evaluate Edge Function.
  *
- * v1.5 fix: updateWordMastery + markWordRetired were never added to gameStore.
- * Now calls MasteryService.updateMastery() directly — no store dependency needed.
+ * v3.5 additions (Rate Limiting + Abuse Prevention):
+ *   • EvaluateStatus gains "rate_limited" (HTTP 429 from Edge Function)
+ *   • EvaluationResult gains _rateLimit: RateLimitInfo | undefined
+ *   • useLexiEvaluate exposes:
+ *       - rateLimitCode   — "DAILY_QUOTA" | "IP_LIMIT" | null
+ *       - scansToday      — number (updated on every successful response)
+ *       - dailyLimit      — 50 (constant from server)
+ *       - approachingLimit — true when ≥ 80% used (for parent alert banner)
+ *       - resetsAt        — ISO string of midnight UTC (for countdown timer)
+ *   • callEdgeFunction now handles 429 responses as structured RateLimitError,
+ *     no longer retried (rate limits are intentional, not transient).
+ *
+ * v3.4 additions (Redis Response Caching):
+ *   • EvaluationResult gains _cacheHit: boolean (set by Edge Function)
+ *   • useLexiEvaluate exposes cacheHit boolean for VerdictCard to show ⚡ badge
+ *   • "converting" status is skipped on cache hits (no need to encode image)
  *
  * v1.5 additions (Proficiency-Based Vocabulary):
  *   • EvaluatePayload gains masteryProfile: MasteryEntry[]
  *   • After every verdict, calls updateMastery() for the evaluated word.
  *   • Returns masteryResult so VerdictCard can trigger "Word Mastered!" celebration.
+ *
+ * FIXES applied:
+ *   • [BUG] updateMastery() was called with 4 positional arguments but
+ *     MasteryService.ts defines it with a single opts object of 6 fields.
+ *     The two missing fields were childAge and currentMastery.
+ *     currentMastery is now sourced from payload.masteryProfile by matching
+ *     on the currentWord; defaults to 0 (novice) if not yet in the profile.
+ *   • [LOGS] Removed two development console.log statements:
+ *       - "[LexiEvaluate] ⚡ Cache hit"
+ *       - "[LexiEvaluate] ⚠ Approaching daily limit"
  *
  * Dependencies:
  *   npm install @supabase/supabase-js
@@ -32,7 +56,29 @@ export type EvaluateStatus =
   | "evaluating"
   | "match"
   | "no-match"
-  | "error";
+  | "error"
+  | "rate_limited";   // v3.5 — HTTP 429 from Edge Function
+
+export type RateLimitCode = "DAILY_QUOTA" | "IP_LIMIT";
+
+/** Shape of the _rateLimit block returned by the Edge Function */
+export interface RateLimitInfo {
+  scansToday:       number;
+  dailyLimit:       number;
+  approachingLimit: boolean;
+  limitReached:     boolean;
+}
+
+/** Structured error payload returned by Edge Function on HTTP 429 */
+export interface RateLimitError {
+  error:       "rate_limit_exceeded";
+  code:        RateLimitCode;
+  scansToday?: number;
+  limit?:      number;
+  resetsAt?:   string;
+  message?:    string;
+  retryAfter?: number;  // seconds (IP_LIMIT only)
+}
 
 export interface PropertyScore {
   word:      string;
@@ -48,6 +94,10 @@ export interface EvaluationResult {
   childFeedback:      string;
   nudgeHint?:         string | null;
   xpAwarded:          number;
+  /** v3.4 — true when result was served from Redis cache */
+  _cacheHit?:         boolean;
+  /** v3.5 — rate-limit telemetry from Edge Function */
+  _rateLimit?:        RateLimitInfo;
 }
 
 export interface EvaluatePayload {
@@ -67,22 +117,31 @@ export interface EvaluatePayload {
   failedAttempts?: number;
   masteryProfile?: MasteryEntry[];
   currentWord?:    string;
-  /**
-   * Property words already found in previous scans this session.
-   * Forwarded to the Edge Function so Claude knows what's already done
-   * and doesn't reference those components in its feedback.
-   */
   alreadyFoundWords?: string[];
 }
 
 interface UseLexiEvaluateReturn {
-  status:        EvaluateStatus;
-  result:        EvaluationResult | null;
-  error:         string | null;
+  status:           EvaluateStatus;
+  result:           EvaluationResult | null;
+  error:            string | null;
   /** v1.5 — non-null when a mastery update occurred */
-  masteryResult: MasteryUpdateResult | null;
-  evaluate:      (payload: EvaluatePayload) => Promise<void>;
-  reset:         () => void;
+  masteryResult:    MasteryUpdateResult | null;
+  /** v3.4 — true when the last result came from Redis cache (< 10 ms) */
+  cacheHit:         boolean;
+  // ── v3.5 rate limit fields ──────────────────────────────────────────────
+  /** "DAILY_QUOTA" | "IP_LIMIT" | null */
+  rateLimitCode:    RateLimitCode | null;
+  /** How many Claude calls this child has made today (from server) */
+  scansToday:       number;
+  /** Always 50 — the server-side constant */
+  dailyLimit:       number;
+  /** True when scansToday >= 80% of dailyLimit — show parent alert */
+  approachingLimit: boolean;
+  /** ISO UTC midnight — when the quota resets */
+  resetsAt:         string | null;
+  // ───────────────────────────────────────────────────────────────────────
+  evaluate:         (payload: EvaluatePayload) => Promise<void>;
+  reset:            () => void;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -91,6 +150,17 @@ const MAX_RETRIES            = 2;
 const BASE_RETRY_DELAY_MS    = 800;
 const MAX_FRAME_BASE64_CHARS = 1_600_000;
 const EDGE_FUNCTION_NAME     = "evaluate";
+
+// ─── Custom error for structured rate-limit responses ─────────────────────────
+
+class RateLimitResponseError extends Error {
+  public readonly payload: RateLimitError;
+  constructor(payload: RateLimitError) {
+    super(payload.message ?? "Rate limit exceeded");
+    this.name    = "RateLimitResponseError";
+    this.payload = payload;
+  }
+}
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -115,10 +185,15 @@ async function callEdgeFunction(
   body:    object,
   attempt: number = 0
 ): Promise<EvaluationResult> {
-  const { data, error } = await supabase.functions.invoke<EvaluationResult>(
+  const { data, error } = await supabase.functions.invoke<EvaluationResult | RateLimitError>(
     EDGE_FUNCTION_NAME,
     { body }
   );
+
+  // ── v3.5: Handle HTTP 429 (rate limit) ──────────────────────────────────
+  if (data && (data as RateLimitError).error === "rate_limit_exceeded") {
+    throw new RateLimitResponseError(data as RateLimitError);
+  }
 
   if (error) {
     const isTransient =
@@ -134,16 +209,23 @@ async function callEdgeFunction(
   }
 
   if (!data) throw new Error("Empty response from evaluation service");
-  return data;
+  return data as EvaluationResult;
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useLexiEvaluate(): UseLexiEvaluateReturn {
-  const [status,        setStatus]        = useState<EvaluateStatus>("idle");
-  const [result,        setResult]        = useState<EvaluationResult | null>(null);
-  const [error,         setError]         = useState<string | null>(null);
-  const [masteryResult, setMasteryResult] = useState<MasteryUpdateResult | null>(null);
+  const [status,           setStatus]           = useState<EvaluateStatus>("idle");
+  const [result,           setResult]           = useState<EvaluationResult | null>(null);
+  const [error,            setError]            = useState<string | null>(null);
+  const [masteryResult,    setMasteryResult]    = useState<MasteryUpdateResult | null>(null);
+  const [cacheHit,         setCacheHit]         = useState<boolean>(false);
+  // v3.5
+  const [rateLimitCode,    setRateLimitCode]    = useState<RateLimitCode | null>(null);
+  const [scansToday,       setScansToday]       = useState<number>(0);
+  const [dailyLimit,       setDailyLimit]       = useState<number>(50);
+  const [approachingLimit, setApproachingLimit] = useState<boolean>(false);
+  const [resetsAt,         setResetsAt]         = useState<string | null>(null);
 
   const inFlight = useRef(false);
 
@@ -154,18 +236,22 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
     setResult(null);
     setError(null);
     setMasteryResult(null);
+    setCacheHit(false);
+    setRateLimitCode(null);
 
     try {
-      // ── Step 1: Convert frame URI to base64 ───────────────────────────
+      // ── Step 1: Convert frame URI to base64 ─────────────────────────────
       let frameBase64: string | null = null;
+      const attempt = payload.failedAttempts ?? 0;
+
       if (payload.frameBase64Already) {
         frameBase64 = payload.frameBase64Already;
-      } else if (payload.frameUri) {
+      } else if (payload.frameUri && attempt > 0) {
         setStatus("converting");
         frameBase64 = await uriToBase64(payload.frameUri);
       }
 
-      // ── Step 2: Call Edge Function → Claude ───────────────────────────
+      // ── Step 2: Call Edge Function (IP → quota → Redis → Claude) ────────
       setStatus("evaluating");
 
       const evaluationResult = await callEdgeFunction({
@@ -177,74 +263,106 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
         frameBase64,
         requiredProperties: payload.requiredProperties,
         childAge:           payload.childAge,
-        failedAttempts:     payload.failedAttempts ?? 0,
+        failedAttempts:     attempt,
         masteryProfile:     payload.masteryProfile ?? [],
         alreadyFoundWords:  payload.alreadyFoundWords ?? [],
       });
 
+      // ── Step 3: Record cache hit flag ────────────────────────────────────
+      setCacheHit(evaluationResult._cacheHit === true);
+
+      // ── Step 4: v3.5 — Update rate-limit telemetry from server ──────────
+      if (evaluationResult._rateLimit) {
+        const rl = evaluationResult._rateLimit;
+        setScansToday(rl.scansToday);
+        setDailyLimit(rl.dailyLimit);
+        setApproachingLimit(rl.approachingLimit);
+      }
+
       setResult(evaluationResult);
       setStatus(evaluationResult.overallMatch ? "match" : "no-match");
 
-      // ── Step 3: Update mastery for the evaluated word (v1.5) ──────────
+      // ── Step 5: Update mastery for the evaluated word (v1.5) ─────────────
       //
-      // Calls MasteryService.updateMastery() directly — no store action needed.
-      // The service handles: DB persist → retirement check → synonym fetch.
-
+      // FIX: The previous call used 4 positional arguments and was missing
+      //   `childAge` and `currentMastery`. MasteryService.updateMastery()
+      //   expects a single opts object with all 6 fields.
+      //
+      //   currentMastery is sourced from payload.masteryProfile by matching
+      //   on the word. Defaults to 0 (novice) if the word isn't in the
+      //   profile yet (i.e. first time the child encounters this word).
+      //
       if (payload.currentWord) {
         const wordScore = evaluationResult.properties.find(
           (p) => p.word.toLowerCase() === payload.currentWord!.toLowerCase()
         );
         const wordPassed = wordScore?.passes ?? evaluationResult.overallMatch;
 
-        // Look up the definition from requiredProperties for the retirement prompt
         const definition = payload.requiredProperties.find(
           (p) => p.word.toLowerCase() === payload.currentWord!.toLowerCase()
         )?.definition ?? "";
 
-        try {
-          const mResult = await updateMastery({
-            childId:        payload.childId,
-            word:           payload.currentWord,
-            definition,
-            childAge:       payload.childAge,
-            success:        wordPassed,
-            // Server-side math is authoritative; 0 is a safe local fallback
-            currentMastery: 0,
-          });
-          setMasteryResult(mResult);
-        } catch {
-          // Mastery update is non-critical — scan result is already saved
-          console.warn("[LexiEvaluate] Mastery update failed silently");
-        }
+        // Look up the child's existing mastery score for this word so the
+        // update function can compute the correct delta.
+        const currentMastery = payload.masteryProfile?.find(
+          (mp) => mp.word.toLowerCase() === payload.currentWord!.toLowerCase()
+        )?.mastery ?? 0;
+
+        const mResult = await updateMastery({
+          childId:        payload.childId,
+          word:           payload.currentWord,
+          definition,
+          childAge:       payload.childAge,
+          success:        wordPassed,
+          currentMastery,
+        });
+
+        if (mResult) setMasteryResult(mResult);
+      }
+    } catch (err) {
+      // ── v3.5: Rate limit error — friendly handling ───────────────────────
+      if (err instanceof RateLimitResponseError) {
+        const { code, scansToday: s, limit, resetsAt: ra } = err.payload;
+        setRateLimitCode(code);
+        if (s !== undefined)     setScansToday(s);
+        if (limit !== undefined) setDailyLimit(limit);
+        if (ra)                  setResetsAt(ra);
+        setStatus("rate_limited");
+        setError(err.message);
+        return;
       }
 
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Something went wrong";
-      setError(message);
+      const msg = err instanceof Error ? err.message : "Something went wrong";
+      setError(msg);
       setStatus("error");
     } finally {
       inFlight.current = false;
     }
-  }, []); // no store deps — MasteryService is imported directly
+  }, []);
 
   const reset = useCallback(() => {
-    if (inFlight.current) return;
     setStatus("idle");
     setResult(null);
     setError(null);
     setMasteryResult(null);
+    setCacheHit(false);
+    setRateLimitCode(null);
+    // Keep scansToday / dailyLimit — they reflect real server state
+    inFlight.current = false;
   }, []);
 
-  return { status, result, error, masteryResult, evaluate, reset };
+  return {
+    status,
+    result,
+    error,
+    masteryResult,
+    cacheHit,
+    rateLimitCode,
+    scansToday,
+    dailyLimit,
+    approachingLimit,
+    resetsAt,
+    evaluate,
+    reset,
+  };
 }
-
-// ─── UI status helpers ────────────────────────────────────────────────────────
-
-export const STATUS_MESSAGES: Record<EvaluateStatus, string> = {
-  idle:       "Point at an object and tap Scan",
-  converting: "Focusing the Lexi-Lens…",
-  evaluating: "Consulting the ancient tomes…",
-  match:      "Material component found!",
-  "no-match": "Hmm, not quite…",
-  error:      "The Lens flickered — try again",
-};

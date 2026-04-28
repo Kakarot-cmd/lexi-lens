@@ -54,8 +54,10 @@ import { DailyQuestBanner } from "../components/DailyQuestBanner";
 import { StreakBar }         from "../components/StreakBar";
 
 type RootStackParamList = {
-  QuestMap: undefined;
-  Scan:     { questId: string; hardMode?: boolean };
+  QuestMap:       undefined;
+  Scan:           { questId: string; hardMode?: boolean };
+  SpellBook:      undefined;
+  ParentDashboard:undefined;
 };
 type Props = NativeStackScreenProps<RootStackParamList, "QuestMap">;
 
@@ -463,13 +465,35 @@ export function QuestMapScreen({ navigation }: Props) {
     <View style={[styles.root, { paddingTop: insets.top }]}>
       {/* ── Screen header ───────────────────────────────── */}
       <View style={styles.header}>
-        <View>
+        <TouchableOpacity
+          style={styles.parentBtn}
+          onPress={() => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+            navigation.navigate("ParentDashboard");
+          }}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        >
+          <Text style={styles.parentBtnText}>📊</Text>
+        </TouchableOpacity>
+        <View style={styles.headerCenter}>
           <Text style={styles.headerTitle}>Dungeon Map</Text>
           {activeChild && (
             <Text style={styles.headerSub}>{activeChild.display_name}</Text>
           )}
         </View>
-        <LevelBar />
+        <View style={styles.headerRight}>
+          <LevelBar />
+          <TouchableOpacity
+            style={styles.spellBookBtn}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              navigation.navigate("SpellBook");
+            }}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          >
+            <Text style={styles.spellBookBtnText}>📖</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       {/* ── Content ─────────────────────────────────────── */}
@@ -518,13 +542,32 @@ const styles = StyleSheet.create({
     flexDirection:     "row",
     alignItems:        "center",
     justifyContent:    "space-between",
-    paddingHorizontal: 20,
-    paddingVertical:   14,
+    paddingHorizontal: 16,
+    paddingVertical:   12,
     borderBottomWidth: 0.5,
     borderBottomColor: P.cardBorder,
   },
   headerTitle: { fontSize: 22, fontWeight: "800", color: P.textPrimary },
   headerSub:   { fontSize: 13, color: P.textMuted, marginTop: 1 },
+
+  headerRight: {
+    flexDirection: "row",
+    alignItems:    "center",
+    gap:           12,
+  },
+  spellBookBtn: {
+    width:           38,
+    height:          38,
+    borderRadius:    19,
+    backgroundColor: "rgba(167,139,250,0.15)",
+    borderWidth:     1,
+    borderColor:     "rgba(167,139,250,0.35)",
+    alignItems:      "center",
+    justifyContent:  "center",
+  },
+  spellBookBtnText: {
+    fontSize: 18,
+  },
 
   // ── Level bar ──────────────────────────────────────────
   levelBar: {
