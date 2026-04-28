@@ -1,35 +1,67 @@
-import { useEffect, useState } from "react";
+// ─── Sentry: must be first import + call before anything else ─────────────────
+import {
+  initSentry,
+  Sentry,
+  setUserContext,
+  clearUserContext,
+  addGameBreadcrumb,
+} from "./lib/sentry";
+initSentry();
+
+// ─── React + RN ───────────────────────────────────────────────────────────────
+import { useEffect, useState, useCallback } from "react";
 import { View, Text, ActivityIndicator, Platform } from "react-native";
-import { NavigationContainer } from "@react-navigation/native";
+
+// ─── Navigation ───────────────────────────────────────────────────────────────
+import {
+  NavigationContainer,
+  useNavigationContainerRef,
+} from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
+
+// ─── Safe area ────────────────────────────────────────────────────────────────
 import { SafeAreaProvider } from "react-native-safe-area-context";
+
+// ─── Supabase ─────────────────────────────────────────────────────────────────
 import type { Session } from "@supabase/supabase-js";
-
 import { supabase } from "./lib/supabase";
-import { AuthScreen } from "./screens/AuthScreen";
-import { ChildSwitcherScreen } from "./screens/ChildSwitcherScreen";
-import { QuestMapScreen } from "./screens/QuestMapScreen";
-import { ParentDashboard } from "./screens/ParentDashboard";
-import SpellBookScreen from "./screens/SpellBookScreen";
 
+// ─── Screens ──────────────────────────────────────────────────────────────────
+import { AuthScreen }          from "./screens/AuthScreen";
+import { ChildSwitcherScreen } from "./screens/ChildSwitcherScreen";
+import { QuestMapScreen }      from "./screens/QuestMapScreen";
+import { ParentDashboard }     from "./screens/ParentDashboard";
+import SpellBookScreen         from "./screens/SpellBookScreen";
+
+// ─── Error boundary ───────────────────────────────────────────────────────────
+import { ErrorBoundary } from "./components/ErrorBoundary";
+
+// ─── Store ────────────────────────────────────────────────────────────────────
+import { useGameStore } from "./store/gameStore";
+
+// ─── Web placeholder (camera not available in browser) ───────────────────────
 function ScanPlaceholder() {
   return (
-    <View style={{ flex:1, backgroundColor:"#0f0620", alignItems:"center", justifyContent:"center", padding:32 }}>
-      <Text style={{ fontSize:48, marginBottom:16 }}>📱</Text>
-      <Text style={{ fontSize:20, fontWeight:"700", color:"#f3e8ff", textAlign:"center", marginBottom:12 }}>
+  
+    <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center", padding: 32 }}>
+      <Text style={{ fontSize: 48, marginBottom: 16 }}>📱</Text>
+      <Text style={{ fontSize: 20, fontWeight: "700", color: "#f3e8ff", textAlign: "center", marginBottom: 12 }}>
         Camera required
       </Text>
-      <Text style={{ fontSize:14, color:"#a78bfa", textAlign:"center", lineHeight:22 }}>
+      <Text style={{ fontSize: 14, color: "#a78bfa", textAlign: "center", lineHeight: 22 }}>
         This feature works on a real Android device with the custom APK installed.
       </Text>
     </View>
   );
 }
 
-// Dynamically import ScanScreen only on native
+// Dynamically import ScanScreen only on native — unchanged from your original
 const ScanScreen = Platform.OS === "web"
   ? ScanPlaceholder
   : require("./screens/ScanScreen").ScanScreen;
+
+
+// ─── Navigators ───────────────────────────────────────────────────────────────
 
 const AuthNav = createNativeStackNavigator();
 const AppNav  = createNativeStackNavigator();
@@ -37,7 +69,13 @@ const AppNav  = createNativeStackNavigator();
 function AuthNavigator() {
   return (
     <AuthNav.Navigator screenOptions={{ headerShown: false }}>
-      <AuthNav.Screen name="Auth" component={AuthScreen} />
+      <AuthNav.Screen name="Auth">
+        {(props) => (
+          <ErrorBoundary screen="AuthScreen">
+            <AuthScreen {...props} />
+          </ErrorBoundary>
+        )}
+      </AuthNav.Screen>
     </AuthNav.Navigator>
   );
 }
@@ -45,43 +83,141 @@ function AuthNavigator() {
 function AppNavigator() {
   return (
     <AppNav.Navigator screenOptions={{ headerShown: false }}>
-      <AppNav.Screen name="ChildSwitcher" component={ChildSwitcherScreen} />
-      <AppNav.Screen name="QuestMap"      component={QuestMapScreen} />
-      <AppNav.Screen name="Scan"          component={ScanScreen} />
-      <AppNav.Screen name="ParentDashboard"        component={ParentDashboard} />
-	  <AppNav.Screen name="SpellBook"     component={SpellBookScreen} /> 
+      <AppNav.Screen name="ChildSwitcher">
+        {(props) => (
+          <ErrorBoundary screen="ChildSwitcherScreen">
+            <ChildSwitcherScreen {...props} />
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
+
+      <AppNav.Screen name="QuestMap">
+        {(props) => (
+          <ErrorBoundary screen="QuestMapScreen">
+            <QuestMapScreen {...props} />
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
+
+      <AppNav.Screen name="Scan">
+        {(props) => (
+          <ErrorBoundary screen="ScanScreen">
+            <ScanScreen {...props} />
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
+
+      <AppNav.Screen name="ParentDashboard">
+        {(props) => (
+          <ErrorBoundary screen="ParentDashboard">
+            <ParentDashboard {...props} />
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
+
+      <AppNav.Screen name="SpellBook">
+        {(props) => (
+          <ErrorBoundary screen="SpellBookScreen">
+            <SpellBookScreen {...props} />
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
     </AppNav.Navigator>
   );
 }
 
-export default function App() {
+// ─── Root component ───────────────────────────────────────────────────────────
+
+function App() {
   const [session,      setSession]      = useState<Session | null>(null);
   const [initialising, setInitialising] = useState(true);
 
+  const activeChild = useGameStore((s) => s.activeChild);
+
+  // Navigation ref — feeds screen names into Sentry breadcrumbs
+  const navigationRef = useNavigationContainerRef();
+
+  // ── Auth listener ──────────────────────────────────────────────────────────
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      setSession(s);
       setInitialising(false);
     });
+
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, session) => setSession(session)
+      (_event, s) => {
+        setSession(s);
+
+        if (!s) {
+          clearUserContext();
+          addGameBreadcrumb({ category: "auth", message: "User signed out" });
+        } else {
+          addGameBreadcrumb({
+            category: "auth",
+            message:  "Session established",
+            data:     { userId: s.user.id },
+          });
+        }
+      }
     );
+	
+
     return () => subscription.unsubscribe();
   }, []);
 
+  // ── Sentry user context — sync whenever active child changes ──────────────
+  useEffect(() => {
+    if (activeChild && session?.user) {
+      setUserContext({
+        childId:  activeChild.id,
+        parentId: session.user.id,
+        // age_band is "7-8" → take upper digit as a proxy for exact age
+        childAge: parseInt(activeChild.age_band?.split("-")[1] ?? "8", 10),
+      });
+      addGameBreadcrumb({
+        category: "auth",
+        message:  "Active child set",
+        data:     { childId: activeChild.id },
+      });
+    }
+  }, [activeChild?.id, session?.user?.id]);
+
+  // ── Screen-change breadcrumb ───────────────────────────────────────────────
+  const handleNavigationStateChange = useCallback(() => {
+    const route = navigationRef.getCurrentRoute();
+    if (route) {
+      addGameBreadcrumb({
+        category: "navigation",
+        message:  `→ ${route.name}`,
+        data:     { routeName: route.name },
+      });
+      Sentry.setTag("active_screen", route.name);
+    }
+  }, []);
+
+  // ── Loading splash — identical to your original ────────────────────────────
   if (initialising) {
     return (
-      <View style={{ flex:1, backgroundColor:"#0f0620", alignItems:"center", justifyContent:"center" }}>
+      <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center" }}>
         <ActivityIndicator color="#f5c842" size="large" />
       </View>
     );
   }
 
   return (
-    <SafeAreaProvider>
-      <NavigationContainer>
-        {session ? <AppNavigator /> : <AuthNavigator />}
-      </NavigationContainer>
-    </SafeAreaProvider>
+    <ErrorBoundary screen="App">
+      <SafeAreaProvider>
+        <NavigationContainer
+          ref={navigationRef}
+          onStateChange={handleNavigationStateChange}
+        >
+          {session ? <AppNavigator /> : <AuthNavigator />}
+        </NavigationContainer>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
+
+// Sentry.wrap() registers the JS-level global error handler.
+// Must wrap the default export — this is what Expo loads as the entry point.
+export default Sentry.wrap(App);

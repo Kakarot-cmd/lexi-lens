@@ -34,14 +34,22 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "react-native-vision-camera"
+      "react-native-vision-camera",
+      [
+        "@sentry/react-native/expo",
+        {
+          "url": "https://sentry.io/",
+          "project": "lexi-lens",
+          "organization": "njlabs"
+        }
+      ]
     ],
     "extra": {
       "eas": {
         "projectId": "7fe2d61b-242a-4de3-91a7-1422f6876164"
       }
     },
-	"updates": {
+    "updates": {
       "fallbackToCacheTimeout": 0
     }
   }

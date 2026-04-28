@@ -168,9 +168,9 @@ export class VerdictCache {
    */
   async set(key: string, verdict: CachedVerdict): Promise<void> {
     try {
-      console.log("[VerdictCache] Attempting SET for key:", key.slice(0, 30));
+     
       await this.redis.set(key, verdict, CACHE_TTL_SECONDS);
-      console.log("[VerdictCache] SET success");
+     
     } catch (err) {
       console.error("[VerdictCache] SET failed:", err);
     }

@@ -1,6 +1,12 @@
 /**
- * useLexiEvaluate.ts
+ * hooks/useLexiEvaluate.ts
  * Lexi-Lens — client-side hook for the evaluate Edge Function.
+ *
+ * v3.7 additions (Sentry Crash Reporting):
+ *   • callEdgeFunction wrapped in withSentrySpan for performance tracing
+ *   • addGameBreadcrumb on every call lifecycle event (start, retry, verdict)
+ *   • captureGameError on fatal non-rate-limit errors (with quest + label context)
+ *   • Rate limit responses logged as "warning" breadcrumbs (not errors — intentional)
  *
  * v3.5 additions (Rate Limiting + Abuse Prevention):
  *   • EvaluateStatus gains "rate_limited" (HTTP 429 from Edge Function)
@@ -37,6 +43,7 @@
  * Dependencies:
  *   npm install @supabase/supabase-js
  *   npx expo install expo-file-system
+ *   npx expo install @sentry/react-native   ← v3.7
  */
 
 import { useState, useCallback, useRef } from "react";
@@ -47,6 +54,11 @@ import {
   type MasteryEntry,
   type MasteryUpdateResult,
 } from "../services/MasteryService";
+import {
+  captureGameError,
+  addGameBreadcrumb,
+  withSentrySpan,
+} from "../lib/sentry";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -181,18 +193,52 @@ async function uriToBase64(uri: string): Promise<string | null> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// ─── Edge Function caller (with Sentry spans + breadcrumbs) ──────────────────
+
 async function callEdgeFunction(
   body:    object,
   attempt: number = 0
 ): Promise<EvaluationResult> {
-  const { data, error } = await supabase.functions.invoke<EvaluationResult | RateLimitError>(
-    EDGE_FUNCTION_NAME,
-    { body }
+  const { detectedLabel, questId } = body as {
+    detectedLabel?: string;
+    questId?:       string;
+  };
+
+  // ── Breadcrumb: call start ─────────────────────────────────────────────────
+  addGameBreadcrumb({
+    category: "evaluate",
+    message:  `Edge Function call — attempt ${attempt + 1}`,
+    data:     { detectedLabel, questId, attempt },
+  });
+
+  // ── Wrap in a Sentry performance span ─────────────────────────────────────
+  const { data, error } = await withSentrySpan(
+    "http.client",
+    `evaluate • ${detectedLabel ?? "unknown"} (attempt ${attempt + 1})`,
+    () =>
+      supabase.functions.invoke<EvaluationResult | RateLimitError>(
+        EDGE_FUNCTION_NAME,
+        { body }
+      )
   );
 
   // ── v3.5: Handle HTTP 429 (rate limit) ──────────────────────────────────
   if (data && (data as RateLimitError).error === "rate_limit_exceeded") {
-    throw new RateLimitResponseError(data as RateLimitError);
+    const rlData = data as RateLimitError;
+
+    addGameBreadcrumb({
+      category: "evaluate",
+      message:  `Rate limited — code: ${rlData.code}`,
+      level:    "warning",
+      data:     {
+        code:       rlData.code,
+        scansToday: rlData.scansToday,
+        limit:      rlData.limit,
+        resetsAt:   rlData.resetsAt,
+      },
+    });
+
+    throw new RateLimitResponseError(rlData);
   }
 
   if (error) {
@@ -202,14 +248,51 @@ async function callEdgeFunction(
       error.message.includes("timeout");
 
     if (isTransient && attempt < MAX_RETRIES) {
+      addGameBreadcrumb({
+        category: "evaluate",
+        message:  `Transient error — retry ${attempt + 1}/${MAX_RETRIES}`,
+        level:    "warning",
+        data:     { message: error.message, detectedLabel, questId },
+      });
       await sleep(BASE_RETRY_DELAY_MS * Math.pow(2, attempt));
       return callEdgeFunction(body, attempt + 1);
     }
+
+    // Fatal — capture and rethrow
+    captureGameError(new Error(error.message ?? "Evaluation failed"), {
+      context:       "evaluate_edge_function",
+      detectedLabel: detectedLabel ?? "",
+      questId:       questId       ?? "",
+      attempt,
+    });
+
     throw new Error(error.message ?? "Evaluation failed");
   }
 
-  if (!data) throw new Error("Empty response from evaluation service");
-  return data as EvaluationResult;
+  if (!data) {
+    captureGameError(new Error("Empty response from evaluation service"), {
+      context:       "evaluate_edge_function_empty",
+      detectedLabel: detectedLabel ?? "",
+      questId:       questId       ?? "",
+      attempt,
+    });
+    throw new Error("Empty response from evaluation service");
+  }
+
+  const result = data as EvaluationResult;
+
+  // ── Breadcrumb: verdict ────────────────────────────────────────────────────
+  addGameBreadcrumb({
+    category: "verdict",
+    message:  result.overallMatch ? "✅ Match" : "❌ No match",
+    data:     {
+      resolvedObjectName: result.resolvedObjectName,
+      xpAwarded:          result.xpAwarded,
+      cacheHit:           result._cacheHit ?? false,
+    },
+  });
+
+  return result;
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
@@ -331,6 +414,14 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
         setError(err.message);
         return;
       }
+
+      // ── v3.7: Capture unexpected errors in Sentry ───────────────────────
+      captureGameError(err, {
+        context:       "useLexiEvaluate_evaluate",
+        detectedLabel: payload.detectedLabel,
+        questId:       payload.questId,
+        failedAttempts: payload.failedAttempts ?? 0,
+      });
 
       const msg = err instanceof Error ? err.message : "Something went wrong";
       setError(msg);

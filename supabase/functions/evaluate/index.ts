@@ -369,7 +369,7 @@ serve(async (req: Request) => {
     : null;
 
   if (cachedResult) {
-    console.log(`[evaluate] ⚡ Cache hit: key=${cacheKey}`);
+    
     // Cache hits are NOT logged to scan_attempts — the original call was already
     // logged, and cache hits don't consume a Claude token or count toward quota.
     return jsonResponse({ ...(cachedResult as object), _cacheHit: true });
