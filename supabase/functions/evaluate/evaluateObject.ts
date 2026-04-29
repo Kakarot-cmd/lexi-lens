@@ -250,7 +250,7 @@ function applyNegativePhraseValidation(
   properties: PropertyScore[]
 ): { properties: PropertyScore[]; overallMatch: boolean } {
   const corrected     = properties.map(validatePropertyScore);
-  const overallMatch  = corrected.every((p) => p.passes);
+  const overallMatch  = corrected.some((p) => p.passes);  // FIX: some not every — scan matches if ANY property passes
   return { properties: corrected, overallMatch };
 }
 
@@ -317,7 +317,7 @@ RESPONSE FORMAT — valid JSON only, no markdown, no text outside JSON:
       "passes": boolean
     }
   ],
-  "overallMatch": boolean,
+  "overallMatch": boolean,    // true if ANY property passes — not all
   "childFeedback": string,    // 1–3 sentences, age-appropriate, RPG tone
   "nudgeHint": string | null, // indirect hint after 2+ failures; null otherwise
   "xpAwarded": number         // always return 0 — server computes XP
