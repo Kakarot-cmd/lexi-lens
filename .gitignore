@@ -48,3 +48,5 @@ node_modules/
 .env.local
 
 .env.local
+"supabase/.temp/" 
+"supabase/.temp/" 

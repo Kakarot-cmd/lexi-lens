@@ -27,11 +27,12 @@ import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./lib/supabase";
 
 // ─── Screens ──────────────────────────────────────────────────────────────────
-import { AuthScreen }          from "./screens/AuthScreen";
-import { ChildSwitcherScreen } from "./screens/ChildSwitcherScreen";
-import { QuestMapScreen }      from "./screens/QuestMapScreen";
-import { ParentDashboard }     from "./screens/ParentDashboard";
-import SpellBookScreen         from "./screens/SpellBookScreen";
+import { AuthScreen }             from "./screens/AuthScreen";
+import { ChildSwitcherScreen }    from "./screens/ChildSwitcherScreen";
+import { QuestMapScreen }         from "./screens/QuestMapScreen";
+import { ParentDashboard }        from "./screens/ParentDashboard";
+import SpellBookScreen            from "./screens/SpellBookScreen";
+import { QuestGeneratorScreen }   from "./screens/QuestGeneratorScreen";
 
 // ─── Error boundary ───────────────────────────────────────────────────────────
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -119,6 +120,14 @@ function AppNavigator() {
         {(props) => (
           <ErrorBoundary screen="SpellBookScreen">
             <SpellBookScreen {...props} />
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
+
+      <AppNav.Screen name="QuestGenerator">
+        {(props) => (
+          <ErrorBoundary screen="QuestGeneratorScreen">
+            <QuestGeneratorScreen {...props} />
           </ErrorBoundary>
         )}
       </AppNav.Screen>

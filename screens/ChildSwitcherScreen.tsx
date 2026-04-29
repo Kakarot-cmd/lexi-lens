@@ -33,7 +33,7 @@ import * as Haptics             from "expo-haptics";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { supabase, signOut }    from "../lib/supabase";
-import QuestGeneratorScreen     from "./QuestGeneratorScreen";
+// QuestGeneratorScreen removed — parent-only, accessed via ParentDashboard + PIN gate
 import { useGameStore }         from "../store/gameStore";
 
 // ─── Navigation types ─────────────────────────────────────────────────────────
@@ -340,8 +340,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
   const [loading,       setLoading]       = useState(true);
   const [showForm,      setShowForm]      = useState(false);
   const [signingOut,    setSigningOut]    = useState(false);
-  const [showGenerator, setShowGenerator] = useState(false);
-  const [generatorChild,setGeneratorChild] = useState<ChildRow | null>(null);
+  // Quest Generator state removed — parent-only feature, gated via ParentDashboard PIN
 
   const startChildSession = useGameStore((s) => s.startChildSession);
   const loadQuests        = useGameStore((s) => s.loadQuests);
@@ -464,21 +463,10 @@ export function ChildSwitcherScreen({ navigation }: Props) {
                 child={child}
                 onSelect={() => handleSelect(child)}
                 onDelete={() => handleDelete(child.id)}
-                onCreateQuest={() => {
-                  setGeneratorChild(child);
-                  setShowGenerator(true);
-                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-                }}
               />
             ))}
 
-            {/* ── AI Quest Generator Modal ──────────────── */}
-            <QuestGeneratorScreen
-              visible={showGenerator}
-              onClose={() => { setShowGenerator(false); setGeneratorChild(null); }}
-              defaultAgeBand={(generatorChild?.age_band as any) ?? "7-8"}
-              targetChild={generatorChild}
-            />
+            {/* Quest Generator removed — parent-only, accessed via ParentDashboard */}
 
             {showForm ? (
               <AddChildForm

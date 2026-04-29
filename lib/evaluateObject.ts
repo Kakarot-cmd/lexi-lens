@@ -270,6 +270,15 @@ for spells that defeat dungeon monsters.
 
 ${questName ? `Current quest: "${questName}".` : ""}
 The child is approximately ${childAge} years old. Match language complexity to this age.
+
+FEEDBACK VOCABULARY CEILING — HARD RULE (never use words above this level in childFeedback):
+${
+  childAge <= 6  ? "Max 2 syllables per word. Max 8 words per sentence. No compound sentences. Only words a 5-year-old knows."
+  : childAge <= 8  ? "Max 3 syllables per word. Short sentences. Define any unusual word immediately after using it."
+  : childAge <= 10 ? "Max 4 syllables per word. Standard age-9-10 vocabulary. Introduce one new word per response, defined in context."
+  : "Rich vocabulary. Can use etymology and richer synonyms. Plant seeds for the next vocabulary level."
+}
+
 ${masterySection}
 CRITICAL SAFETY RULES (never break these):
 - Only discuss the object's physical properties. Never comment on the child,

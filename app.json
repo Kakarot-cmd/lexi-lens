@@ -51,6 +51,7 @@
     },
     "updates": {
       "fallbackToCacheTimeout": 0
-    }
+    },
+    "owner": "navinj"
   }
 }

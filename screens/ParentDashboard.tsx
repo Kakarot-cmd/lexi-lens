@@ -53,6 +53,7 @@ import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
 import { StreakHeatmap }         from "../components/StreakHeatmap";
 import QuestGeneratorScreen     from "./QuestGeneratorScreen";
+import { ParentPinGateModal }   from "../components/ParentPinGateModal";
 // v2.4 — Phase 4.1 COPPA + GDPR-K
 import { DataDeletionScreen }   from "../components/DataDeletionScreen";
 import { PrivacyPolicyScreen }  from "../components/PrivacyPolicyScreen";
@@ -309,6 +310,9 @@ export function ParentDashboard({ navigation }: Props) {
   const [streakInfo, setStreakInfo]       = useState<StreakInfo>({ currentStreak: 0, longestStreak: 0 });
   const [notifEnabled, setNotifEnabled]     = useState(false);
   const [showGenerator, setShowGenerator]   = useState(false);
+  const [pinVisible,    setPinVisible]      = useState(false);
+  const [parentId,      setParentId]        = useState("");
+  const [parentEmail,   setParentEmail]     = useState("");
 
   // v2.4 — Phase 4.1 COPPA + GDPR-K modals
   const [showPrivacyPolicy,    setShowPrivacyPolicy]    = useState(false);
@@ -335,6 +339,11 @@ export function ParentDashboard({ navigation }: Props) {
       const { data: { user } } = await supabase.auth.getUser();
       const scheduled = user?.app_metadata?.deletion_scheduled_at ?? null;
       setDeletionScheduledAt(scheduled);
+      // Store for PIN gate
+      if (user) {
+        setParentId(user.id);
+        setParentEmail(user.email ?? "");
+      }
     }
 
     fetchChildren();
@@ -502,7 +511,7 @@ export function ParentDashboard({ navigation }: Props) {
             style={styles.createQuestBtn}
             onPress={() => {
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-              setShowGenerator(true);
+              setPinVisible(true);
             }}
             accessibilityLabel="Create AI quest"
           >
@@ -522,6 +531,18 @@ export function ParentDashboard({ navigation }: Props) {
           </ScrollView>
         )}
       </View>
+
+      {/* ── Parent PIN Gate → Quest Generator ──────────── */}
+      <ParentPinGateModal
+        visible={pinVisible}
+        parentId={parentId}
+        parentEmail={parentEmail}
+        onSuccess={() => {
+          setPinVisible(false);
+          setShowGenerator(true);
+        }}
+        onDismiss={() => setPinVisible(false)}
+      />
 
       {/* ── Quest Generator Modal ───────────────────────── */}
       <QuestGeneratorScreen
