@@ -28,7 +28,7 @@
       "permissions": [
         "android.permission.CAMERA"
       ],
-      "package": "com.anonymous.lexilens"
+      "package": "com.navinj.lexilore"
     },
     "web": {
       "favicon": "./assets/favicon.png"
