@@ -475,9 +475,23 @@ export const useGameStore = create<GameState>()(
           quest.hard_mode_properties.length > 0;
 
         const ageBandProps = quest.age_band_properties?.[ageBand];
+
+        // age_band_properties entries are often bare {word} objects without
+        // definition/evaluationHints. Enrich them from required_properties
+        // so children always see definitions on the quest intro screen.
+        const enrichedAgeBandProps = ageBandProps?.map(
+          (p: PropertyRequirement) => {
+            if (p.definition?.trim()) return p;
+            const canonical = quest.required_properties.find(
+              (r) => r.word === p.word
+            );
+            return canonical ? { ...p, definition: canonical.definition, evaluationHints: p.evaluationHints ?? canonical.evaluationHints } : p;
+          }
+        );
+
         const baseProperties =
-          ageBandProps && ageBandProps.length > 0
-            ? ageBandProps
+          enrichedAgeBandProps && enrichedAgeBandProps.length > 0
+            ? enrichedAgeBandProps
             : quest.required_properties;
 
         const effectiveProperties = canHardMode

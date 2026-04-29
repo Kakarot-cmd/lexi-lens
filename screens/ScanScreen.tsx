@@ -301,7 +301,13 @@ function QuestIntro({
             <Text style={[styles.introPropWord, isHardMode && { color: P.hardRedText }]}>
               {p.word}
             </Text>
-            <Text style={styles.introPropDef}>{p.definition}</Text>
+            {p.definition ? (
+              <Text style={styles.introPropDef}>{p.definition}</Text>
+            ) : (
+              <Text style={styles.introPropDefMissing}>
+                Find something that is {p.word}!
+              </Text>
+            )}
           </View>
         </View>
       ))}
@@ -829,6 +835,7 @@ const styles = StyleSheet.create({
   introPropRow:       { flexDirection: "row", gap: 10, marginBottom: 12, alignItems: "flex-start", width: "100%" },
   introPropWord:      { fontSize: 16, fontWeight: "700", color: P.gold },
   introPropDef:       { fontSize: 13, color: P.textMuted, marginTop: 2, lineHeight: 18 },
+  introPropDefMissing:{ fontSize: 13, color: P.textDim,   marginTop: 2, lineHeight: 18, fontStyle: "italic" },
   beginBtn:           { marginTop: 24, backgroundColor: "#7c3aed", borderRadius: 16, paddingVertical: 16, paddingHorizontal: 48, alignItems: "center" },
   beginBtnHard:       { backgroundColor: P.hardRed },
   beginBtnText:       { fontSize: 17, fontWeight: "700", color: "#fff" },
