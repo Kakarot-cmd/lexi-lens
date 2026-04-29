@@ -101,6 +101,12 @@ interface EvaluateObjectOptions {
   questName?:         string;
   /** v1.5 — mastery profile of the child's known vocabulary */
   masteryProfile?:    MasteryEntry[];
+  /**
+   * XP FIX — per-quest XP rates from the DB (xp_reward_first_try / xp_reward_retry).
+   * When supplied, the Edge Function uses these instead of the hardcoded constants so
+   * the value shown on the quest card matches what actually gets awarded.
+   */
+  xpRates?: { firstTry: number; secondTry: number; thirdPlus: number };
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -452,11 +458,18 @@ export async function evaluateObject(
 
   const attempts  = opts.failedAttempts ?? 0;
 
-  // Base XP by attempt number — same as before
+  // XP FIX: use per-quest rates from the DB when provided; fall back to constants.
+  // This ensures the number shown on the quest card matches what is actually awarded.
+  const rates = opts.xpRates ?? {
+    firstTry:  XP_FIRST_TRY,
+    secondTry: XP_SECOND_TRY,
+    thirdPlus: XP_THIRD_PLUS,
+  };
+
   const baseXp = correctedResult.overallMatch
-    ? attempts === 0 ? XP_FIRST_TRY
-    : attempts === 1 ? XP_SECOND_TRY
-    : XP_THIRD_PLUS
+    ? attempts === 0 ? rates.firstTry
+    : attempts === 1 ? rates.secondTry
+    : rates.thirdPlus
     : 0;
 
   // Phase 1.2: Multi-property bonus
