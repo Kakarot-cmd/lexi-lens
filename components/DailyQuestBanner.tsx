@@ -81,6 +81,11 @@ export function DailyQuestBanner({ onPress }: Props) {
   const currentStreak = streak?.currentStreak ?? 0;
   const has2x         = multiplier >= 2;
 
+  // XP FIX: compute real max XP matching the Edge Function formula
+  const propCount  = dailyQuest.required_properties?.length ?? 1;
+  const multiBonus = propCount >= 3 ? 2.0 : propCount === 2 ? 1.5 : 1.0;
+  const maxXpFirst = Math.round((dailyQuest.xp_reward_first_try ?? 40) * propCount * multiBonus);
+
   return (
     <View style={styles.wrapper}>
       {/* Section header */}
@@ -137,9 +142,8 @@ export function DailyQuestBanner({ onPress }: Props) {
               <>
                 <View style={styles.xpPill}>
                   <Text style={styles.xpText}>
-                    {has2x
-                      ? `${dailyQuest.xp_reward_first_try * 2} XP`
-                      : `${dailyQuest.xp_reward_first_try} XP`}
+                    {/* XP FIX: show formula total, not raw xp_reward_first_try */}
+                    {has2x ? `${maxXpFirst * 2} XP` : `${maxXpFirst} XP`}
                   </Text>
                   {has2x && <Text style={styles.xpBase}>×2</Text>}
                 </View>

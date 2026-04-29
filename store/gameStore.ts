@@ -664,6 +664,19 @@ export const useGameStore = create<GameState>()(
             // Optimistic update stays — same-session shows Done.
             // Cross-session: AsyncStorage has it via zustand-persist.
           } else {
+            // XP FIX: call award_xp so child_profiles.total_xp is actually written
+            // to the DB. Without this, refreshChildFromDB() reads the old (pre-quest)
+            // value and silently overwrites the optimistic update — erasing XP from
+            // QuestMap LevelBar, ChildSwitcher card, and all cross-session displays.
+            const { error: xpError } = await supabase.rpc("award_xp", {
+              p_child_id: activeChild.id,
+              p_xp:       totalXp,
+            });
+            if (xpError) {
+              console.error("[markQuestCompletion] award_xp RPC failed:", xpError);
+              // Optimistic update stays in store for this session.
+            }
+
             // Upsert confirmed — reload from DB to sync store with source of truth.
             get().loadCompletedQuests();
           }

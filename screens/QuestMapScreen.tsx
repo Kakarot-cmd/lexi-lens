@@ -214,6 +214,12 @@ function QuestCard({
   const isDaily      = quest.id === dailyQuestId;
   const propCount    = quest.required_properties.length;
 
+  // XP FIX: compute the real max XP the Edge Function will award.
+  // Formula mirrors evaluateObject.ts: base × propCount × multiBonus
+  const multiBonus  = propCount >= 3 ? 2.0 : propCount === 2 ? 1.5 : 1.0;
+  const maxXpFirst  = Math.round((quest.xp_reward_first_try ?? 40) * propCount * multiBonus);
+  const maxXpRetry  = Math.round((quest.xp_reward_retry     ?? 25) * propCount * multiBonus);
+
   return (
     <View
       style={[
@@ -284,13 +290,19 @@ function QuestCard({
         </View>
       )}
 
-      {/* ── XP rewards ──────────────────────────────────── */}
+      {/* ── XP rewards (XP FIX: shows real formula total, not raw per-prop base) ── */}
       <View style={styles.xpRow}>
+        <View>
+          <Text style={styles.xpText}>
+            ⚡ Up to{" "}
+            <Text style={{ color: P.gold, fontWeight: "800" }}>{maxXpFirst} XP</Text>
+          </Text>
+          <Text style={[styles.xpText, { fontSize: 10, color: P.textDim, marginTop: 1 }]}>
+            {quest.xp_reward_first_try ?? 40}/prop · {propCount} prop{propCount !== 1 ? "s" : ""} · {multiBonus}×
+          </Text>
+        </View>
         <Text style={styles.xpText}>
-          First try: <Text style={{ color: P.gold }}>{quest.xp_reward_first_try} XP</Text>
-        </Text>
-        <Text style={styles.xpText}>
-          Retry: <Text style={{ color: P.textDim }}>{quest.xp_reward_retry} XP</Text>
+          Retry: <Text style={{ color: P.textDim }}>{maxXpRetry} XP</Text>
         </Text>
       </View>
 

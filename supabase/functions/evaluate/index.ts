@@ -287,7 +287,18 @@ serve(async (req: Request) => {
     failedAttempts,
     masteryProfile,
     alreadyFoundWords,
+    // XP FIX: per-quest XP rates sent by useLexiEvaluate from the quest DB row
+    xp_reward_first_try,
+    xp_reward_retry,
+    xp_reward_third_plus,
   } = body as Record<string, unknown>;
+
+  // Build xpRates — use quest DB values so awarded XP matches what the card shows.
+  const xpRates = {
+    firstTry:  typeof xp_reward_first_try  === "number" ? xp_reward_first_try  : 40,
+    secondTry: typeof xp_reward_retry      === "number" ? xp_reward_retry      : 25,
+    thirdPlus: typeof xp_reward_third_plus === "number" ? xp_reward_third_plus : 10,
+  };
 
   if (!childId || typeof childId !== "string") {
     return jsonResponse({ error: "childId is required" }, 400);
@@ -389,6 +400,7 @@ serve(async (req: Request) => {
       failedAttempts:     failedAttempts as number | undefined,
       questName:          questName as string | undefined,
       masteryProfile:     masteryProfile as Parameters<typeof evaluateObject>[0]["masteryProfile"],
+      xpRates,   // XP FIX: pass per-quest rates through to evaluateObject
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Evaluation failed";

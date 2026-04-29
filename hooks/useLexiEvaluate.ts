@@ -130,6 +130,10 @@ export interface EvaluatePayload {
   masteryProfile?: MasteryEntry[];
   currentWord?:    string;
   alreadyFoundWords?: string[];
+  // XP FIX: quest DB values — sent to Edge Function so awarded XP matches card display
+  xp_reward_first_try?:   number;
+  xp_reward_retry?:       number;
+  xp_reward_third_plus?:  number;
 }
 
 interface UseLexiEvaluateReturn {
@@ -349,6 +353,10 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
         failedAttempts:     attempt,
         masteryProfile:     payload.masteryProfile ?? [],
         alreadyFoundWords:  payload.alreadyFoundWords ?? [],
+        // XP FIX: forward per-quest rates to the Edge Function
+        xp_reward_first_try:  payload.xp_reward_first_try  ?? 40,
+        xp_reward_retry:      payload.xp_reward_retry      ?? 25,
+        xp_reward_third_plus: payload.xp_reward_third_plus ?? 10,
       });
 
       // ── Step 3: Record cache hit flag ────────────────────────────────────

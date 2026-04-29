@@ -551,6 +551,11 @@ export function ScanScreen({ route, navigation }: Props) {
           .map((c) => c.propertyWord),
         childAge:           parseInt(activeChild.age_band.split("-")[1], 10),
         failedAttempts:     currentAttempts,
+        // XP FIX: pass quest DB rates so the Edge Function awards the correct XP
+        // and the value matches what the quest card showed the child before they started.
+        xp_reward_first_try:  activeQuest.quest.xp_reward_first_try  ?? 40,
+        xp_reward_retry:      activeQuest.quest.xp_reward_retry      ?? 25,
+        xp_reward_third_plus: activeQuest.quest.xp_reward_third_plus ?? 10,
       });
     },
   });
