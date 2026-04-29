@@ -15,7 +15,7 @@
       "autoIncrement": true,
 	  "env": {
     "EXPO_PUBLIC_SUPABASE_URL": "https://zhnaxafmacygbhpvtwvf.supabase.co",
-    "EXPO_PUBLIC_SUPABASE_ANON_KEY": "sb_publishable_4gqj-PJEn8WgYLs5NFiX_w_JANd86TW"
+    "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpobmF4YWZtYWN5Z2JocHZ0d3ZmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYyMjQ1OTMsImV4cCI6MjA5MTgwMDU5M30.tZYWWzH7UoGQV23BSZt6VhZ-dHQBExZzrcbSGPo-0bg"
   }
     }
   },
