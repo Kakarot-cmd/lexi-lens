@@ -1,34 +1,26 @@
 /**
  * supabase/functions/generate-quest/index.ts
- * Lexi-Lens — AI Quest Generator (Phase 4.2 rewrite)
+ * Lexi-Lens — AI Quest Generator (Phase 3.3 + propCount update)
  *
  * POST /functions/v1/generate-quest
  *
- * WHAT CHANGED FROM THE ORIGINAL:
- *   • Full vocabulary taxonomy baked into the prompt — age band now enforces
- *     syllable ceilings, property-count limits, word register, and object concreteness.
- *   • knownWords[] passed from the child's word_tome — Claude explicitly avoids
- *     them so every quest introduces fresh vocabulary.
- *   • masteryProfile passed from evaluate payload — for Archmage tier Claude
- *     targets the child's weakest known words first (novice → developing), not
- *     random advanced words.
- *   • hard_mode_properties now enforced as true upward synonyms — same physical
- *     property at a higher vocabulary register (rigid → inflexible → inelastic).
- *   • Feedback vocabulary ceiling enforced per age band in the eval prompt too
- *     (see evaluateObject.ts).
+ * Changes in this version:
+ *   • Accepts `propCount` (1–5) in the request body. When provided it overrides
+ *     the taxonomy default so Claude generates exactly the number of vocabulary
+ *     words the parent selected in the app.
+ *   • max_tokens scales with propCount (800 + 200 × N) so larger quests never
+ *     get truncated.
+ *   • buildSystemPrompt receives propCount as an explicit parameter instead of
+ *     deriving it from the taxonomy table.
  *
  * REQUEST BODY:
  *   {
- *     theme:          string,          // parent-supplied, e.g. "ocean creatures"
+ *     theme:          string,
  *     ageBand:        "5-6"|"7-8"|"9-10"|"11-12",
  *     tier:           "apprentice"|"scholar"|"sage"|"archmage",
- *     knownWords?:    string[],        // words already in the child's word_tome
- *     masteryProfile?: Array<{         // child's mastery data from word_tome
- *       word:         string;
- *       mastery:      number;          // 0.0–1.0
- *       masteryTier:  "novice"|"developing"|"proficient"|"expert";
- *       timesUsed:    number;
- *     }>;
+ *     propCount?:     number,   // 1–5, default 3
+ *     knownWords?:    string[],
+ *     masteryProfile?: Array<{ word, mastery, masteryTier, timesUsed }>;
  *   }
  *
  * RESPONSE:
@@ -55,16 +47,14 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-// ─── Vocabulary taxonomy ───────────────────────────────────────────────────────
-// This is the source of truth for what words/properties belong at each
-// age band × tier combination. The taxonomy is embedded in the Claude prompt.
+// ─── Vocabulary taxonomy ──────────────────────────────────────────────────────
 
 const TAXONOMY: Record<string, {
   propertyType:    string;
   wordPool:        string[];
   hardModePool:    string;
   maxSyllables:    number;
-  propertyCount:   Record<string, number>;
+  defaultPropCount: Record<string, number>;  // renamed from propertyCount for clarity
   objectExamples:  string;
   feedbackCeiling: string;
 }> = {
@@ -82,9 +72,9 @@ const TAXONOMY: Record<string, {
       heavy → weighty
       rough → bumpy → textured
       stretchy → flexible`,
-    maxSyllables:  2,
-    propertyCount: { apprentice: 1, scholar: 1, sage: 1, archmage: 1 },
-    objectExamples: "spoon, pillow, stone, leaf, sock, cup, pencil, crayon, toy block, blanket",
+    maxSyllables:     2,
+    defaultPropCount: { apprentice: 1, scholar: 1, sage: 1, archmage: 1 },
+    objectExamples:   "spoon, pillow, stone, leaf, sock, cup, pencil, crayon, toy block, blanket",
     feedbackCeiling: `
       - Maximum sentence length: 8 words.
       - No compound sentences ("and", "but", "because" are fine; semicolons are not).
@@ -106,9 +96,9 @@ const TAXONOMY: Record<string, {
       magnetic → attracted-to-magnets → ferromagnetic (use only for age 11-12)
       absorbent → sponge-like → porous
       reflective → mirror-like → glossy`,
-    maxSyllables:  3,
-    propertyCount: { apprentice: 1, scholar: 2, sage: 2, archmage: 2 },
-    objectExamples: "mirror, sponge, ruler, candle, coin, balloon, rubber band, plastic bottle, glass",
+    maxSyllables:     3,
+    defaultPropCount: { apprentice: 1, scholar: 2, sage: 2, archmage: 2 },
+    objectExamples:   "mirror, sponge, ruler, candle, coin, balloon, rubber band, plastic bottle, glass",
     feedbackCeiling: `
       - Use simple sentences. Some compound sentences are fine.
       - Vocabulary of a confident 7-year-old reader.
@@ -132,9 +122,9 @@ const TAXONOMY: Record<string, {
       fibrous → filamentous
       malleable → workable → ductile (save ductile for age 11-12)
       buoyant → floatable → hydrophobic`,
-    maxSyllables:  4,
-    propertyCount: { apprentice: 1, scholar: 2, sage: 3, archmage: 3 },
-    objectExamples: "cork, aluminium foil, rubber eraser, copper wire, clay, gravel, felt, mesh, wax candle",
+    maxSyllables:     4,
+    defaultPropCount: { apprentice: 1, scholar: 2, sage: 3, archmage: 3 },
+    objectExamples:   "cork, aluminium foil, rubber eraser, copper wire, clay, gravel, felt, mesh, wax candle",
     feedbackCeiling: `
       - Standard vocabulary for age 9-10.
       - Words up to 4 syllables are fine.
@@ -158,9 +148,9 @@ const TAXONOMY: Record<string, {
       ferromagnetic → paramagnetic (different but related — explain distinction)
       hygroscopic → deliquescent (extreme case of hygroscopic)
       refractive → diffractive (introduce optical nuance)`,
-    maxSyllables:  5,
-    propertyCount: { apprentice: 2, scholar: 3, sage: 3, archmage: 3 },
-    objectExamples: "copper pipe, glass rod, wax block, felt sheet, resin block, polished metal, mica flake, salt crystal",
+    maxSyllables:     5,
+    defaultPropCount: { apprentice: 2, scholar: 3, sage: 3, archmage: 3 },
+    objectExamples:   "copper pipe, glass rod, wax block, felt sheet, resin block, polished metal, mica flake, salt crystal",
     feedbackCeiling: `
       - Rich vocabulary. Age 11-12 level.
       - Can introduce etymology: "Pellucid comes from Latin pellucēre — to shine through."
@@ -172,13 +162,13 @@ const TAXONOMY: Record<string, {
 // ─── System prompt builder ────────────────────────────────────────────────────
 
 function buildSystemPrompt(
-  ageBand:       string,
-  tier:          string,
-  knownWords:    string[],
-  masteryProfile: Array<{ word: string; mastery: number; masteryTier: string; timesUsed: number }>
+  ageBand:        string,
+  tier:           string,
+  knownWords:     string[],
+  masteryProfile: Array<{ word: string; mastery: number; masteryTier: string; timesUsed: number }>,
+  propCount:      number,   // parent-specified, already clamped to 1–5
 ): string {
   const tax = TAXONOMY[ageBand] ?? TAXONOMY["7-8"];
-  const propCount = tax.propertyCount[tier] ?? 2;
 
   const knownWordsSection = knownWords.length > 0
     ? `\nWORDS ALREADY IN THE CHILD'S VOCABULARY (DO NOT use any of these):
@@ -207,7 +197,7 @@ VOCABULARY TAXONOMY FOR THIS AGE BAND (${ageBand}):
   Property type: ${tax.propertyType}
   Word pool (choose FROM these or close synonyms): ${tax.wordPool.join(", ")}
   Max syllables per vocabulary word: ${tax.maxSyllables}
-  Number of required_properties for this tier: EXACTLY ${propCount}
+  Number of required_properties: EXACTLY ${propCount}
   Target object concreteness: ${tax.objectExamples}
 
 TIER BEHAVIOUR:
@@ -266,7 +256,7 @@ CRITICAL: required_properties.length === ${propCount} and hard_mode_properties.l
 Both arrays must have exactly ${propCount} item(s). Never more, never fewer.`;
 }
 
-// ─── User message builder ──────────────────────────────────────────────────────
+// ─── User message builder ─────────────────────────────────────────────────────
 
 function buildUserMessage(theme: string, ageBand: string, tier: string): string {
   return `Create a vocabulary quest with theme: "${theme}"
@@ -278,7 +268,7 @@ defeats the enemy. The vocabulary words must come from the taxonomy specified in
 Make the quest feel exciting and magical while staying true to the age-appropriate vocabulary constraints.`;
 }
 
-// ─── Main handler ──────────────────────────────────────────────────────────────
+// ─── Main handler ─────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
@@ -289,6 +279,7 @@ Deno.serve(async (req: Request) => {
     theme?:          unknown;
     ageBand?:        unknown;
     tier?:           unknown;
+    propCount?:      unknown;   // ← NEW
     knownWords?:     unknown;
     masteryProfile?: unknown;
   };
@@ -299,9 +290,18 @@ Deno.serve(async (req: Request) => {
     return json({ error: "Request body must be valid JSON." }, 400);
   }
 
-  const theme      = typeof body.theme   === "string" ? body.theme.trim()   : "";
-  const ageBand    = typeof body.ageBand === "string" ? body.ageBand        : "7-8";
-  const tier       = typeof body.tier    === "string" ? body.tier           : "apprentice";
+  const theme    = typeof body.theme   === "string" ? body.theme.trim() : "";
+  const ageBand  = typeof body.ageBand === "string" ? body.ageBand      : "7-8";
+  const tier     = typeof body.tier    === "string" ? body.tier         : "apprentice";
+
+  // propCount: parent-specified (1–5). If absent/invalid, fall back to taxonomy default.
+  const tax = TAXONOMY[ageBand] ?? TAXONOMY["7-8"];
+  const taxonomyDefault = tax.defaultPropCount[tier] ?? 2;
+  const rawPropCount    = typeof body.propCount === "number" ? body.propCount : null;
+  const propCount       = rawPropCount !== null
+    ? Math.min(5, Math.max(1, Math.round(rawPropCount)))
+    : taxonomyDefault;
+
   const knownWords = Array.isArray(body.knownWords)
     ? (body.knownWords as string[]).filter(w => typeof w === "string")
     : [];
@@ -320,8 +320,11 @@ Deno.serve(async (req: Request) => {
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
   if (!apiKey) return json({ error: "ANTHROPIC_API_KEY not configured." }, 500);
 
-  const systemPrompt = buildSystemPrompt(ageBand, tier, knownWords, masteryProfile);
+  const systemPrompt = buildSystemPrompt(ageBand, tier, knownWords, masteryProfile, propCount);
   const userMessage  = buildUserMessage(theme, ageBand, tier);
+
+  // Scale token budget with propCount — 5 properties needs ~400 more tokens than 1
+  const maxTokens = Math.max(1200, 800 + propCount * 200);
 
   let raw: string;
   try {
@@ -334,7 +337,7 @@ Deno.serve(async (req: Request) => {
       },
       body: JSON.stringify({
         model:      "claude-haiku-4-5-20251001",
-        max_tokens: 1200,
+        max_tokens: maxTokens,
         system:     systemPrompt,
         messages:   [{ role: "user", content: userMessage }],
       }),
@@ -362,14 +365,14 @@ Deno.serve(async (req: Request) => {
 
   // ── Parse & validate response ──────────────────────────────────────────────
   let quest: {
-    name:                string;
-    enemy_name:          string;
-    enemy_emoji:         string;
-    room_label:          string;
-    spell_name:          string;
-    weapon_emoji:        string;
-    spell_description:   string;
-    required_properties: Array<{ word: string; definition: string; evaluationHints: string }>;
+    name:                 string;
+    enemy_name:           string;
+    enemy_emoji:          string;
+    room_label:           string;
+    spell_name:           string;
+    weapon_emoji:         string;
+    spell_description:    string;
+    required_properties:  Array<{ word: string; definition: string; evaluationHints: string }>;
     hard_mode_properties: Array<{ word: string; definition: string; evaluationHints: string }>;
   };
 
@@ -387,14 +390,14 @@ Deno.serve(async (req: Request) => {
     return json({ error: "AI returned an incomplete quest. Please try again." }, 502);
   }
 
-  // Ensure hard_mode_properties exists and matches length
+  // Ensure hard_mode_properties exists
   if (!Array.isArray(quest.hard_mode_properties)) {
     quest.hard_mode_properties = [];
   }
 
   // Guard: never return a quest where required_property.word is in knownWords
   if (knownWords.length > 0) {
-    const knownSet = new Set(knownWords.map(w => w.toLowerCase()));
+    const knownSet  = new Set(knownWords.map(w => w.toLowerCase()));
     const collision = quest.required_properties.find(p => knownSet.has(p.word.toLowerCase()));
     if (collision) {
       console.warn(`[generate-quest] Claude used a known word: "${collision.word}" — returning error`);
@@ -404,8 +407,11 @@ Deno.serve(async (req: Request) => {
     }
   }
 
-  console.log(`[generate-quest] Generated quest "${quest.name}" for age ${ageBand} tier ${tier}. ` +
-    `Properties: ${quest.required_properties.map(p => p.word).join(", ")}`);
+  console.log(
+    `[generate-quest] Generated quest "${quest.name}" for age ${ageBand} tier ${tier}. ` +
+    `propCount requested: ${propCount}, delivered: ${quest.required_properties.length}. ` +
+    `Properties: ${quest.required_properties.map(p => p.word).join(", ")}`
+  );
 
   return json({ quest });
 });
