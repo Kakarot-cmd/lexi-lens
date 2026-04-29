@@ -100,7 +100,7 @@ function PropertyBadge({ word, passes, reasoning }: {
           {word}
         </Text>
       </View>
-      <Text style={styles.badgeReason}>{reasoning}</Text>
+      <Text style={styles.badgeReason}>{reasoning.replace(/\s*\[auto-corrected:[^\]]*\]/g, "").trim()}</Text>
     </View>
   );
 }

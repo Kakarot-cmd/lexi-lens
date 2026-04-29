@@ -130,7 +130,9 @@ const NEGATIVE_PHRASES: string[] = [
   "not applicable", "not qualify", "not qualif",
   "fails to", "fail to", "failed to",
   "lacks", "lack ", "lacking",
-  "without", "absent",
+  // "without" and "absent" removed — too ambiguous.
+  // "without breaking/cracking/damage" are positive phrases that confirm a property.
+  // Trust Claude's score directly when phrasing is ambiguous.
 
   // Property mismatch signals
   "does not apply", "does not match", "does not meet",
@@ -202,25 +204,35 @@ function formatMasteryProfile(profile: MasteryEntry[]): string {
 function validatePropertyScore(prop: PropertyScore): PropertyScore {
   const reasoning = prop.reasoning.toLowerCase();
 
-  const hardMatch = NEGATIVE_PHRASES.find((phrase) => reasoning.includes(phrase));
-  if (hardMatch) {
-    return {
-      ...prop,
-      score:     0.0,
-      passes:    false,
-      reasoning: `${prop.reasoning} [auto-corrected: score overridden due to negative phrasing ("${hardMatch}")]`,
-    };
+  // ── Negative phrase override ───────────────────────────────────────────────
+  // Only override when Claude's own score is already below the pass threshold.
+  // This prevents ambiguous phrases like "without breaking" (which confirm the
+  // property is present) from falsely overriding high-confidence passes.
+  // Rule: if Claude scores >= PROPERTY_PASS_THRESHOLD, trust Claude's judgment.
+  if (prop.score < PROPERTY_PASS_THRESHOLD) {
+    const hardMatch = NEGATIVE_PHRASES.find((phrase) => reasoning.includes(phrase));
+    if (hardMatch) {
+      return {
+        ...prop,
+        score:  0.0,
+        passes: false,
+        // reasoning unchanged — no debug text injected into child-facing UI
+      };
+    }
   }
 
+  // ── Hedging cap ───────────────────────────────────────────────────────────
+  // If Claude scores confidently but uses hedging language, cap the score.
+  // This catches cases like "not typically flexible" scored at 0.8.
   if (prop.score >= CONTRADICTION_THRESHOLD) {
     const hedgeMatch = HEDGING_PHRASES.find((phrase) => reasoning.includes(phrase));
     if (hedgeMatch) {
       const cappedScore = Math.min(prop.score, CONTRADICTION_CAP);
       return {
         ...prop,
-        score:     cappedScore,
-        passes:    cappedScore >= PROPERTY_PASS_THRESHOLD,
-        reasoning: `${prop.reasoning} [auto-corrected: score capped due to hedging ("${hedgeMatch}")]`,
+        score:  cappedScore,
+        passes: cappedScore >= PROPERTY_PASS_THRESHOLD,
+        // reasoning unchanged — no debug text injected into child-facing UI
       };
     }
   }
