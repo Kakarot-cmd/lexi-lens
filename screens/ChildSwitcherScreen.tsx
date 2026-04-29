@@ -34,6 +34,7 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { supabase, signOut }    from "../lib/supabase";
 // QuestGeneratorScreen removed — parent-only, accessed via ParentDashboard + PIN gate
+import { ParentPinGateModal }   from "../components/ParentPinGateModal";
 import { useGameStore }         from "../store/gameStore";
 
 // ─── Navigation types ─────────────────────────────────────────────────────────
@@ -342,6 +343,11 @@ export function ChildSwitcherScreen({ navigation }: Props) {
   const [signingOut,    setSigningOut]    = useState(false);
   // Quest Generator state removed — parent-only feature, gated via ParentDashboard PIN
 
+  // ── Parent PIN gate (Option A — gate is at the door) ──────────────────────
+  const [pinVisible,  setPinVisible]  = useState(false);
+  const [parentId,    setParentId]    = useState("");
+  const [parentEmail, setParentEmail] = useState("");
+
   const startChildSession = useGameStore((s) => s.startChildSession);
   const loadQuests        = useGameStore((s) => s.loadQuests);
   const loadCompletedQuests = useGameStore((s) => s.loadCompletedQuests);
@@ -363,6 +369,16 @@ export function ChildSwitcherScreen({ navigation }: Props) {
   }, []);
 
   useEffect(() => { fetchChildren(); }, [fetchChildren]);
+
+  // Fetch parent user info once — needed by PIN gate modal
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (user) {
+        setParentId(user.id);
+        setParentEmail(user.email ?? "");
+      }
+    });
+  }, []);
 
   const handleSelect = useCallback(async (child: ChildRow) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
@@ -417,7 +433,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
         <View style={styles.headerActions}>
           <TouchableOpacity
             style={styles.dashboardBtn}
-            onPress={() => navigation.navigate("ParentDashboard")}
+            onPress={() => setPinVisible(true)}
             accessibilityLabel="Parent dashboard"
           >
             <Text style={styles.dashboardBtnText}>📊 Word Tome</Text>
@@ -467,6 +483,18 @@ export function ChildSwitcherScreen({ navigation }: Props) {
             ))}
 
             {/* Quest Generator removed — parent-only, accessed via ParentDashboard */}
+
+            {/* ── Parent PIN gate ───────────────────────────── */}
+            <ParentPinGateModal
+              visible={pinVisible}
+              parentId={parentId}
+              parentEmail={parentEmail}
+              onSuccess={() => {
+                setPinVisible(false);
+                navigation.navigate("ParentDashboard");
+              }}
+              onDismiss={() => setPinVisible(false)}
+            />
 
             {showForm ? (
               <AddChildForm

@@ -465,16 +465,7 @@ export function QuestMapScreen({ navigation }: Props) {
     <View style={[styles.root, { paddingTop: insets.top }]}>
       {/* ── Screen header ───────────────────────────────── */}
       <View style={styles.header}>
-        <TouchableOpacity
-          style={styles.parentBtn}
-          onPress={() => {
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-            navigation.navigate("ParentDashboard");
-          }}
-          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-        >
-          <Text style={styles.parentBtnText}>📊</Text>
-        </TouchableOpacity>
+        {/* Chart icon removed — ParentDashboard accessible via PIN-gated Word Tome on ChildSwitcher */}
         <View style={styles.headerCenter}>
           <Text style={styles.headerTitle}>Dungeon Map</Text>
           {activeChild && (
