@@ -675,7 +675,10 @@ export const useGameStore = create<GameState>()(
             if (xpError) {
               console.error("[markQuestCompletion] award_xp RPC failed:", xpError);
               // Optimistic update stays in store for this session.
-            }
+            }else {
+				// ← ADD THIS: read confirmed value back from DB immediately after award
+				await get().refreshChildFromDB();
+				}
 
             // Upsert confirmed — reload from DB to sync store with source of truth.
             get().loadCompletedQuests();

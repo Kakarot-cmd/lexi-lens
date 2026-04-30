@@ -30,6 +30,7 @@ import {
   TouchableOpacity,
   StyleSheet,
   Animated,
+  Linking,
 } from "react-native";
 import { Camera } from "react-native-vision-camera";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -508,7 +509,7 @@ export function ScanScreen({ route, navigation }: Props) {
     markQuestCompletion(activeQuest.quest.id, mode, totalXp)
       .then(() => {
         completeQuest();
-        refreshChildFromDB();
+        //refreshChildFromDB();
         navigation.goBack();
       })
       .catch(() => {
@@ -530,6 +531,7 @@ export function ScanScreen({ route, navigation }: Props) {
     triggerManualScan,
     liveLabel,
     liveConfidence,
+	requestPermission,
   } = useObjectScanner({
     enabled: phase === "scanning" && status === "idle",
     onDetection: async ({ primary, frameBase64 }) => {
@@ -562,20 +564,46 @@ export function ScanScreen({ route, navigation }: Props) {
 
   // ── Guards ────────────────────────────────────────────────────────────────
 
-  if (!hasPermission) {
-    return (
-      <View style={[styles.center, { paddingTop: insets.top }]}>
-        <Text style={styles.permText}>Camera access needed</Text>
-      </View>
-    );
-  }
-  if (!device) {
-    return (
-      <View style={[styles.center, { paddingTop: insets.top }]}>
-        <Text style={styles.permText}>No camera found</Text>
-      </View>
-    );
-  }
+ // Replace the !hasPermission guard
+if (!hasPermission) {
+  return (
+    <View style={[styles.center, { paddingTop: insets.top, gap: 16, padding: 32 }]}>
+      <Text style={{ fontSize: 48 }}>📷</Text>
+      <Text style={styles.permText}>Camera access needed</Text>
+      <Text style={{ color: "#a78bfa", fontSize: 14, textAlign: "center", lineHeight: 22 }}>
+        Lexi-Lens needs camera access to scan objects for your quest.
+      </Text>
+      <TouchableOpacity
+        onPress={requestPermission}
+        style={{ backgroundColor: "#7c3aed", borderRadius: 50, paddingVertical: 14, paddingHorizontal: 32 }}
+      >
+        <Text style={{ color: "#fff", fontSize: 16, fontWeight: "700" }}>Grant Camera Access</Text>
+      </TouchableOpacity>
+      <TouchableOpacity onPress={() => Linking.openSettings()}>
+        <Text style={{ color: "#a78bfa", fontSize: 13 }}>Open App Settings instead</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+// Replace the !device guard
+if (!device) {
+  return (
+    <View style={[styles.center, { paddingTop: insets.top, gap: 16, padding: 32 }]}>
+      <Text style={{ fontSize: 48 }}>📷</Text>
+      <Text style={styles.permText}>Camera not available</Text>
+      <Text style={{ color: "#a78bfa", fontSize: 14, textAlign: "center", lineHeight: 22 }}>
+        Could not access the back camera. Please grant permission in Settings.
+      </Text>
+      <TouchableOpacity onPress={() => Linking.openSettings()}>
+        <Text style={{ color: "#fff", backgroundColor: "#7c3aed", borderRadius: 50,
+          paddingVertical: 14, paddingHorizontal: 32, fontSize: 16, fontWeight: "700" }}>
+          Open App Settings
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
 
   const quest      = activeQuest?.quest;
   const components = activeQuest?.components ?? [];

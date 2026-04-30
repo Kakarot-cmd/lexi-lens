@@ -266,5 +266,6 @@ export function useObjectScanner({
     liveLabel,
     liveConfidence,
     mlKitReady: mlKitAvailable,
+	requestPermission,
   };
 }
