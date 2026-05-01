@@ -1009,3 +1009,34 @@ export const selectSpellsByTier = (
   tier: QuestTier
 ): SpellUnlock[] =>
   state.spellBook.filter((s) => s.tier === tier);
+
+// ── Age-band property helper ───────────────────────────────────────────────────
+
+/**
+ * Returns the vocabulary properties that will actually be used when a child
+ * plays a quest — mirroring the priority logic in beginQuest().
+ *
+ * Priority:
+ *   1. age_band_properties[ageBand]  (enriched with definitions if bare)
+ *   2. required_properties            (fallback)
+ *
+ * Use this everywhere word chips are rendered so the UI always matches
+ * what the child will actually have to scan for.
+ */
+export function getDisplayProperties(
+  quest: Quest,
+  ageBand: string
+): PropertyRequirement[] {
+  const ageBandProps = quest.age_band_properties?.[ageBand];
+  if (!ageBandProps || ageBandProps.length === 0) return quest.required_properties;
+
+  const enriched = ageBandProps.map((p) => {
+    if (p.definition?.trim()) return p;
+    const canonical = quest.required_properties.find((r) => r.word === p.word);
+    return canonical
+      ? { ...p, definition: canonical.definition, evaluationHints: p.evaluationHints ?? canonical.evaluationHints }
+      : p;
+  });
+
+  return enriched;
+}

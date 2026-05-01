@@ -10,7 +10,7 @@ initSentry();
 
 // ─── React + RN ───────────────────────────────────────────────────────────────
 import { useEffect, useState, useCallback } from "react";
-import { View, Text, ActivityIndicator, Platform } from "react-native";
+import { View, Text, ActivityIndicator, Platform, Linking } from "react-native";
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 import {
@@ -169,9 +169,55 @@ function App() {
         }
       }
     );
-	
 
-    return () => subscription.unsubscribe();
+    // ── Deep-link handler — email-confirmation redirect ─────────────────────
+    // When the user taps the confirmation link in their email client, the OS
+    // opens the app via the "lexilens://auth/confirm" custom scheme.
+    // Supabase appends either a PKCE ?code=… param (v2 default) or a legacy
+    // #access_token=… fragment. We handle both.
+    const handleDeepLink = async ({ url }: { url: string | null }) => {
+      if (!url) return;
+      try {
+        const parsed = new URL(url);
+
+        // PKCE code exchange — Supabase JS v2 default
+        const code = parsed.searchParams.get("code");
+        if (code) {
+          const { error } = await supabase.auth.exchangeCodeForSession(code);
+          if (error) {
+            addGameBreadcrumb({
+              category: "auth",
+              message:  "Email confirm code exchange failed",
+              data:     { error: error.message },
+            });
+          }
+          return;
+        }
+
+        // Legacy implicit-flow fragment: #access_token=…&refresh_token=…
+        const fragment = parsed.hash.replace(/^#/, "");
+        if (fragment) {
+          const params = new URLSearchParams(fragment);
+          const access_token  = params.get("access_token");
+          const refresh_token = params.get("refresh_token");
+          if (access_token && refresh_token) {
+            await supabase.auth.setSession({ access_token, refresh_token });
+          }
+        }
+      } catch {
+        // Malformed / unrelated URL — ignore
+      }
+    };
+
+    // Cold-start: app launched directly via the confirmation link
+    Linking.getInitialURL().then((url) => handleDeepLink({ url }));
+    // Warm-start: app was already running when the link was tapped
+    const linkingSub = Linking.addEventListener("url", handleDeepLink);
+
+    return () => {
+      subscription.unsubscribe();
+      linkingSub.remove();
+    };
   }, []);
 
   // ── Sentry user context — sync whenever active child changes ──────────────

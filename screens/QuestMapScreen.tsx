@@ -44,6 +44,7 @@ import {
   selectLevelProgress,
   selectQuestsGroupedByTier,
   selectDailyQuest,
+  getDisplayProperties,
   TIER_META,
   type Quest,
   type TierGroup,
@@ -207,12 +208,16 @@ function QuestCard({
   const completionMode   = useGameStore((s) => selectQuestCompletionMode(s, quest.id));
   const dailyQuestId     = useGameStore((s) => s.dailyQuest.questId);
   const isDailyComplete  = useGameStore((s) => s.isDailyQuestComplete);
+  const ageBand          = useGameStore((s: any) => s.activeChild?.age_band ?? "7-8");
   const hasHard          = selectHasHardMode(quest);
+
+  // Age-band-specific properties — matches exactly what beginQuest() will use
+  const displayProps = getDisplayProperties(quest, ageBand);
 
   const isCompleted  = completionMode === "normal" || completionMode === "hard";
   const isHardBeaten = completionMode === "hard";
   const isDaily      = quest.id === dailyQuestId;
-  const propCount    = quest.required_properties.length;
+  const propCount    = displayProps.length;
 
   // XP FIX: compute the real max XP the Edge Function will award.
   // Formula mirrors evaluateObject.ts: base × propCount × multiBonus
@@ -266,9 +271,9 @@ function QuestCard({
         </View>
       </View>
 
-      {/* ── Property preview ────────────────────────────── */}
+      {/* ── Property preview — words the child will actually scan for ───── */}
       <View style={styles.propRow}>
-        {quest.required_properties.slice(0, 3).map((p) => (
+        {displayProps.slice(0, 3).map((p) => (
           <View key={p.word} style={styles.propChip}>
             <Text style={styles.propChipText}>{p.word}</Text>
           </View>
