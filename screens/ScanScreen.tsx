@@ -4,23 +4,24 @@
  * v3.5 additions (Rate Limiting + Abuse Prevention):
  *   • Destructures rateLimitCode, scansToday, dailyLimit, approachingLimit,
  *     resetsAt from useLexiEvaluate
- *   • status === "rate_limited" → setPhase("verdict") so render tree picks
- *     it up cleanly (same pattern as "error")
+ *   • status === "rate_limited" → setPhase("verdict")
  *   • RateLimitWall rendered as absoluteFillObject overlay when rate_limited
  *   • ApproachingLimitBanner shown non-blocking in scanning phase at 80% quota
  *   • limitBannerDismissed local state so child can clear the warning
  *
  * v3.1 additions:
  *   • LiveLabelChip — floating chip on camera showing what ML Kit currently sees
- *     ("📦 cushion · 94%"). Updates every 1.5s. Disappears when scanning.
  *   • liveLabel + liveConfidence destructured from useObjectScanner
  *   • StatusBanner receives liveLabel + liveConfidence for idle state text
- *   • onDetection now receives ML Kit label as primary.label — Claude only
- *     evaluates vocabulary properties, not object identification (~50% cheaper)
  *
  * v1.4 changes:
  *   • effectiveProperties for hard mode
  *   • markQuestCompletion on victory dismiss
+ *
+ * FIX (Metro bundler): removed duplicate `useObjectScanner` call at the
+ * bottom of the component body — it re-declared hasPermission, device and
+ * requestPermission which were already declared by the full call above it.
+ * The cameraKey state and remount useEffect that followed it are kept.
  */
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
@@ -38,7 +39,7 @@ import * as Haptics from "expo-haptics";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { useObjectScanner } from "../hooks/useObjectScanner";
-import { useLexiEvaluate } from "../hooks/useLexiEvaluate";
+import { useLexiEvaluate }  from "../hooks/useLexiEvaluate";
 import {
   useGameStore,
   selectCurrentComponent,
@@ -46,10 +47,12 @@ import {
   selectQuestComplete,
   selectStreakMultiplier,
 } from "../store/gameStore";
-import { VerdictCard }                              from "../components/VerdictCard";
-import { StatusBanner }                             from "../components/StatusBanner";
-import { VictoryFusionScreen }                      from "../components/VictoryFusionScreen";
-import { RateLimitWall, ApproachingLimitBanner }    from "../components/RateLimitWall"; // v3.5
+import { VerdictCard }                           from "../components/VerdictCard";
+import { StatusBanner }                          from "../components/StatusBanner";
+import { VictoryFusionScreen }                   from "../components/VictoryFusionScreen";
+import { RateLimitWall, ApproachingLimitBanner } from "../components/RateLimitWall";
+
+// ─── Navigation types ─────────────────────────────────────────────────────────
 
 type RootStackParamList = {
   Scan: { questId: string; hardMode?: boolean };
@@ -62,6 +65,8 @@ type ScreenPhase =
   | "verdict"
   | "component_win"
   | "quest_victory";
+
+// ─── Palette ──────────────────────────────────────────────────────────────────
 
 const P = {
   deepPurple:     "#0f0620",
@@ -163,25 +168,26 @@ function ComponentsStrip({
         </View>
         <Text style={styles.progressPct}>{percent}%</Text>
       </View>
-      <Text style={styles.progressLabel}>{foundCount}/{total} components found</Text>
+      <Text style={styles.progressLabel}>
+        {foundCount} of {total} word{total !== 1 ? "s" : ""} found
+      </Text>
 
       <View style={styles.chipsRow}>
         {components.map((c) => {
-          const isBrowsed = c.propertyWord === browsedWord && !c.found;
+          const isActive  = c.propertyWord === current;
+          const isBrowsed = c.propertyWord === browsedWord;
           return (
             <TouchableOpacity
               key={c.propertyWord}
               style={[
                 styles.chip,
+                isActive  && styles.chipActive,
                 c.found   && styles.chipDone,
-                isBrowsed && styles.chipActive,
               ]}
               onPress={() => { if (!c.found) onSelectWord(c.propertyWord); }}
-              activeOpacity={c.found ? 1 : 0.7}
-              accessibilityRole="button"
-              accessibilityLabel={`${c.propertyWord}${c.found ? " — found" : " — tap to view"}`}
+              disabled={c.found}
             >
-              <Text style={{ fontSize: 10, color: c.found ? "#86efac" : P.textDim }}>
+              <Text style={{ color: c.found ? "#86efac" : P.textDim }}>
                 {c.found ? "✦" : isBrowsed ? "◉" : "○"}
               </Text>
               <View>
@@ -223,8 +229,8 @@ function EnemyBar({
     <View style={[styles.enemyBar, isHardMode && styles.enemyBarHard]}>
       <Text style={{ fontSize: 22 }}>{emoji}</Text>
       <View style={{ flex: 1 }}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
-          <Text style={styles.enemyName} numberOfLines={1}>{name}</Text>
+        <View style={{ flexDirection: "row", alignItems: "center" }}>
+          <Text style={[styles.enemyName, { flex: 1 }]} numberOfLines={1}>{name}</Text>
           {isHardMode && (
             <View style={styles.hardPill}>
               <Text style={styles.hardPillText}>⚔</Text>
@@ -286,23 +292,18 @@ function QuestIntro({
       <Text style={styles.introRoom}>Appears in: {quest.room_label}</Text>
       <View style={styles.introDivider} />
       <Text style={styles.introHeading}>
-        {isHardMode ? "Hard mode vocabulary:" : "Find material components:"}
+        {isHardMode ? "Harder vocabulary to find:" : "Vocabulary to find:"}
       </Text>
       <Text style={styles.introHint}>
         {isHardMode
-          ? "Same enemy — harder synonym challenge!"
-          : "One object can satisfy multiple properties!"}
+          ? "Use Hard Mode synonyms — they're trickier!"
+          : "Scan any object that matches these words"}
       </Text>
-      {effectiveProperties.map((p) => (
+      {effectiveProperties.map((p, i) => (
         <View key={p.word} style={styles.introPropRow}>
-          <Text style={{ color: isHardMode ? P.hardRedText : P.gold, fontSize: 14, marginTop: 2 }}>
-            {isHardMode ? "⚔" : "✦"}
-          </Text>
+          <Text style={styles.introPropWord}>{i + 1}. {p.word}</Text>
           <View style={{ flex: 1 }}>
-            <Text style={[styles.introPropWord, isHardMode && { color: P.hardRedText }]}>
-              {p.word}
-            </Text>
-            {p.definition ? (
+            {p.definition?.trim() ? (
               <Text style={styles.introPropDef}>{p.definition}</Text>
             ) : (
               <Text style={styles.introPropDefMissing}>
@@ -336,8 +337,8 @@ export function ScanScreen({ route, navigation }: Props) {
   const currentComponent = useGameStore(selectCurrentComponent);
   const currentAttempts  = useGameStore(selectCurrentAttempts);
   const questComplete    = useGameStore(selectQuestComplete);
+  const streakMultiplier = useGameStore(selectStreakMultiplier);
 
-  const streakMultiplier     = useGameStore(selectStreakMultiplier);
   const beginQuest           = useGameStore((s) => s.beginQuest);
   const recordComponentFound = useGameStore((s) => s.recordComponentFound);
   const recordMissedScan     = useGameStore((s) => s.recordMissedScan);
@@ -348,10 +349,10 @@ export function ScanScreen({ route, navigation }: Props) {
   const markQuestCompletion  = useGameStore((s) => s.markQuestCompletion);
   const refreshChildFromDB   = useGameStore((s) => s.refreshChildFromDB);
 
-  const [phase, setPhase]                         = useState<ScreenPhase>("quest_intro");
-  const [lastLabel, setLastLabel]                 = useState<string | null>(null);
-  const [browsedWord, setBrowsedWord]             = useState<string | null>(null);
-  const [limitBannerDismissed, setLimitBannerDismissed] = useState(false); // v3.5
+  const [phase, setPhase]                               = useState<ScreenPhase>("quest_intro");
+  const [lastLabel, setLastLabel]                       = useState<string | null>(null);
+  const [browsedWord, setBrowsedWord]                   = useState<string | null>(null);
+  const [limitBannerDismissed, setLimitBannerDismissed] = useState(false);
 
   useEffect(() => {
     const quest = questLibrary.find((q) => q.id === questId);
@@ -392,7 +393,6 @@ export function ScanScreen({ route, navigation }: Props) {
   // ── Core mechanic: save any newly passing property ────────────────────────
 
   useEffect(() => {
-    // v3.5: rate_limited goes straight to verdict phase so RateLimitWall renders
     if (status === "rate_limited") {
       setPhase("verdict");
       return;
@@ -407,9 +407,6 @@ export function ScanScreen({ route, navigation }: Props) {
         (activeQuest.components ?? []).filter((c) => c.found).map((c) => c.propertyWord)
       );
 
-      // FIX: result.properties is undefined when Edge Function returns a
-      // partial response (e.g. error shape without properties array).
-      // Guard with ?? [] so the forEach below safely does nothing.
       const newlyPassing = (result.properties ?? []).filter(
         (p) => p.passes && !alreadyFound.has(p.word)
       );
@@ -417,20 +414,6 @@ export function ScanScreen({ route, navigation }: Props) {
       if (newlyPassing.length > 0) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
-        // ── XP calculation (Phase 1.2 + 2.3) ─────────────────────────────
-        //
-        // result.xpAwarded already includes the multi-property bonus from
-        // the Edge Function (1.0× / 1.5× / 2.0× based on passingCount).
-        //
-        // Here we additionally apply the 7-day streak multiplier (1.0× or 2.0×)
-        // from the store — this is the only place that knows both values.
-        //
-        // Previous bug: divided xpAwarded by newlyPassing.length, which cut
-        // XP instead of distributing it. Each property gets the full XP share:
-        //   total = xpAwarded × streakMultiplier
-        //   each  = total / newlyPassing.length   (fair split across properties)
-        //
-        // Minimum 10 XP per property so no find ever feels worthless.
         const totalXpThisScan = Math.round((result.xpAwarded || 20) * streakMultiplier);
         const xpEach = Math.max(10, Math.floor(totalXpThisScan / newlyPassing.length));
 
@@ -494,28 +477,12 @@ export function ScanScreen({ route, navigation }: Props) {
     const totalXp = activeQuest.components.reduce((s, c) => s + c.xpEarned, 0);
     const mode    = activeQuest.isHardMode ? "hard" : "normal";
 
-    // FIX: markQuestCompletion was not awaited. navigation.goBack() fired while the
-    // upsert was still in-flight. Any focus-triggered DB read in QuestMap would
-    // race the upsert and return stale data, wiping the optimistic update.
-    //
-    // We use .then() (not async/await) so the callback stays () => void as required
-    // by VictoryFusionScreen's onContinue prop type.
-    //
-    // Sequence:
-    //   1. markQuestCompletion() → optimistic set fires immediately (sync) → upsert starts
-    //   2. Upsert completes (~200ms) → loadCompletedQuests() confirms from DB
-    //   3. .then() fires → completeQuest() + navigation.goBack()
-    //   4. QuestMap renders with fully confirmed completedQuestIds → shows "Done" ✓
     markQuestCompletion(activeQuest.quest.id, mode, totalXp)
       .then(() => {
         completeQuest();
-        //refreshChildFromDB();
         navigation.goBack();
       })
       .catch(() => {
-        // Upsert failed (network/schema error) — optimistic update is still in
-        // the store and AsyncStorage, so same-session and cold-launch still work.
-        // Navigate away regardless so the child isn't stuck on the victory screen.
         completeQuest();
         navigation.goBack();
       });
@@ -531,7 +498,7 @@ export function ScanScreen({ route, navigation }: Props) {
     triggerManualScan,
     liveLabel,
     liveConfidence,
-	requestPermission,
+    requestPermission,
   } = useObjectScanner({
     enabled: phase === "scanning" && status === "idle",
     onDetection: async ({ primary, frameBase64 }) => {
@@ -553,8 +520,6 @@ export function ScanScreen({ route, navigation }: Props) {
           .map((c) => c.propertyWord),
         childAge:           parseInt(activeChild.age_band.split("-")[1], 10),
         failedAttempts:     currentAttempts,
-        // XP FIX: pass quest DB rates so the Edge Function awards the correct XP
-        // and the value matches what the quest card showed the child before they started.
         xp_reward_first_try:  activeQuest.quest.xp_reward_first_try  ?? 40,
         xp_reward_retry:      activeQuest.quest.xp_reward_retry      ?? 25,
         xp_reward_third_plus: activeQuest.quest.xp_reward_third_plus ?? 10,
@@ -562,58 +527,55 @@ export function ScanScreen({ route, navigation }: Props) {
     },
   });
 
-const { hasPermission, device, requestPermission, ...rest } = useObjectScanner({ ... });
+  // Force camera to remount when permission is granted after being denied
+  const [cameraKey, setCameraKey] = React.useState(0);
 
-// Force camera to remount when permission is granted after being denied
-const [cameraKey, setCameraKey] = React.useState(0);
+  React.useEffect(() => {
+    if (hasPermission && device) {
+      setCameraKey(k => k + 1);
+    }
+  }, [hasPermission, device]);
 
-React.useEffect(() => {
-  if (hasPermission && device) {
-    setCameraKey(k => k + 1);
-  }
-}, [hasPermission, device]);
   // ── Guards ────────────────────────────────────────────────────────────────
 
- // Replace the !hasPermission guard
-if (!hasPermission) {
-  return (
-    <View style={[styles.center, { paddingTop: insets.top, gap: 16, padding: 32 }]}>
-      <Text style={{ fontSize: 48 }}>📷</Text>
-      <Text style={styles.permText}>Camera access needed</Text>
-      <Text style={{ color: "#a78bfa", fontSize: 14, textAlign: "center", lineHeight: 22 }}>
-        Lexi-Lens needs camera access to scan objects for your quest.
-      </Text>
-      <TouchableOpacity
-        onPress={requestPermission}
-        style={{ backgroundColor: "#7c3aed", borderRadius: 50, paddingVertical: 14, paddingHorizontal: 32 }}
-      >
-        <Text style={{ color: "#fff", fontSize: 16, fontWeight: "700" }}>Grant Camera Access</Text>
-      </TouchableOpacity>
-      <TouchableOpacity onPress={() => Linking.openSettings()}>
-        <Text style={{ color: "#a78bfa", fontSize: 13 }}>Open App Settings instead</Text>
-      </TouchableOpacity>
-    </View>
-  );
-}
-
-// Replace the !device guard
-if (!device) {
-  return (
-    <View style={[styles.center, { paddingTop: insets.top, gap: 16, padding: 32 }]}>
-      <Text style={{ fontSize: 48 }}>📷</Text>
-      <Text style={styles.permText}>Camera not available</Text>
-      <Text style={{ color: "#a78bfa", fontSize: 14, textAlign: "center", lineHeight: 22 }}>
-        Could not access the back camera. Please grant permission in Settings.
-      </Text>
-      <TouchableOpacity onPress={() => Linking.openSettings()}>
-        <Text style={{ color: "#fff", backgroundColor: "#7c3aed", borderRadius: 50,
-          paddingVertical: 14, paddingHorizontal: 32, fontSize: 16, fontWeight: "700" }}>
-          Open App Settings
+  if (!hasPermission) {
+    return (
+      <View style={[styles.center, { paddingTop: insets.top, padding: 32 }]}>
+        <Text style={{ fontSize: 48, marginBottom: 16 }}>📷</Text>
+        <Text style={styles.permText}>Camera access needed</Text>
+        <Text style={{ color: "#a78bfa", fontSize: 14, textAlign: "center", lineHeight: 22, marginBottom: 24 }}>
+          Lexi-Lens needs camera access to scan objects for your quest.
         </Text>
-      </TouchableOpacity>
-    </View>
-  );
-}
+        <TouchableOpacity
+          onPress={requestPermission}
+          style={{ backgroundColor: "#7c3aed", borderRadius: 50, paddingVertical: 14, paddingHorizontal: 32, marginBottom: 12 }}
+        >
+          <Text style={{ color: "#fff", fontSize: 16, fontWeight: "700" }}>Grant Camera Access</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => Linking.openSettings()}>
+          <Text style={{ color: "#a78bfa", fontSize: 13 }}>Open App Settings instead</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  if (!device) {
+    return (
+      <View style={[styles.center, { paddingTop: insets.top, padding: 32 }]}>
+        <Text style={{ fontSize: 48, marginBottom: 16 }}>📷</Text>
+        <Text style={styles.permText}>Camera not available</Text>
+        <Text style={{ color: "#a78bfa", fontSize: 14, textAlign: "center", lineHeight: 22, marginBottom: 24 }}>
+          Could not access the back camera. Please grant permission in Settings.
+        </Text>
+        <TouchableOpacity onPress={() => Linking.openSettings()}>
+          <Text style={{ color: "#fff", backgroundColor: "#7c3aed", borderRadius: 50,
+            paddingVertical: 14, paddingHorizontal: 32, fontSize: 16, fontWeight: "700" }}>
+            Open App Settings
+          </Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
 
   const quest      = activeQuest?.quest;
   const components = activeQuest?.components ?? [];
@@ -625,7 +587,7 @@ if (!device) {
   return (
     <View style={styles.root}>
       <Camera
-	    key={cameraKey} 
+        key={cameraKey}
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}
@@ -657,7 +619,6 @@ if (!device) {
           </View>
 
           <View style={[styles.bottomHud, { paddingBottom: insets.bottom + 12 }]}>
-            {/* v3.5 — approaching-limit warning strip, dismissible */}
             {approachingLimit && !limitBannerDismissed && (
               <ApproachingLimitBanner
                 scansToday={scansToday}
@@ -738,7 +699,6 @@ if (!device) {
         </View>
       )}
 
-      {/* v3.5 — rate limit wall: full-screen overlay, shown before VerdictCard check */}
       {phase === "verdict" && status === "rate_limited" && rateLimitCode && (
         <View style={StyleSheet.absoluteFillObject}>
           <RateLimitWall
@@ -790,15 +750,17 @@ if (!device) {
 
 const styles = StyleSheet.create({
   root:     { flex: 1, backgroundColor: P.deepPurple },
-  center:   { flex: 1, alignItems: "center", justifyContent: "center", padding: 32, backgroundColor: P.deepPurple },
-  permText: { fontSize: 18, fontWeight: "700", color: P.textPrimary, textAlign: "center" },
+  center:   { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: P.deepPurple },
+  permText: { fontSize: 18, fontWeight: "700", color: P.textPrimary, textAlign: "center", marginBottom: 12 },
 
-  corner: { position: "absolute", width: 22, height: 22, borderColor: "#67e8f9", borderStyle: "solid", borderWidth: 0 },
-  tl: { top: 80,    left: 20,  borderTopWidth: 2.5,    borderLeftWidth: 2.5,  borderTopLeftRadius: 4 },
-  tr: { top: 80,    right: 20, borderTopWidth: 2.5,    borderRightWidth: 2.5, borderTopRightRadius: 4 },
-  bl: { bottom: 290, left: 20, borderBottomWidth: 2.5, borderLeftWidth: 2.5,  borderBottomLeftRadius: 4 },
-  br: { bottom: 290, right: 20,borderBottomWidth: 2.5, borderRightWidth: 2.5, borderBottomRightRadius: 4 },
+  // Camera viewfinder corners
+  corner: { position: "absolute", width: 22, height: 22, borderColor: "#67e8f9", borderWidth: 0 },
+  tl: { top: 80,    left: 20,   borderTopWidth: 2.5,    borderLeftWidth: 2.5,   borderTopLeftRadius: 4 },
+  tr: { top: 80,    right: 20,  borderTopWidth: 2.5,    borderRightWidth: 2.5,  borderTopRightRadius: 4 },
+  bl: { bottom: 290, left: 20,  borderBottomWidth: 2.5, borderLeftWidth: 2.5,   borderBottomLeftRadius: 4 },
+  br: { bottom: 290, right: 20, borderBottomWidth: 2.5, borderRightWidth: 2.5,  borderBottomRightRadius: 4 },
 
+  // Live label chip
   liveChipWrap: {
     position:   "absolute",
     top:        "38%",
@@ -810,55 +772,59 @@ const styles = StyleSheet.create({
   liveChip: {
     flexDirection:     "row",
     alignItems:        "center",
-    gap:               6,
     paddingHorizontal: 14,
     paddingVertical:   7,
     borderRadius:      30,
     borderWidth:       1,
     borderColor:       "rgba(103,232,249,0.3)",
   },
-  liveDot:      { width: 7, height: 7, borderRadius: 3.5 },
+  liveDot:      { width: 7, height: 7, borderRadius: 3.5, marginRight: 6 },
   liveChipText: { fontSize: 14, fontWeight: "600" },
-  liveChipConf: { fontSize: 12, fontWeight: "500", opacity: 0.7 },
+  liveChipConf: { fontSize: 12, fontWeight: "500", opacity: 0.7, marginLeft: 4 },
 
+  // Hard mode banner
   hardBanner:     { backgroundColor: P.hardRed, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 5, alignSelf: "center", marginBottom: 6 },
   hardBannerText: { fontSize: 11, fontWeight: "700", color: "#fff", letterSpacing: 0.5 },
 
   topHud:    { position: "absolute", top: 0, left: 0, right: 0, paddingHorizontal: 12 },
   bottomHud: { position: "absolute", bottom: 0, left: 0, right: 0, paddingHorizontal: 12 },
 
-  enemyBar:     { flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: "rgba(15,6,32,0.82)", borderRadius: 14, padding: 10, borderWidth: 0.5, borderColor: P.cardBorder },
+  // Enemy bar
+  enemyBar:     { flexDirection: "row", alignItems: "center", backgroundColor: "rgba(15,6,32,0.82)", borderRadius: 14, padding: 10, borderWidth: 0.5, borderColor: P.cardBorder, marginBottom: 8 },
   enemyBarHard: { borderColor: "#7f1d1d", backgroundColor: "rgba(26,5,5,0.85)" },
   enemyName:    { fontSize: 13, color: P.textPrimary, fontWeight: "500", marginBottom: 4 },
   hpTrack:      { height: 5, backgroundColor: "rgba(255,255,255,0.1)", borderRadius: 3, overflow: "hidden" },
   hpFill:       { height: 5, backgroundColor: "#ef4444", borderRadius: 3 },
   hpFillHard:   { backgroundColor: "#dc2626" },
-  hpLabel:      { fontSize: 11, color: P.textDim, minWidth: 30, textAlign: "right" },
-
-  hardPill:     { backgroundColor: "#7f1d1d", borderRadius: 10, paddingHorizontal: 6, paddingVertical: 2 },
+  hpLabel:      { fontSize: 11, color: P.textDim, minWidth: 30, textAlign: "right", marginLeft: 8 },
+  hardPill:     { backgroundColor: "#7f1d1d", borderRadius: 10, paddingHorizontal: 6, paddingVertical: 2, marginLeft: 6 },
   hardPillText: { fontSize: 10, color: P.hardRedText },
 
-  progressRow:   { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 2 },
-  progressTrack: { flex: 1, height: 5, backgroundColor: "rgba(255,255,255,0.08)", borderRadius: 3, overflow: "hidden" },
+  // Progress strip
+  progressRow:   { flexDirection: "row", alignItems: "center", marginBottom: 2 },
+  progressTrack: { flex: 1, height: 5, backgroundColor: "rgba(255,255,255,0.08)", borderRadius: 3, overflow: "hidden", marginRight: 8 },
   progressFill:  { height: 5, backgroundColor: P.progressPurple, borderRadius: 3 },
   progressPct:   { fontSize: 12, color: P.textMuted, fontWeight: "600", minWidth: 36, textAlign: "right" },
   progressLabel: { fontSize: 11, color: P.textDim, marginBottom: 8 },
 
-  chipsRow:     { flexDirection: "row", flexWrap: "wrap", gap: 6, marginBottom: 8 },
-  chip:         { flexDirection: "row", alignItems: "center", gap: 5, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20, backgroundColor: "rgba(30,16,64,0.85)", borderWidth: 0.5, borderColor: P.cardBorder },
+  // Word chips
+  chipsRow:     { flexDirection: "row", flexWrap: "wrap", marginBottom: 8 },
+  chip:         { flexDirection: "row", alignItems: "center", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20, backgroundColor: "rgba(30,16,64,0.85)", borderWidth: 0.5, borderColor: P.cardBorder, marginRight: 6, marginBottom: 6 },
   chipActive:   { borderColor: P.gold, backgroundColor: "rgba(40,24,80,0.9)" },
   chipDone:     { borderColor: "#166534", backgroundColor: "rgba(5,46,22,0.85)" },
-  chipText:     { fontSize: 12, color: P.textMuted },
+  chipText:     { fontSize: 12, color: P.textMuted, marginLeft: 5 },
   chipTextDone: { color: "#86efac" },
   chipObject:   { fontSize: 9, color: "#4ade80", opacity: 0.8 },
   chipTapHint:  { fontSize: 8, color: P.textDim, opacity: 0.6, marginTop: 1 },
 
+  // Seek card
   seekCard:     { backgroundColor: "rgba(15,6,32,0.88)", borderRadius: 16, padding: 14, marginBottom: 8, borderWidth: 0.5, borderColor: P.cardBorder },
   seekCardHard: { borderColor: "#7f1d1d", backgroundColor: "rgba(26,5,5,0.88)" },
   seekLabel:    { fontSize: 11, color: P.textDim, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 2 },
   seekWord:     { fontSize: 22, fontWeight: "700", color: P.gold, marginBottom: 4 },
   seekDef:      { fontSize: 13, color: P.textMuted, lineHeight: 18 },
 
+  // Scan button
   scanBtn:     { backgroundColor: "#7c3aed", borderRadius: 50, paddingVertical: 16, alignItems: "center", marginBottom: 8 },
   scanBtnHard: { backgroundColor: P.hardRed },
   scanBtnText: { color: "#fff", fontSize: 16, fontWeight: "700" },
@@ -866,8 +832,12 @@ const styles = StyleSheet.create({
   abandonBtn:  { alignItems: "center", paddingVertical: 6 },
   abandonText: { fontSize: 12, color: "rgba(200,180,255,0.35)" },
 
+  // Overlays
   overlayFull: { ...StyleSheet.absoluteFillObject, backgroundColor: P.deepPurple, justifyContent: "center", padding: 20 },
+  winFlash:    { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(34,197,94,0.15)" },
+  winText:     { fontSize: 36, fontWeight: "800", color: "#86efac" },
 
+  // Quest intro
   introWrap:          { alignItems: "center" },
   introHardBadge:     { backgroundColor: P.hardRed, borderRadius: 16, paddingHorizontal: 16, paddingVertical: 6, marginBottom: 14 },
   introHardBadgeText: { fontSize: 13, color: "#fff", fontWeight: "800", letterSpacing: 0.8 },
@@ -876,14 +846,11 @@ const styles = StyleSheet.create({
   introDivider:       { height: 0.5, backgroundColor: P.cardBorder, width: "100%", marginBottom: 16 },
   introHeading:       { fontSize: 14, color: P.textDim, fontWeight: "600", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 },
   introHint:          { fontSize: 12, color: P.textDim, textAlign: "center", marginBottom: 16, lineHeight: 18 },
-  introPropRow:       { flexDirection: "row", gap: 10, marginBottom: 12, alignItems: "flex-start", width: "100%" },
-  introPropWord:      { fontSize: 16, fontWeight: "700", color: P.gold },
+  introPropRow:       { flexDirection: "row", marginBottom: 12, alignItems: "flex-start", width: "100%" },
+  introPropWord:      { fontSize: 16, fontWeight: "700", color: P.gold, marginRight: 10, minWidth: 30 },
   introPropDef:       { fontSize: 13, color: P.textMuted, marginTop: 2, lineHeight: 18 },
   introPropDefMissing:{ fontSize: 13, color: P.textDim,   marginTop: 2, lineHeight: 18, fontStyle: "italic" },
   beginBtn:           { marginTop: 24, backgroundColor: "#7c3aed", borderRadius: 16, paddingVertical: 16, paddingHorizontal: 48, alignItems: "center" },
   beginBtnHard:       { backgroundColor: P.hardRed },
   beginBtnText:       { fontSize: 17, fontWeight: "700", color: "#fff" },
-
-  winFlash: { ...StyleSheet.absoluteFillObject, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(34,197,94,0.15)", pointerEvents: "none" as any },
-  winText:  { fontSize: 36, fontWeight: "800", color: "#86efac" },
 });

@@ -2,42 +2,32 @@
  * gameStore.ts
  * Lexi-Lens — Zustand store for all client-side game state.
  *
+ * N1 additions:
+ *   • hasSeenOnboarding: boolean  — persisted; gates first-session walkthrough
+ *   • markOnboardingComplete()    — flips flag, persists to AsyncStorage
+ *
  * v2.4 additions (Phase 2.4 — Spell Book):
  *   • SpellUnlock type
- *   • spellBook: SpellUnlock[]   — all unlocked spells for the active child
+ *   • spellBook: SpellUnlock[]
  *   • isLoadingSpells: boolean
- *   • loadSpellBook()            — queries spell_unlocks VIEW from Supabase
- *   • markQuestCompletion() now auto-calls loadSpellBook() after DB write
- *   • spellBook persisted to AsyncStorage (survives cold launch)
+ *   • loadSpellBook()
+ *   • markQuestCompletion() now auto-calls loadSpellBook()
  *
  * v2.3 additions (Phase 2.3 — Daily Quest + 7-day Streak):
  *   • StreakData + DailyQuestState types
- *   • streak, dailyQuest, isDailyQuestComplete state fields
- *   • loadStreakData()       — fetches child_streaks row from DB
- *   • loadDailyQuest()      — resolves today's featured quest (DB → deterministic fallback)
- *   • recordDailyCompletion() — calls record_daily_completion() RPC, updates streak locally
- *   • markQuestCompletion() now auto-calls recordDailyCompletion()
- *   • selectStreakMultiplier — returns 2.0 at ≥7 days, 1.0 otherwise
- *   • selectIsPlayingDailyQuest / selectDailyQuest selectors
+ *   • streak, dailyQuest, isDailyQuestComplete
+ *   • loadStreakData(), loadDailyQuest(), recordDailyCompletion()
+ *   • selectStreakMultiplier — 2.0 at ≥7 days, 1.0 otherwise
  *
  * v2.1 additions (Phase 2.1 — Quest Tier System):
  *   • QuestTier union type
- *   • tier field on Quest interface
- *   • TIER_ORDER constant for display and unlock logic
- *   • selectUnlockedTiers() — returns Set of tiers the child has access to
- *   • selectQuestsGroupedByTier() — returns quests sorted into tier buckets
- *   • selectTierCleared() — true when every quest in a tier has been beaten
+ *   • TIER_ORDER, TIER_META constants
+ *   • selectUnlockedTiers(), selectQuestsGroupedByTier(), selectTierCleared()
  *
  * v1.4 additions:
- *   • hard mode support on ActiveQuest (isHardMode + effectiveProperties)
- *   • quest completion tracking (completedQuestIds, hardCompletedQuestIds)
- *   • markQuestCompletion() — writes to quest_completions table
- *   • loadCompletedQuests() — hydrates completion sets from DB
- *
- * Dependencies:
- *   npm install zustand
- *   npx expo install @react-native-async-storage/async-storage
- *   npm install zustand/middleware
+ *   • hard mode support on ActiveQuest
+ *   • quest completion tracking
+ *   • markQuestCompletion(), loadCompletedQuests()
  */
 
 import { create } from "zustand";
@@ -47,7 +37,6 @@ import { supabase } from "../lib/supabase";
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────
 
-/** Returns today's date as "YYYY-MM-DD" in local time. */
 function todayDate(): string {
   const d = new Date();
   const y = d.getFullYear();
@@ -56,7 +45,6 @@ function todayDate(): string {
   return `${y}-${m}-${day}`;
 }
 
-/** Days since Unix epoch (UTC) — used for deterministic daily quest rotation. */
 function daysSinceEpoch(): number {
   return Math.floor(Date.now() / 86_400_000);
 }
@@ -65,7 +53,6 @@ function daysSinceEpoch(): number {
 
 export type QuestTier = "apprentice" | "scholar" | "sage" | "archmage";
 
-/** Canonical order used for sorting and unlock checks. */
 export const TIER_ORDER: QuestTier[] = [
   "apprentice",
   "scholar",
@@ -73,7 +60,6 @@ export const TIER_ORDER: QuestTier[] = [
   "archmage",
 ];
 
-/** Human-readable metadata for each tier. */
 export const TIER_META: Record<
   QuestTier,
   { label: string; emoji: string; color: string; lockMessage: string }
@@ -120,25 +106,13 @@ export interface Quest {
   xp_reward_first_try:   number;
   xp_reward_retry:       number;
   required_properties:   PropertyRequirement[];
-  /** v1.4 — empty array means Hard Mode is not available */
   hard_mode_properties:  PropertyRequirement[];
-  /** v2.1 — tier this quest belongs to */
   tier:                  QuestTier;
-  /**
-   * v2.2 — age-band-specific vocabulary.
-   * Map of age_band → property list. App picks the child's band;
-   * falls back to required_properties if the band is absent.
-   */
   age_band_properties:   Record<string, PropertyRequirement[]>;
-  /** null = system/admin quest | uuid = parent who created it */
   created_by:            string | null;
-  /** 'public' | 'private' | 'pending_approval' */
   visibility:            "public" | "private" | "pending_approval";
-  /** Timestamp set when admin approves a user-created quest */
   approved_at:           string | null;
-  /** 1-15 within each age band — lower = easier vocabulary */
   sort_order:            number;
-  /** v2.4 — spell book fields (populated via schema_v2_4.sql migration) */
   spell_name?:           string;
   weapon_emoji?:         string;
   spell_description?:    string;
@@ -153,18 +127,11 @@ export interface ComponentProgress {
 }
 
 export interface ActiveQuest {
-  quest:       Quest;
-  components:  ComponentProgress[];
-  startedAt:   number;
-  enemyHp:     number;
-
-  /** v1.4 — True when the child is replaying with harder synonyms */
-  isHardMode: boolean;
-  /**
-   * v1.4 — The property list actually being used for this run.
-   * Normal mode → quest.required_properties
-   * Hard mode   → quest.hard_mode_properties
-   */
+  quest:               Quest;
+  components:          ComponentProgress[];
+  startedAt:           number;
+  enemyHp:             number;
+  isHardMode:          boolean;
   effectiveProperties: PropertyRequirement[];
 }
 
@@ -195,8 +162,6 @@ export interface ScanHistoryItem {
   feedback:      string;
 }
 
-// ─── v2.1: Tier grouping type ─────────────────────────────────────────────────
-
 export interface TierGroup {
   tier:     QuestTier;
   quests:   Quest[];
@@ -204,28 +169,20 @@ export interface TierGroup {
   cleared:  boolean;
 }
 
-// ─── v2.3: Streak types ───────────────────────────────────────────────────────
-
 export interface StreakData {
   currentStreak:  number;
   longestStreak:  number;
-  lastQuestDate:  string | null;   // ISO date "YYYY-MM-DD"
-  streakDates:    string[];        // last ≤30 ISO dates — for heatmap
-  gotMultiplier:  boolean;         // true when currentStreak >= 7
+  lastQuestDate:  string | null;
+  streakDates:    string[];
+  gotMultiplier:  boolean;
 }
 
 export interface DailyQuestState {
   questId:   string | null;
-  questDate: string;               // "YYYY-MM-DD"
+  questDate: string;
   isLoaded:  boolean;
 }
 
-// ─── v2.4: Spell Book type ────────────────────────────────────────────────────
-
-/**
- * A single entry in the child's Spell Book.
- * Sourced from the spell_unlocks VIEW (schema_v2_4.sql).
- */
 export interface SpellUnlock {
   questId:          string;
   questName:        string;
@@ -236,8 +193,7 @@ export interface SpellUnlock {
   enemyEmoji:       string;
   roomLabel:        string;
   tier:             QuestTier;
-  // Hard-mode badge: checked via hardCompletedQuestIds — not stored in view
-  unlockedAt:       string;   // ISO timestamp string
+  unlockedAt:       string;
   bestXp:           number;
   completionCount:  number;
 }
@@ -245,73 +201,52 @@ export interface SpellUnlock {
 // ─── Store shape ──────────────────────────────────────────────────────────────
 
 interface GameState {
-  // ── Session ───────────────────────────────────────────────
-  activeChild:    ChildSession | null;
-  questLibrary:   Quest[];
-  activeQuest:    ActiveQuest | null;
-  scanHistory:    ScanHistoryItem[];
-  wordTomeCache:  WordTomeEntry[];
-
-  // ── v1.4: completion tracking ──────────────────────────────
+  activeChild:           ChildSession | null;
+  questLibrary:          Quest[];
+  activeQuest:           ActiveQuest | null;
+  scanHistory:           ScanHistoryItem[];
+  wordTomeCache:         WordTomeEntry[];
   completedQuestIds:     string[];
   hardCompletedQuestIds: string[];
+  streak:                StreakData;
+  dailyQuest:            DailyQuestState;
+  isDailyQuestComplete:  boolean;
+  spellBook:             SpellUnlock[];
+  isLoadingSpells:       boolean;
+  isLoadingQuests:       boolean;
+  questError:            string | null;
+  isLoadingCompletions:  boolean;
 
-  // ── v2.3: streak + daily quest ─────────────────────────────
-  streak:               StreakData;
-  dailyQuest:           DailyQuestState;
-  isDailyQuestComplete: boolean;
-
-  // ── v2.4: spell book ───────────────────────────────────────
-  spellBook:        SpellUnlock[];
-  isLoadingSpells:  boolean;
-
-  // UI flags
-  isLoadingQuests:      boolean;
-  questError:           string | null;
-  isLoadingCompletions: boolean;
+  // ── N1 ─────────────────────────────────────────────────────
+  hasSeenOnboarding:      boolean;
+  markOnboardingComplete: () => void;
 
   // ── Actions ────────────────────────────────────────────────
   startChildSession:  (child: ChildSession) => void;
   endChildSession:    () => void;
-
   loadQuests:         () => Promise<void>;
-
-  beginQuest: (quest: Quest, hardMode?: boolean) => void;
-
+  beginQuest:         (quest: Quest, hardMode?: boolean) => void;
   recordComponentFound: (opts: {
     propertyWord:  string;
     objectUsed:    string;
     xpAwarded:     number;
     attemptCount:  number;
   }) => void;
-
-  recordMissedScan: (propertyWord: string) => void;
-
-  completeQuest: () => void;
-
-  abandonQuest: () => void;
-
-  syncXpFromServer: (newXp: number, newLevel: number) => void;
-
+  recordMissedScan:   (propertyWord: string) => void;
+  completeQuest:      () => void;
+  abandonQuest:       () => void;
+  syncXpFromServer:   (newXp: number, newLevel: number) => void;
   refreshChildFromDB: () => Promise<void>;
-
-  addWordToTome:    (entry: WordTomeEntry) => void;
-  setWordTomeCache: (entries: WordTomeEntry[]) => void;
-
-  addScanHistory:   (item: ScanHistoryItem) => void;
-  clearScanHistory: () => void;
-
-  // ── v1.4 actions ───────────────────────────────────────────
+  addWordToTome:      (entry: WordTomeEntry) => void;
+  setWordTomeCache:   (entries: WordTomeEntry[]) => void;
+  addScanHistory:     (item: ScanHistoryItem) => void;
+  clearScanHistory:   () => void;
   markQuestCompletion: (questId: string, mode: "normal" | "hard", totalXp: number) => Promise<void>;
   loadCompletedQuests: () => Promise<void>;
-
-  // ── v2.3 actions ───────────────────────────────────────────
-  loadStreakData:         () => Promise<void>;
-  loadDailyQuest:         () => Promise<void>;
-  recordDailyCompletion:  (questId: string) => Promise<void>;
-
-  // ── v2.4 actions ───────────────────────────────────────────
-  loadSpellBook: () => Promise<void>;
+  loadStreakData:       () => Promise<void>;
+  loadDailyQuest:      () => Promise<void>;
+  recordDailyCompletion: (questId: string) => Promise<void>;
+  loadSpellBook:       () => Promise<void>;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -369,36 +304,21 @@ export const useGameStore = create<GameState>()(
       isLoadingQuests:       false,
       questError:            null,
       isLoadingCompletions:  false,
+      streak:                DEFAULT_STREAK,
+      dailyQuest:            DEFAULT_DAILY_QUEST,
+      isDailyQuestComplete:  false,
+      spellBook:             [],
+      isLoadingSpells:       false,
 
-      // ── v2.3 defaults ─────────────────────────────────────
-      streak:               DEFAULT_STREAK,
-      dailyQuest:           DEFAULT_DAILY_QUEST,
-      isDailyQuestComplete: false,
-
-      // ── v2.4 defaults ─────────────────────────────────────
-      spellBook:       [],
-      isLoadingSpells: false,
+      // ── N1: Onboarding gate ────────────────────────────────
+      hasSeenOnboarding:      false,
+      markOnboardingComplete: () => set({ hasSeenOnboarding: true }),
 
       // ── Session ────────────────────────────────────────────
       startChildSession: (child) => {
         const { activeChild: prev } = get();
         const isSameChild = prev?.id === child.id;
 
-        // KEY FIX 1: Only wipe completedQuestIds when switching to a DIFFERENT child.
-        //
-        // Previous code always reset completedQuestIds: [] unconditionally.
-        // Problem: zustand-persist immediately writes [] to AsyncStorage, erasing
-        // persisted progress. If loadCompletedQuests() then fails (DB table missing,
-        // RLS blocks, network error), the data is permanently lost — both from
-        // memory and from AsyncStorage.
-        //
-        // Solution: When re-selecting the SAME child (including after app restart),
-        // preserve completedQuestIds. loadCompletedQuests() (called by
-        // ChildSwitcherScreen.handleSelect below) will overwrite with fresh DB data
-        // if the DB is healthy. If DB fails, the AsyncStorage fallback is preserved.
-        //
-        // When switching to a DIFFERENT child, reset as before — we can't show
-        // the wrong child's completions.
         set({
           activeChild: child,
           ...(!isSameChild && {
@@ -411,9 +331,6 @@ export const useGameStore = create<GameState>()(
           isDailyQuestComplete: false,
         });
 
-        // loadCompletedQuests() is awaited by ChildSwitcherScreen.handleSelect
-        // immediately after this call — no need to fire-and-forget here too.
-        // loadStreakData/loadSpellBook have no other caller so they fire here.
         get().loadStreakData();
         get().loadSpellBook();
       },
@@ -426,10 +343,10 @@ export const useGameStore = create<GameState>()(
           wordTomeCache:         [],
           completedQuestIds:     [],
           hardCompletedQuestIds: [],
-          spellBook:             [],         // v2.4: clear on session end
-          streak:               DEFAULT_STREAK,
-          dailyQuest:           DEFAULT_DAILY_QUEST,
-          isDailyQuestComplete: false,
+          spellBook:             [],
+          streak:                DEFAULT_STREAK,
+          dailyQuest:            DEFAULT_DAILY_QUEST,
+          isDailyQuestComplete:  false,
         }),
 
       // ── Quest library ──────────────────────────────────────
@@ -476,16 +393,13 @@ export const useGameStore = create<GameState>()(
 
         const ageBandProps = quest.age_band_properties?.[ageBand];
 
-        // age_band_properties entries are often bare {word} objects without
-        // definition/evaluationHints. Enrich them from required_properties
-        // so children always see definitions on the quest intro screen.
         const enrichedAgeBandProps = ageBandProps?.map(
           (p: PropertyRequirement) => {
             if (p.definition?.trim()) return p;
-            const canonical = quest.required_properties.find(
-              (r) => r.word === p.word
-            );
-            return canonical ? { ...p, definition: canonical.definition, evaluationHints: p.evaluationHints ?? canonical.evaluationHints } : p;
+            const canonical = quest.required_properties.find((r) => r.word === p.word);
+            return canonical
+              ? { ...p, definition: canonical.definition, evaluationHints: p.evaluationHints ?? canonical.evaluationHints }
+              : p;
           }
         );
 
@@ -520,8 +434,7 @@ export const useGameStore = create<GameState>()(
               : c
           );
 
-          const enemyHp = calcEnemyHp(components);
-
+          const enemyHp  = calcEnemyHp(components);
           const newXp    = (state.activeChild?.total_xp ?? 0) + xpAwarded;
           const newLevel = Math.min(100, Math.floor(Math.sqrt(newXp / 50)) + 1);
 
@@ -549,7 +462,7 @@ export const useGameStore = create<GameState>()(
       abandonQuest: () =>
         set((state) => {
           if (!state.activeQuest || !state.activeChild) return { activeQuest: null };
-          const earnedSoFar = state.activeQuest.components
+          const earnedSoFar     = state.activeQuest.components
             .filter((c) => c.found)
             .reduce((sum, c) => sum + c.xpEarned, 0);
           const rolledBackXp    = Math.max(0, state.activeChild.total_xp - earnedSoFar);
@@ -564,7 +477,6 @@ export const useGameStore = create<GameState>()(
           };
         }),
 
-      // ── XP sync ────────────────────────────────────────────
       syncXpFromServer: (newXp, newLevel) =>
         set((state) =>
           state.activeChild
@@ -610,7 +522,6 @@ export const useGameStore = create<GameState>()(
 
       setWordTomeCache: (entries) => set({ wordTomeCache: entries }),
 
-      // ── Scan history ───────────────────────────────────────
       addScanHistory: (item) =>
         set((state) => ({
           scanHistory: [item, ...state.scanHistory].slice(0, 50),
@@ -623,25 +534,12 @@ export const useGameStore = create<GameState>()(
         const { activeChild, completedQuestIds, hardCompletedQuestIds } = get();
         if (!activeChild) return;
 
-        // Step 1: Optimistic local update — fires synchronously so the UI
-        // shows "Done" instantly without waiting for the network.
         if (mode === "normal" && !completedQuestIds.includes(questId)) {
           set({ completedQuestIds: [...completedQuestIds, questId] });
         } else if (mode === "hard" && !hardCompletedQuestIds.includes(questId)) {
           set({ hardCompletedQuestIds: [...hardCompletedQuestIds, questId] });
         }
 
-        // Step 2: Persist to DB.
-        //
-        // KEY FIX 2a: Supabase client returns { data, error } — it does NOT
-        // throw on DB errors. The previous try/catch NEVER caught anything
-        // because errors were in the returned object, not thrown.
-        // We now explicitly check the error field and log it.
-        //
-        // KEY FIX 2b: Only call loadCompletedQuests() when the upsert
-        // SUCCEEDED. Calling it after a failed upsert would overwrite the
-        // optimistic update with stale DB data (empty), erasing the "Done"
-        // badge right after the child just earned it.
         try {
           const { error: upsertError } = await supabase
             .from("quest_completions")
@@ -657,40 +555,24 @@ export const useGameStore = create<GameState>()(
             );
 
           if (upsertError) {
-            // Visible in Metro / Logcat — tells you exactly what DB issue exists.
-            // Common causes: quest_completions table missing, RLS blocks INSERT,
-            // unique constraint (child_id, quest_id, mode) not created.
             console.error("[markQuestCompletion] Upsert failed:", upsertError);
-            // Optimistic update stays — same-session shows Done.
-            // Cross-session: AsyncStorage has it via zustand-persist.
           } else {
-            // XP FIX: call award_xp so child_profiles.total_xp is actually written
-            // to the DB. Without this, refreshChildFromDB() reads the old (pre-quest)
-            // value and silently overwrites the optimistic update — erasing XP from
-            // QuestMap LevelBar, ChildSwitcher card, and all cross-session displays.
             const { error: xpError } = await supabase.rpc("award_xp", {
               p_child_id: activeChild.id,
               p_xp:       totalXp,
             });
             if (xpError) {
               console.error("[markQuestCompletion] award_xp RPC failed:", xpError);
-              // Optimistic update stays in store for this session.
-            }else {
-				// ← ADD THIS: read confirmed value back from DB immediately after award
-				await get().refreshChildFromDB();
-				}
-
-            // Upsert confirmed — reload from DB to sync store with source of truth.
+            } else {
+              await get().refreshChildFromDB();
+            }
             get().loadCompletedQuests();
           }
         } catch (e) {
           console.error("[markQuestCompletion] Unexpected error:", e);
         }
 
-        // v2.3: auto-record streak if this was the daily quest
         get().recordDailyCompletion(questId);
-
-        // v2.4: refresh spell book so new card appears immediately
         get().loadSpellBook();
       },
 
@@ -706,14 +588,8 @@ export const useGameStore = create<GameState>()(
             .eq("child_id", activeChild.id);
 
           if (error) {
-            // KEY FIX 3: Log the error so you can see exactly what is failing.
-            // Check Metro / Logcat for this message — it will tell you whether
-            // the table is missing, RLS blocks the read, or auth has expired.
             console.error("[loadCompletedQuests] DB read failed:", error);
             set({ isLoadingCompletions: false });
-            // IMPORTANT: do NOT update completedQuestIds on error.
-            // The existing value (from AsyncStorage or the optimistic update)
-            // is preserved as a fallback — progress is not wiped on DB failure.
             return;
           }
 
@@ -732,13 +608,11 @@ export const useGameStore = create<GameState>()(
         } catch (e) {
           console.error("[loadCompletedQuests] Exception:", e);
           set({ isLoadingCompletions: false });
-          // Do NOT update completedQuestIds — preserve existing data.
         }
       },
 
       // ── v2.3: Streak actions ───────────────────────────────
 
-      /** Fetch this child's streak row from child_streaks. */
       loadStreakData: async () => {
         const { activeChild } = get();
         if (!activeChild) return;
@@ -764,10 +638,6 @@ export const useGameStore = create<GameState>()(
         });
       },
 
-      /**
-       * Determine today's daily quest.
-       * Priority: row in daily_quests table → deterministic fallback (day % questCount).
-       */
       loadDailyQuest: async () => {
         const { questLibrary } = get();
         const today = todayDate();
@@ -802,8 +672,8 @@ export const useGameStore = create<GameState>()(
       recordDailyCompletion: async (questId: string) => {
         const { activeChild, dailyQuest, isDailyQuestComplete } = get();
         if (!activeChild)                    return;
-        if (dailyQuest.questId !== questId)  return;   // not the daily quest
-        if (isDailyQuestComplete)             return;   // already counted today
+        if (dailyQuest.questId !== questId)  return;
+        if (isDailyQuestComplete)             return;
 
         try {
           const { data, error } = await supabase.rpc("record_daily_completion", {
@@ -829,17 +699,12 @@ export const useGameStore = create<GameState>()(
             },
           }));
         } catch {
-          // Non-fatal — isDailyQuestComplete stays false; retried next session
+          // Non-fatal
         }
       },
 
       // ── v2.4: Spell Book ───────────────────────────────────
 
-      /**
-       * Load all spell unlocks for the active child from the spell_unlocks VIEW.
-       * Called on SpellBookScreen mount and auto-called after markQuestCompletion().
-       * Requires schema_v2_4.sql to have been applied.
-       */
       loadSpellBook: async () => {
         const { activeChild } = get();
         if (!activeChild) return;
@@ -888,11 +753,10 @@ export const useGameStore = create<GameState>()(
         wordTomeCache:         state.wordTomeCache,
         completedQuestIds:     state.completedQuestIds,
         hardCompletedQuestIds: state.hardCompletedQuestIds,
-        // v2.3: persist streak so it shows on cold launch before DB fetch
-        streak:               state.streak,
-        isDailyQuestComplete: state.isDailyQuestComplete,
-        // v2.4: persist spell book so it shows on cold launch before DB fetch
-        spellBook:            state.spellBook,
+        streak:                state.streak,
+        isDailyQuestComplete:  state.isDailyQuestComplete,
+        spellBook:             state.spellBook,
+        hasSeenOnboarding:     state.hasSeenOnboarding,   // ← N1
       }),
     }
   )
@@ -900,19 +764,15 @@ export const useGameStore = create<GameState>()(
 
 // ─── Selectors ────────────────────────────────────────────────────────────────
 
-/** Current component the child needs to find next (first unfound) */
 export const selectCurrentComponent = (state: GameState): ComponentProgress | null =>
   state.activeQuest?.components.find((c) => !c.found) ?? null;
 
-/** True when all components in the active quest have been found */
 export const selectQuestComplete = (state: GameState): boolean =>
   !!state.activeQuest && state.activeQuest.components.every((c) => c.found);
 
-/** How many times the child has failed on the current component */
 export const selectCurrentAttempts = (state: GameState): number =>
   selectCurrentComponent(state)?.attemptCount ?? 0;
 
-/** XP progress within the current level (0–1) */
 export const selectLevelProgress = (state: GameState): number => {
   const xp    = state.activeChild?.total_xp ?? 0;
   const level = state.activeChild?.level ?? 1;
@@ -921,11 +781,9 @@ export const selectLevelProgress = (state: GameState): number => {
   return next === prev ? 0 : Math.min(1, (xp - prev) / (next - prev));
 };
 
-/** v1.4 — true if the given quest has hard mode available */
 export const selectHasHardMode = (quest: Quest): boolean =>
   Array.isArray(quest.hard_mode_properties) && quest.hard_mode_properties.length > 0;
 
-/** v1.4 — completion status for a quest */
 export const selectQuestCompletionMode = (
   state: GameState,
   questId: string
@@ -945,7 +803,6 @@ export const selectTierCleared = (state: GameState, tier: QuestTier): boolean =>
 
 export const selectUnlockedTiers = (state: GameState): Set<QuestTier> => {
   const unlocked = new Set<QuestTier>(["apprentice"]);
-
   for (let i = 0; i < TIER_ORDER.length - 1; i++) {
     const current = TIER_ORDER[i];
     const next    = TIER_ORDER[i + 1];
@@ -955,13 +812,11 @@ export const selectUnlockedTiers = (state: GameState): Set<QuestTier> => {
       break;
     }
   }
-
   return unlocked;
 };
 
 export const selectQuestsGroupedByTier = (state: GameState): TierGroup[] => {
   const unlocked = selectUnlockedTiers(state);
-
   return TIER_ORDER
     .map((tier) => ({
       tier,
@@ -974,17 +829,14 @@ export const selectQuestsGroupedByTier = (state: GameState): TierGroup[] => {
 
 // ── v2.3 Streak selectors ─────────────────────────────────────────────────────
 
-/** 2.0 at ≥7-day streak, 1.0 otherwise */
 export const selectStreakMultiplier = (state: GameState): number =>
   state.streak?.gotMultiplier ? 2.0 : 1.0;
 
-/** True when the child is currently playing today's daily quest */
 export const selectIsPlayingDailyQuest = (state: GameState): boolean =>
   !!state.activeQuest &&
   !!state.dailyQuest.questId &&
   state.activeQuest.quest.id === state.dailyQuest.questId;
 
-/** The Quest object for today's daily quest, or null */
 export const selectDailyQuest = (state: GameState): Quest | null =>
   state.dailyQuest.questId
     ? (state.questLibrary.find((q) => q.id === state.dailyQuest.questId) ?? null)
@@ -992,18 +844,11 @@ export const selectDailyQuest = (state: GameState): Quest | null =>
 
 // ── v2.4 Spell Book selectors ─────────────────────────────────────────────────
 
-/**
- * Number of unique quests cleared (ignores hard/normal duplication).
- * Used for the global progress bar in SpellBookScreen.
- */
 export const selectSpellsUnlockedCount = (state: GameState): number => {
   const unique = new Set(state.spellBook.map((s) => s.questId));
   return unique.size;
 };
 
-/**
- * All spell unlocks for a given tier, newest first.
- */
 export const selectSpellsByTier = (
   state: GameState,
   tier: QuestTier

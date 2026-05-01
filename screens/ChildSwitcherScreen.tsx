@@ -5,14 +5,9 @@
  * v2.1 change: age_band replaced with exact age (5–12).
  *   • AgePicker now shows individual ages 5–12 as chips
  *   • age_band is derived server-side via DB trigger (no client logic needed)
- *   • ChildSession gains an `age` field passed to Claude for exact language matching
  *
- * All other features unchanged:
- *   • Lists all child profiles linked to the parent account
- *   • Tapping a child loads their XP, Word Tome, and completed quests
- *   • "Add child" inline form (name + age + avatar pick)
- *   • Delete child with confirmation (COPPA data removal)
- *   • Parent sign-out
+ * N1 change: handleSelect now checks hasSeenOnboarding and routes to the
+ * onboarding walkthrough on first launch instead of jumping straight to QuestMap.
  */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
@@ -28,14 +23,13 @@ import {
   Alert,
   Platform,
 } from "react-native";
-import { useSafeAreaInsets }    from "react-native-safe-area-context";
-import * as Haptics             from "expo-haptics";
+import { useSafeAreaInsets }  from "react-native-safe-area-context";
+import * as Haptics           from "expo-haptics";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
-import { supabase, signOut }    from "../lib/supabase";
-// QuestGeneratorScreen removed — parent-only, accessed via ParentDashboard + PIN gate
-import { ParentPinGateModal }   from "../components/ParentPinGateModal";
-import { useGameStore }         from "../store/gameStore";
+import { supabase, signOut }  from "../lib/supabase";
+import { ParentPinGateModal } from "../components/ParentPinGateModal";
+import { useGameStore }       from "../store/gameStore";
 
 // ─── Navigation types ─────────────────────────────────────────────────────────
 
@@ -44,6 +38,7 @@ type RootStackParamList = {
   ChildSwitcher:   undefined;
   QuestMap:        undefined;
   ParentDashboard: undefined;
+  Onboarding:      undefined;   // ← N1
 };
 type Props = NativeStackScreenProps<RootStackParamList, "ChildSwitcher">;
 
@@ -101,8 +96,8 @@ function AvatarPicker({
   selected,
   onSelect,
 }: {
-  selected:  string;
-  onSelect:  (key: string) => void;
+  selected: string;
+  onSelect: (key: string) => void;
 }) {
   return (
     <View style={styles.avatarRow}>
@@ -122,7 +117,7 @@ function AvatarPicker({
   );
 }
 
-// ─── Age band picker ─────────────────────────────────────────────────────────
+// ─── Age band picker ──────────────────────────────────────────────────────────
 
 function AgePicker({
   selected,
@@ -189,10 +184,6 @@ function AddChildForm({
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("Not signed in");
 
-      // ── Deletion-pending guard ─────────────────────────────────────────────
-      // Block child creation if the parent account is scheduled for deletion.
-      // Creating new child profiles during the 30-day purge window would leave
-      // orphaned data and violates the intent of the erasure request.
       const scheduledAt = user.app_metadata?.deletion_scheduled_at;
       if (scheduledAt) {
         const daysLeft = Math.ceil(
@@ -209,8 +200,8 @@ function AddChildForm({
       const { error: insertErr } = await supabase.from("child_profiles").insert({
         parent_id:    user.id,
         display_name: name.trim(),
-        age_band:     ageBand,            // set directly — works with or without trigger
-        age:          selectedBand.age,   // integer for DB trigger compatibility
+        age_band:     ageBand,
+        age:          selectedBand.age,
         avatar_key:   avatarKey,
       });
       if (insertErr) throw insertErr;
@@ -336,21 +327,22 @@ function ChildCard({
 // ─── Main screen ──────────────────────────────────────────────────────────────
 
 export function ChildSwitcherScreen({ navigation }: Props) {
-  const insets  = useSafeAreaInsets();
-  const [children,      setChildren]      = useState<ChildRow[]>([]);
-  const [loading,       setLoading]       = useState(true);
-  const [showForm,      setShowForm]      = useState(false);
-  const [signingOut,    setSigningOut]    = useState(false);
-  // Quest Generator state removed — parent-only feature, gated via ParentDashboard PIN
+  const insets = useSafeAreaInsets();
+  const [children,   setChildren]   = useState<ChildRow[]>([]);
+  const [loading,    setLoading]    = useState(true);
+  const [showForm,   setShowForm]   = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
-  // ── Parent PIN gate (Option A — gate is at the door) ──────────────────────
   const [pinVisible,  setPinVisible]  = useState(false);
   const [parentId,    setParentId]    = useState("");
   const [parentEmail, setParentEmail] = useState("");
 
-  const startChildSession = useGameStore((s) => s.startChildSession);
-  const loadQuests        = useGameStore((s) => s.loadQuests);
+  const startChildSession   = useGameStore((s) => s.startChildSession);
+  const loadQuests          = useGameStore((s) => s.loadQuests);
   const loadCompletedQuests = useGameStore((s) => s.loadCompletedQuests);
+
+  // ── N1: onboarding gate ───────────────────────────────────────────────────
+  const hasSeenOnboarding = useGameStore((s) => s.hasSeenOnboarding);
 
   const fetchChildren = useCallback(async () => {
     setLoading(true);
@@ -370,7 +362,6 @@ export function ChildSwitcherScreen({ navigation }: Props) {
 
   useEffect(() => { fetchChildren(); }, [fetchChildren]);
 
-  // Fetch parent user info once — needed by PIN gate modal
   useEffect(() => {
     supabase.auth.getUser().then(({ data: { user } }) => {
       if (user) {
@@ -391,8 +382,14 @@ export function ChildSwitcherScreen({ navigation }: Props) {
       avatar_key:   child.avatar_key,
     });
     await Promise.all([loadQuests(), loadCompletedQuests()]);
-    navigation.navigate("QuestMap");
-  }, [startChildSession, loadQuests, loadCompletedQuests, navigation]);
+
+    // ── N1: route to onboarding on first launch, QuestMap thereafter ────────
+    if (!hasSeenOnboarding) {
+      navigation.navigate("Onboarding");
+    } else {
+      navigation.navigate("QuestMap");
+    }
+  }, [startChildSession, loadQuests, loadCompletedQuests, navigation, hasSeenOnboarding]);
 
   const handleDelete = useCallback((id: string) => {
     Alert.alert(
@@ -424,7 +421,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
-      {/* ── Header ─────────────────────────────────────── */}
+      {/* ── Header ──────────────────────────────────────────────── */}
       <View style={styles.header}>
         <View>
           <Text style={styles.headerTitle}>Who's playing?</Text>
@@ -482,9 +479,6 @@ export function ChildSwitcherScreen({ navigation }: Props) {
               />
             ))}
 
-            {/* Quest Generator removed — parent-only, accessed via ParentDashboard */}
-
-            {/* ── Parent PIN gate ───────────────────────────── */}
             <ParentPinGateModal
               visible={pinVisible}
               parentId={parentId}
@@ -536,7 +530,6 @@ const styles = StyleSheet.create({
   center: { paddingVertical: 60, alignItems: "center" },
   scroll: { paddingHorizontal: 20, paddingTop: 8 },
 
-  // Header
   header: {
     flexDirection:     "row",
     alignItems:        "center",
@@ -551,7 +544,6 @@ const styles = StyleSheet.create({
   signOutBtn:  { paddingVertical: 8, paddingHorizontal: 4 },
   signOutText: { fontSize: 14, color: P.inkLight, fontWeight: "500" },
 
-  // Header actions
   headerActions: {
     flexDirection: "row",
     alignItems:    "center",
@@ -571,7 +563,6 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
 
-  // Child card
   childCard: {
     flexDirection:   "row",
     alignItems:      "center",
@@ -592,21 +583,6 @@ const styles = StyleSheet.create({
     alignItems:    "center",
     padding:       16,
   },
-  cardActions: {
-    flexDirection: "row",
-    alignItems:    "stretch",
-  },
-  questBtn: {
-    paddingHorizontal: 12,
-    paddingVertical:   16,
-    backgroundColor:   P.purpleLight,
-    borderLeftWidth:   1,
-    borderLeftColor:   P.purpleBorder,
-    alignItems:        "center",
-    justifyContent:    "center",
-  },
-  questBtnText: { fontSize: 16 },
-  childAvatarWrap: { marginRight: 14 },
   childAvatar: {
     width:           50,
     height:          50,
@@ -616,6 +592,7 @@ const styles = StyleSheet.create({
     borderColor:     P.amberBorder,
     alignItems:      "center",
     justifyContent:  "center",
+    marginRight:     14,
   },
   childAvatarEmoji: { fontSize: 26 },
   childInfo:        { flex: 1 },
@@ -631,12 +608,10 @@ const styles = StyleSheet.create({
   },
   deleteBtnText: { fontSize: 14, color: P.dangerText, fontWeight: "700" },
 
-  // Add child button
   addChildBtn: {
     flexDirection:   "row",
     alignItems:      "center",
     justifyContent:  "center",
-    gap:             8,
     marginTop:       12,
     paddingVertical: 16,
     borderRadius:    16,
@@ -645,10 +620,9 @@ const styles = StyleSheet.create({
     borderStyle:     "dashed",
     backgroundColor: P.amberLight,
   },
-  addChildBtnPlus: { fontSize: 20, color: P.amber, fontWeight: "700", lineHeight: 22 },
+  addChildBtnPlus: { fontSize: 20, color: P.amber, fontWeight: "700", lineHeight: 22, marginRight: 8 },
   addChildBtnText: { fontSize: 15, fontWeight: "600", color: P.amber },
 
-  // Add child form
   addForm: {
     backgroundColor: P.white,
     borderRadius:    16,
@@ -679,7 +653,6 @@ const styles = StyleSheet.create({
     color:             P.inkBrown,
   },
 
-  // Age picker — 2×2 grid of range bands
   ageGrid: {
     flexDirection: "row",
     flexWrap:      "wrap",
@@ -695,14 +668,13 @@ const styles = StyleSheet.create({
     marginRight:     "3%",
     marginBottom:    8,
   },
-  ageChipSelected:        { backgroundColor: P.amberLight, borderColor: P.amber },
-  ageChipRange:           { fontSize: 15, fontWeight: "700", color: P.inkMid },
-  ageChipRangeSelected:   { color: P.amber },
-  ageChipDesc:            { fontSize: 10, color: P.inkFaint, marginTop: 2 },
-  ageChipDescSelected:    { color: P.inkLight },
+  ageChipSelected:      { backgroundColor: P.amberLight, borderColor: P.amber },
+  ageChipRange:         { fontSize: 15, fontWeight: "700", color: P.inkMid },
+  ageChipRangeSelected: { color: P.amber },
+  ageChipDesc:          { fontSize: 10, color: P.inkFaint, marginTop: 2 },
+  ageChipDescSelected:  { color: P.inkLight },
 
-  // Avatar picker
-  avatarRow:           { flexDirection: "row", gap: 10 },
+  avatarRow:           { flexDirection: "row" },
   avatarOption: {
     flex:            1,
     alignItems:      "center",
@@ -711,12 +683,12 @@ const styles = StyleSheet.create({
     backgroundColor: P.parchment,
     borderWidth:     1,
     borderColor:     P.warmBorder,
+    marginRight:     8,
   },
   avatarOptionSelected: { backgroundColor: P.purpleLight, borderColor: P.purpleBorder },
   avatarOptionEmoji:    { fontSize: 24 },
 
-  // Form buttons
-  addFormButtons: { flexDirection: "row", gap: 10, marginTop: 20 },
+  addFormButtons: { flexDirection: "row", marginTop: 20 },
   cancelBtn: {
     flex:            1,
     alignItems:      "center",
@@ -724,6 +696,7 @@ const styles = StyleSheet.create({
     borderRadius:    12,
     borderWidth:     1,
     borderColor:     P.warmBorder,
+    marginRight:     10,
   },
   cancelBtnText: { fontSize: 14, fontWeight: "600", color: P.inkMid },
   saveBtn: {
@@ -735,13 +708,11 @@ const styles = StyleSheet.create({
   },
   saveBtnText: { fontSize: 14, fontWeight: "700", color: P.white },
 
-  // Empty state
-  emptyState: { alignItems: "center", paddingVertical: 40, gap: 10 },
-  emptyEmoji: { fontSize: 52 },
-  emptyTitle: { fontSize: 18, fontWeight: "700", color: P.inkBrown },
+  emptyState: { alignItems: "center", paddingVertical: 40 },
+  emptyEmoji: { fontSize: 52, marginBottom: 10 },
+  emptyTitle: { fontSize: 18, fontWeight: "700", color: P.inkBrown, marginBottom: 8 },
   emptyDesc:  { fontSize: 14, color: P.inkLight, textAlign: "center", lineHeight: 20 },
 
-  // COPPA note
   coppaNote: {
     fontSize:          11,
     color:             P.inkFaint,
