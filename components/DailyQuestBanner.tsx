@@ -24,6 +24,7 @@ import {
   useGameStore,
   selectDailyQuest,
   selectStreakMultiplier,
+  getDisplayProperties,
 } from "../store/gameStore";
 
 // ─── Palette (matches dungeon dark theme) ─────────────────────────────────────
@@ -52,6 +53,7 @@ export function DailyQuestBanner({ onPress }: Props) {
   const streak             = useGameStore((s: any) => s.streak);
   const multiplier         = useGameStore(selectStreakMultiplier);
   const dailyQuestLoaded   = useGameStore((s: any) => s.dailyQuest.isLoaded);
+  const ageBand            = useGameStore((s: any) => s.activeChild?.age_band ?? "7-8");
 
   // Pulsing glow animation
   const glowAnim = useRef(new Animated.Value(0)).current;
@@ -81,8 +83,11 @@ export function DailyQuestBanner({ onPress }: Props) {
   const currentStreak = streak?.currentStreak ?? 0;
   const has2x         = multiplier >= 2;
 
+  // Use the age-band-specific word list so chips match what the child scans
+  const displayProps = getDisplayProperties(dailyQuest, ageBand);
+
   // XP FIX: compute real max XP matching the Edge Function formula
-  const propCount  = dailyQuest.required_properties?.length ?? 1;
+  const propCount  = displayProps.length;
   const multiBonus = propCount >= 3 ? 2.0 : propCount === 2 ? 1.5 : 1.0;
   const maxXpFirst = Math.round((dailyQuest.xp_reward_first_try ?? 40) * propCount * multiBonus);
 
@@ -121,9 +126,9 @@ export function DailyQuestBanner({ onPress }: Props) {
             <Text style={styles.enemyName}>{dailyQuest.enemy_name}</Text>
             <Text style={styles.roomLabel}>{dailyQuest.room_label}</Text>
 
-            {/* Property chips */}
+            {/* Property chips — show the words the child will actually scan for */}
             <View style={styles.chips}>
-              {dailyQuest.required_properties.slice(0, 3).map((p: any) => (
+              {displayProps.slice(0, 3).map((p: any) => (
                 <View key={p.word} style={styles.chip}>
                   <Text style={styles.chipText}>{p.word}</Text>
                 </View>

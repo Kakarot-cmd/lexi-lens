@@ -37,7 +37,7 @@
  * (in App.tsx) will redirect to ChildSwitcher automatically.
  */
 
-import React, { useState, useRef, useCallback } from "react";
+import React, { useState, useRef, useCallback, useEffect } from "react";
 import {
   View,
   Text,
@@ -50,6 +50,7 @@ import {
   Platform,
   ActivityIndicator,
   Modal,
+  Linking,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
@@ -120,6 +121,24 @@ export function AuthScreen() {
   const [loading, setLoading] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [success,  setSuccess]  = useState(false);
+  // Set to true when the app is reopened via the confirmation deep link,
+  // so we can show a "Email confirmed! Sign in below." banner.
+  const [emailConfirmed, setEmailConfirmed] = useState(false);
+
+  // Detect cold-start via confirmation link (warm-start is handled in App.tsx)
+  useEffect(() => {
+    Linking.getInitialURL().then((url: string | null) => {
+      if (url?.includes("auth/confirm")) setEmailConfirmed(true);
+    });
+    const sub = Linking.addEventListener("url", ({ url }: { url: string }) => {
+      if (url?.includes("auth/confirm")) {
+        setEmailConfirmed(true);
+        // Switch to sign-in so the user can immediately log in
+        setMode("sign_in");
+      }
+    });
+    return () => sub.remove();
+  }, []);
 
   // Phase 4.1: Consent + privacy state
   const [showConsentGate,  setShowConsentGate]  = useState(false);
@@ -236,6 +255,9 @@ export function AuthScreen() {
         email:    email.value.trim(),
         password: password.value,
         options: {
+          // Deep-link the confirmation email back into the app (not localhost).
+          // App.tsx handles this URL via Linking and calls exchangeCodeForSession().
+          emailRedirectTo: "lexilens://auth/confirm",
           data: {
             display_name: displayName.value.trim(),
             // Consent metadata stored in raw_user_meta_data for reference.
@@ -384,6 +406,15 @@ export function AuthScreen() {
                 ? "Sign in to manage your child's vocabulary progress."
                 : "One account for the whole family. You control all child profiles."}
             </Text>
+
+            {/* Email-confirmed banner — shown when user returns via confirmation link */}
+            {emailConfirmed && !apiError && (
+              <View style={styles.confirmedBox}>
+                <Text style={styles.confirmedText}>
+                  ✅ Email confirmed! Sign in below to start your adventure.
+                </Text>
+              </View>
+            )}
 
             {/* API-level error */}
             {apiError && (
@@ -645,6 +676,17 @@ const styles = StyleSheet.create({
   formSub:   { fontSize: 13, color: P.inkLight, lineHeight: 19, marginBottom: 20 },
 
   // API error
+  // Email-confirmed success banner
+  confirmedBox: {
+    backgroundColor: "#f0fdf4",
+    borderRadius:    10,
+    borderWidth:     1,
+    borderColor:     "#86efac",
+    padding:         12,
+    marginBottom:    16,
+  },
+  confirmedText: { fontSize: 13, color: "#166534", lineHeight: 18, fontWeight: "600" },
+
   apiErrorBox: {
     backgroundColor: P.errorBg,
     borderRadius:    10,
