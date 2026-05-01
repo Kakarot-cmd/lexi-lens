@@ -27,6 +27,11 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, apikey",
 };
 
+
+const MODEL              = "claude-haiku-4-5-20251001";
+const ANTHROPIC_API_URL  = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION  = "2023-06-01";
+
 serve(async (req: Request) => {
   // Handle CORS preflight
   if (req.method === "OPTIONS") {
@@ -60,16 +65,19 @@ serve(async (req: Request) => {
     //   smooth      → frictionless / silken
     //   heavy       → ponderous / dense
     //   transparent → diaphanous
+	
+	
+	
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type":      "application/json",
         "x-api-key":         apiKey,
-        "anthropic-version": "2023-06-01",
+        "anthropic-version": ANTHROPIC_VERSION,
       },
       body: JSON.stringify({
-        model:      "claude-sonnet-4-20250514",
+		model: MODEL,
         max_tokens: 200,
         system: `You are a vocabulary curriculum designer for a children's educational game.
 Your task: find a harder synonym for a word a child has just mastered.
