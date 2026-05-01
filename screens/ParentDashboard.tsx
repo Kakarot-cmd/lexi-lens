@@ -56,6 +56,8 @@ import QuestGeneratorScreen     from "./QuestGeneratorScreen";
 // v2.4 — Phase 4.1 COPPA + GDPR-K
 import { DataDeletionScreen }   from "../components/DataDeletionScreen";
 import { PrivacyPolicyScreen }  from "../components/PrivacyPolicyScreen";
+// N5 — Recent Sessions panel
+import { RecentSessionsPanel }  from "../components/RecentSessionsPanel";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -315,6 +317,8 @@ export function ParentDashboard({ navigation }: Props) {
   const [showDeleteScreen,     setShowDeleteScreen]     = useState(false);
   const [deletionScheduledAt,  setDeletionScheduledAt]  = useState<string | null>(null);
   const [cancellingDeletion,   setCancellingDeletion]   = useState(false);
+  // N5 — bumped on pull-to-refresh so RecentSessionsPanel reloads in sync
+  const [sessionRefreshKey,    setSessionRefreshKey]    = useState(0);
 
   const selectedChild = dashboard?.child ?? null;
 
@@ -408,6 +412,7 @@ export function ParentDashboard({ navigation }: Props) {
 
   const onRefresh = () => {
     setRefreshing(true);
+    setSessionRefreshKey((k) => k + 1);
     if (selectedId) {
       fetchDashboard(selectedId);
       fetchStreakData(selectedId);
@@ -649,6 +654,18 @@ export function ParentDashboard({ navigation }: Props) {
                 childId={selectedChild.id}
                 currentStreak={streakInfo.currentStreak}
                 longestStreak={streakInfo.longestStreak}
+              />
+            </View>
+          )}
+
+          {/* ── N5: Recent Sessions ───────────────────────── */}
+          {selectedChild && (
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Session History</Text>
+              <RecentSessionsPanel
+                childId={selectedChild.id}
+                childName={selectedChild.display_name}
+                refreshKey={sessionRefreshKey}
               />
             </View>
           )}
