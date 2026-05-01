@@ -58,6 +58,8 @@ import { DataDeletionScreen }   from "../components/DataDeletionScreen";
 import { PrivacyPolicyScreen }  from "../components/PrivacyPolicyScreen";
 // N5 — Recent Sessions panel
 import { RecentSessionsPanel }  from "../components/RecentSessionsPanel";
+// N3 — Mastery Radar panel
+import { MasteryRadarPanel }    from "../components/MasteryRadarPanel";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -317,7 +319,7 @@ export function ParentDashboard({ navigation }: Props) {
   const [showDeleteScreen,     setShowDeleteScreen]     = useState(false);
   const [deletionScheduledAt,  setDeletionScheduledAt]  = useState<string | null>(null);
   const [cancellingDeletion,   setCancellingDeletion]   = useState(false);
-  // N5 — bumped on pull-to-refresh so RecentSessionsPanel reloads in sync
+  // N5 / N3 — bumped on pull-to-refresh so RecentSessionsPanel + MasteryRadarPanel reload in sync
   const [sessionRefreshKey,    setSessionRefreshKey]    = useState(0);
 
   const selectedChild = dashboard?.child ?? null;
@@ -663,6 +665,18 @@ export function ParentDashboard({ navigation }: Props) {
             <View style={styles.section}>
               <Text style={styles.sectionTitle}>Session History</Text>
               <RecentSessionsPanel
+                childId={selectedChild.id}
+                childName={selectedChild.display_name}
+                refreshKey={sessionRefreshKey}
+              />
+            </View>
+          )}
+
+          {/* ── N3: Vocabulary Mastery Radar ──────────────── */}
+          {selectedChild && (
+            <View style={styles.section}>
+              <Text style={styles.sectionTitle}>Vocabulary Map</Text>
+              <MasteryRadarPanel
                 childId={selectedChild.id}
                 childName={selectedChild.display_name}
                 refreshKey={sessionRefreshKey}
