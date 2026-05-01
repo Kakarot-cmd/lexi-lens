@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Lexi-Lens Admin Dashboard</title>
+
+<!-- Supabase JS CDN -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<style>
+  /* ── Reset & tokens ──────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0d0f14;
+    --surface:   #161a23;
+    --card:      #1e2330;
+    --border:    #2a3045;
+    --text:      #e2e8f0;
+    --text-muted:#8892a4;
+    --accent:    #7c3aed;
+    --accent-lt: #a78bfa;
+    --green:     #22c55e;
+    --amber:     #f59e0b;
+    --red:       #ef4444;
+    --blue:      #3b82f6;
+    --tier-ap:   #86efac;
+    --tier-sc:   #93c5fd;
+    --tier-sg:   #c4b5fd;
+    --tier-ar:   #fbbf24;
+    --radius:    10px;
+    --shadow:    0 4px 24px rgba(0,0,0,0.4);
+  }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* ── Auth screen ──────────────────────────────────────────────────── */
+  #auth-screen {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+  }
+  .auth-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 40px;
+    width: 380px;
+    box-shadow: var(--shadow);
+  }
+  .auth-card h1 { font-size: 24px; margin-bottom: 4px; }
+  .auth-card p  { color: var(--text-muted); font-size: 13px; margin-bottom: 28px; }
+
+  /* ── App shell ────────────────────────────────────────────────────── */
+  #app { display: none; }
+
+  .topbar {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .topbar-brand { font-size: 18px; font-weight: 700; color: var(--accent-lt); flex: 1; }
+  .topbar-admin { font-size: 12px; color: var(--text-muted); }
+
+  .main { max-width: 1200px; margin: 0 auto; padding: 28px 24px; }
+
+  /* ── Tabs ─────────────────────────────────────────────────────────── */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px;
+    margin-bottom: 24px;
+    width: fit-content;
+  }
+  .tab {
+    padding: 7px 18px;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    transition: all .15s;
+  }
+  .tab.active, .tab:hover { background: var(--card); color: var(--text); }
+  .tab.active { color: var(--accent-lt); }
+
+  /* ── Stats row ────────────────────────────────────────────────────── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+  }
+  .stat-card .value { font-size: 28px; font-weight: 700; margin-bottom: 2px; }
+  .stat-card .label { font-size: 12px; color: var(--text-muted); }
+
+  /* ── Filters row ──────────────────────────────────────────────────── */
+  .filters {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  /* ── Table ────────────────────────────────────────────────────────── */
+  .table-wrap {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead { background: var(--surface); }
+  th { padding: 12px 14px; text-align: left; color: var(--text-muted); font-weight: 500; white-space: nowrap; }
+  td { padding: 11px 14px; border-top: 1px solid var(--border); vertical-align: middle; }
+  tr:hover td { background: rgba(255,255,255,.02); }
+
+  .empty-row td { text-align: center; color: var(--text-muted); padding: 40px; }
+
+  /* ── Badges ───────────────────────────────────────────────────────── */
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .badge-ap { background: rgba(134,239,172,.15); color: var(--tier-ap); }
+  .badge-sc { background: rgba(147,197,253,.15); color: var(--tier-sc); }
+  .badge-sg { background: rgba(196,181,253,.15); color: var(--tier-sg); }
+  .badge-ar { background: rgba(251,191,36,.15);  color: var(--tier-ar); }
+  .badge-pub{ background: rgba(34,197,94,.15);   color: var(--green); }
+  .badge-prv{ background: rgba(148,163,184,.12); color: var(--text-muted); }
+  .badge-pnd{ background: rgba(245,158,11,.15);  color: var(--amber); }
+
+  /* ── Buttons ──────────────────────────────────────────────────────── */
+  .btn {
+    padding: 8px 16px;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: none;
+    transition: all .15s;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #6d28d9; }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn-ghost { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+  .btn-ghost:hover { border-color: var(--accent-lt); color: var(--accent-lt); }
+  .btn-danger { background: rgba(239,68,68,.15); color: var(--red); border: 1px solid rgba(239,68,68,.3); }
+  .btn-danger:hover { background: var(--red); color: #fff; }
+  .btn-success { background: rgba(34,197,94,.15); color: var(--green); border: 1px solid rgba(34,197,94,.3); }
+  .btn-success:hover { background: var(--green); color: #111; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* ── Form controls ────────────────────────────────────────────────── */
+  input[type=text], input[type=email], input[type=password],
+  input[type=number], select, textarea {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    color: var(--text);
+    padding: 9px 12px;
+    font-size: 13px;
+    width: 100%;
+    outline: none;
+    font-family: inherit;
+    transition: border-color .15s;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 80px; }
+  select option { background: var(--surface); }
+  label { font-size: 12px; color: var(--text-muted); margin-bottom: 5px; display: block; }
+
+  /* ── Modal ────────────────────────────────────────────────────────── */
+  .modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.7);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000;
+    padding: 16px;
+    overflow-y: auto;
+  }
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 28px;
+    width: 100%;
+    max-width: 680px;
+    box-shadow: var(--shadow);
+    animation: slideIn .2s ease;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+  @keyframes slideIn { from { transform: translateY(16px); opacity: 0; } }
+  .modal-title { font-size: 18px; font-weight: 700; margin-bottom: 20px; }
+
+  /* ── Form grid ────────────────────────────────────────────────────── */
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+  .form-grid .full { grid-column: 1 / -1; }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+
+  /* ── Properties editor ────────────────────────────────────────────── */
+  .prop-section { margin-top: 16px; }
+  .prop-section h3 { font-size: 13px; font-weight: 600; color: var(--text-muted); margin-bottom: 10px; text-transform: uppercase; letter-spacing: .05em; }
+  .prop-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 8px;
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 8px;
+    align-items: start;
+  }
+  .prop-card textarea { min-height: 60px; }
+  .add-prop-btn {
+    background: none;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    color: var(--text-muted);
+    padding: 10px;
+    font-size: 13px;
+    cursor: pointer;
+    width: 100%;
+    transition: all .15s;
+  }
+  .add-prop-btn:hover { border-color: var(--accent); color: var(--accent-lt); }
+
+  /* ── Toast ────────────────────────────────────────────────────────── */
+  #toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 18px;
+    font-size: 13px;
+    z-index: 9999;
+    box-shadow: var(--shadow);
+    display: none;
+    animation: slideIn .2s ease;
+    max-width: 320px;
+  }
+  #toast.success { border-color: var(--green); color: var(--green); }
+  #toast.error   { border-color: var(--red);   color: var(--red); }
+
+  /* ── Misc ─────────────────────────────────────────────────────────── */
+  .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .section-header h2 { font-size: 16px; font-weight: 600; }
+  .pending-count { background: var(--amber); color: #000; border-radius: 20px; padding: 1px 7px; font-size: 11px; font-weight: 700; }
+  .divider { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+  .text-muted { color: var(--text-muted); }
+  .emoji-preview { font-size: 24px; margin-right: 8px; }
+  .quest-name-cell { display: flex; align-items: center; }
+
+  @media (max-width: 640px) {
+    .form-grid { grid-template-columns: 1fr; }
+    .prop-card  { grid-template-columns: 1fr; }
+    .stats-grid { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ──────────────────── AUTH SCREEN ──────────────────────────────────── -->
+<div id="auth-screen">
+  <div class="auth-card">
+    <h1>⚔️ Lexi-Lens Admin</h1>
+    <p>Sign in with your admin account to manage quests.</p>
+
+    <div class="field" style="margin-bottom:12px">
+      <label>Supabase URL</label>
+      <input id="supa-url" type="text" placeholder="https://xxxx.supabase.co" />
+    </div>
+    <div class="field" style="margin-bottom:12px">
+      <label>Supabase Anon Key</label>
+      <input id="supa-key" type="text" placeholder="eyJ..." />
+    </div>
+    <hr class="divider" style="margin:16px 0"/>
+    <div class="field" style="margin-bottom:12px">
+      <label>Email</label>
+      <input id="login-email" type="email" placeholder="admin@example.com" />
+    </div>
+    <div class="field" style="margin-bottom:20px">
+      <label>Password</label>
+      <input id="login-password" type="password" placeholder="••••••••" />
+    </div>
+    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Sign In</button>
+    <p id="auth-error" style="color:var(--red);font-size:12px;margin-top:10px;display:none"></p>
+
+    <p style="margin-top:16px;font-size:11px;color:var(--text-muted)">
+      Save your Supabase credentials — they're stored in sessionStorage only.
+    </p>
+  </div>
+</div>
+
+<!-- ──────────────────── APP ────────────────────────────────────────────── -->
+<div id="app">
+  <div class="topbar">
+    <span class="topbar-brand">⚔️ Lexi-Lens Admin</span>
+    <span class="topbar-admin" id="admin-email-label"></span>
+    <button class="btn btn-ghost btn-sm" onclick="doLogout()">Sign out</button>
+  </div>
+
+  <div class="main">
+    <!-- Stats -->
+    <div class="stats-grid" id="stats-grid">
+      <div class="stat-card"><div class="value" id="stat-total">—</div><div class="label">Total Quests</div></div>
+      <div class="stat-card"><div class="value" id="stat-pending" style="color:var(--amber)">—</div><div class="label">Pending Approval</div></div>
+      <div class="stat-card"><div class="value" id="stat-public" style="color:var(--green)">—</div><div class="label">Public Quests</div></div>
+      <div class="stat-card"><div class="value" id="stat-bands">5</div><div class="label">Age Bands</div></div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab active" onclick="showTab('quests',this)">All Quests</button>
+      <button class="tab" onclick="showTab('pending',this)">Pending <span id="pending-tab-badge"></span></button>
+      <button class="tab" onclick="showTab('create',this)">+ New Quest</button>
+    </div>
+
+    <!-- ── ALL QUESTS TAB ── -->
+    <div id="tab-quests">
+      <div class="section-header">
+        <h2>Quest Library</h2>
+        <button class="btn btn-primary btn-sm" onclick="showTab('create', document.querySelector('.tab:nth-child(3)'))">+ New Quest</button>
+      </div>
+
+      <div class="filters">
+        <select id="filter-tier" onchange="renderTable()" style="width:160px">
+          <option value="">All Tiers</option>
+          <option value="apprentice">🌱 Apprentice</option>
+          <option value="scholar">📖 Scholar</option>
+          <option value="sage">🔮 Sage</option>
+          <option value="archmage">⚡ Archmage</option>
+        </select>
+        <select id="filter-band" onchange="renderTable()" style="width:160px">
+          <option value="">All Age Bands</option>
+          <option value="5-6">5-6</option>
+          <option value="7-8">7-8</option>
+          <option value="9-10">9-10</option>
+          <option value="11-12">11-12</option>
+          <option value="13-14">13-14</option>
+        </select>
+        <select id="filter-vis" onchange="renderTable()" style="width:160px">
+          <option value="">All Visibility</option>
+          <option value="public">Public</option>
+          <option value="private">Private</option>
+          <option value="pending_approval">Pending</option>
+        </select>
+        <input type="text" id="filter-search" placeholder="Search quests…" oninput="renderTable()" style="width:220px" />
+        <button class="btn btn-ghost btn-sm" onclick="clearFilters()">Clear</button>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Quest</th>
+              <th>Age Band</th>
+              <th>Tier</th>
+              <th>Properties</th>
+              <th>XP (1st / retry)</th>
+              <th>Visibility</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="quest-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── PENDING TAB ── -->
+    <div id="tab-pending" style="display:none">
+      <div class="section-header">
+        <h2>Pending Approval</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Quest</th>
+              <th>Submitted by</th>
+              <th>Age Band</th>
+              <th>Tier</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="pending-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ── CREATE / EDIT TAB ── -->
+    <div id="tab-create" style="display:none">
+      <div class="section-header">
+        <h2 id="form-title">New Quest</h2>
+      </div>
+
+      <div class="table-wrap" style="padding:24px">
+        <input type="hidden" id="edit-id" />
+
+        <div class="form-grid">
+          <div class="field">
+            <label>Quest Name *</label>
+            <input id="f-name" type="text" placeholder="The Boredom Behemoth's Study" />
+          </div>
+          <div class="field">
+            <label>Room / Location *</label>
+            <input id="f-room" type="text" placeholder="Study Room" />
+          </div>
+          <div class="field">
+            <label>Enemy Name *</label>
+            <input id="f-enemy-name" type="text" placeholder="Boredom Behemoth" />
+          </div>
+          <div class="field">
+            <label>Enemy Emoji *</label>
+            <input id="f-emoji" type="text" placeholder="😴" maxlength="4" />
+          </div>
+          <div class="field">
+            <label>Minimum Age Band *</label>
+            <select id="f-band">
+              <option value="5-6">5-6</option>
+              <option value="7-8">7-8</option>
+              <option value="9-10">9-10</option>
+              <option value="11-12">11-12</option>
+              <option value="13-14">13-14</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Tier *</label>
+            <select id="f-tier">
+              <option value="apprentice">🌱 Apprentice</option>
+              <option value="scholar">📖 Scholar</option>
+              <option value="sage">🔮 Sage</option>
+              <option value="archmage">⚡ Archmage</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>XP — First Try</label>
+            <input id="f-xp1" type="number" value="50" min="10" max="999" />
+          </div>
+          <div class="field">
+            <label>XP — Retry</label>
+            <input id="f-xp2" type="number" value="25" min="5" max="999" />
+          </div>
+          <div class="field">
+            <label>Visibility</label>
+            <select id="f-vis">
+              <option value="public">Public (approved)</option>
+              <option value="private">Private</option>
+              <option value="pending_approval">Pending Approval</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Required Properties -->
+        <div class="prop-section">
+          <h3>Required Properties <span style="color:var(--text-muted);font-weight:400;text-transform:none">(what the child must find)</span></h3>
+          <div id="req-props-list"></div>
+          <button class="add-prop-btn" onclick="addProp('req')">+ Add Property</button>
+        </div>
+
+        <!-- Hard Mode Properties -->
+        <div class="prop-section" style="margin-top:20px">
+          <h3>Hard Mode Properties <span style="color:var(--text-muted);font-weight:400;text-transform:none">(harder synonyms — optional)</span></h3>
+          <div id="hard-props-list"></div>
+          <button class="add-prop-btn" onclick="addProp('hard')">+ Add Hard Mode Property</button>
+        </div>
+
+        <div class="modal-actions" style="border-top:none;padding-top:0;margin-top:28px">
+          <button class="btn btn-ghost" onclick="resetForm(); showTab('quests', document.querySelector('.tab'))">Cancel</button>
+          <button class="btn btn-primary" onclick="saveQuest()" id="save-btn">Save Quest</button>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /app -->
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<!-- ──────────────────── SCRIPT ─────────────────────────────────────────── -->
+<script>
+// ── Supabase client (initialized at login) ────────────────────────────────
+let sb = null;
+let allQuests = [];
+let adminEmail = '';
+
+// ── Login ─────────────────────────────────────────────────────────────────
+async function doLogin() {
+  const url  = document.getElementById('supa-url').value.trim();
+  const key  = document.getElementById('supa-key').value.trim();
+  const email= document.getElementById('login-email').value.trim();
+  const pw   = document.getElementById('login-password').value;
+
+  if (!url || !key || !email || !pw) {
+    showAuthError('Please fill in all fields.'); return;
+  }
+
+  try {
+    sb = supabase.createClient(url, key);
+    const { data, error } = await sb.auth.signInWithPassword({ email, password: pw });
+    if (error) throw error;
+
+    // Check admin status
+    const { data: isAdm, error: admErr } = await sb.rpc('is_admin');
+    if (admErr || !isAdm) throw new Error('This account does not have admin privileges.');
+
+    adminEmail = email;
+    sessionStorage.setItem('ll_admin_url', url);
+    sessionStorage.setItem('ll_admin_key', key);
+
+    document.getElementById('admin-email-label').textContent = email;
+    document.getElementById('auth-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+
+    await loadAll();
+  } catch (e) {
+    showAuthError(e.message);
+  }
+}
+
+function showAuthError(msg) {
+  const el = document.getElementById('auth-error');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+async function doLogout() {
+  await sb?.auth.signOut();
+  sessionStorage.clear();
+  location.reload();
+}
+
+// ── Pre-fill saved credentials ─────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  const url = sessionStorage.getItem('ll_admin_url');
+  const key = sessionStorage.getItem('ll_admin_key');
+  if (url) document.getElementById('supa-url').value = url;
+  if (key) document.getElementById('supa-key').value = key;
+});
+
+// ── Data loading ──────────────────────────────────────────────────────────
+async function loadAll() {
+  const { data, error } = await sb
+    .from('quests')
+    .select('*')
+    .order('min_age_band')
+    .order('tier');
+
+  if (error) { toast('Failed to load quests: ' + error.message, 'error'); return; }
+
+  allQuests = data || [];
+  updateStats();
+  renderTable();
+  renderPending();
+}
+
+function updateStats() {
+  document.getElementById('stat-total').textContent   = allQuests.length;
+  document.getElementById('stat-pending').textContent = allQuests.filter(q => q.visibility === 'pending_approval').length;
+  document.getElementById('stat-public').textContent  = allQuests.filter(q => q.visibility === 'public').length;
+
+  const cnt = allQuests.filter(q => q.visibility === 'pending_approval').length;
+  document.getElementById('pending-tab-badge').textContent = cnt > 0 ? cnt : '';
+  document.getElementById('pending-tab-badge').className   = cnt > 0 ? 'pending-count' : '';
+}
+
+// ── Tables ─────────────────────────────────────────────────────────────────
+function renderTable() {
+  const tier   = document.getElementById('filter-tier').value;
+  const band   = document.getElementById('filter-band').value;
+  const vis    = document.getElementById('filter-vis').value;
+  const search = document.getElementById('filter-search').value.toLowerCase();
+
+  const filtered = allQuests.filter(q =>
+    (!tier   || q.tier           === tier)   &&
+    (!band   || q.min_age_band   === band)   &&
+    (!vis    || q.visibility     === vis)    &&
+    (!search || q.name.toLowerCase().includes(search) || (q.enemy_name||'').toLowerCase().includes(search))
+  );
+
+  const tbody = document.getElementById('quest-tbody');
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="7">No quests match the current filters.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = filtered.map(q => `
+    <tr>
+      <td>
+        <div class="quest-name-cell">
+          <span class="emoji-preview">${q.enemy_emoji || '❓'}</span>
+          <div>
+            <div style="font-weight:500">${esc(q.name)}</div>
+            <div style="font-size:11px;color:var(--text-muted)">${esc(q.room_label)}</div>
+          </div>
+        </div>
+      </td>
+      <td>${esc(q.min_age_band)}</td>
+      <td>${tierBadge(q.tier)}</td>
+      <td style="font-size:12px">${(q.required_properties||[]).length} req · ${(q.hard_mode_properties||[]).length} hard</td>
+      <td style="font-size:12px">${q.xp_reward_first_try} / ${q.xp_reward_retry}</td>
+      <td>${visBadge(q.visibility)}</td>
+      <td>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" onclick="editQuest('${q.id}')">Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteQuest('${q.id}', '${esc(q.name)}')">Delete</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function renderPending() {
+  const pending = allQuests.filter(q => q.visibility === 'pending_approval');
+  const tbody   = document.getElementById('pending-tbody');
+
+  if (pending.length === 0) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No quests pending approval. 🎉</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = pending.map(q => `
+    <tr>
+      <td>
+        <div class="quest-name-cell">
+          <span class="emoji-preview">${q.enemy_emoji || '❓'}</span>
+          <div>
+            <div style="font-weight:500">${esc(q.name)}</div>
+            <div style="font-size:11px;color:var(--text-muted)">${esc(q.room_label)}</div>
+          </div>
+        </div>
+      </td>
+      <td style="font-size:12px;color:var(--text-muted)">${q.created_by ? q.created_by.substring(0,8)+'…' : 'System'}</td>
+      <td>${esc(q.min_age_band)}</td>
+      <td>${tierBadge(q.tier)}</td>
+      <td>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-success btn-sm" onclick="approveQuest('${q.id}')">✓ Approve</button>
+          <button class="btn btn-ghost btn-sm" onclick="editQuest('${q.id}')">Edit</button>
+          <button class="btn btn-danger btn-sm" onclick="deleteQuest('${q.id}', '${esc(q.name)}')">Reject</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+// ── Approve ────────────────────────────────────────────────────────────────
+async function approveQuest(id) {
+  const { error } = await sb
+    .from('quests')
+    .update({ visibility: 'public', approved_at: new Date().toISOString() })
+    .eq('id', id);
+
+  if (error) { toast('Error: ' + error.message, 'error'); return; }
+  toast('Quest approved and published!', 'success');
+  await loadAll();
+}
+
+// ── Delete ─────────────────────────────────────────────────────────────────
+async function deleteQuest(id, name) {
+  if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+  const { error } = await sb.from('quests').delete().eq('id', id);
+  if (error) { toast('Delete failed: ' + error.message, 'error'); return; }
+  toast('Quest deleted.', 'success');
+  await loadAll();
+}
+
+// ── Edit ───────────────────────────────────────────────────────────────────
+function editQuest(id) {
+  const q = allQuests.find(x => x.id === id);
+  if (!q) return;
+
+  document.getElementById('edit-id').value  = id;
+  document.getElementById('f-name').value   = q.name || '';
+  document.getElementById('f-room').value   = q.room_label || '';
+  document.getElementById('f-enemy-name').value = q.enemy_name || '';
+  document.getElementById('f-emoji').value  = q.enemy_emoji || '';
+  document.getElementById('f-band').value   = q.min_age_band || '5-6';
+  document.getElementById('f-tier').value   = q.tier || 'apprentice';
+  document.getElementById('f-xp1').value    = q.xp_reward_first_try || 50;
+  document.getElementById('f-xp2').value    = q.xp_reward_retry || 25;
+  document.getElementById('f-vis').value    = q.visibility || 'public';
+  document.getElementById('form-title').textContent = 'Edit Quest';
+
+  // Render properties
+  renderPropList('req',  q.required_properties  || []);
+  renderPropList('hard', q.hard_mode_properties || []);
+
+  showTab('create', document.querySelectorAll('.tab')[2]);
+}
+
+// ── Properties editor ──────────────────────────────────────────────────────
+function renderPropList(type, props) {
+  const listEl = document.getElementById(`${type}-props-list`);
+  listEl.innerHTML = '';
+  props.forEach((p, i) => addPropCard(type, p));
+}
+
+function addProp(type) {
+  addPropCard(type, { word: '', definition: '', evaluationHints: '' });
+}
+
+function addPropCard(type, prop) {
+  const listEl = document.getElementById(`${type}-props-list`);
+  const div = document.createElement('div');
+  div.className = 'prop-card';
+  div.innerHTML = `
+    <div class="field">
+      <label>Word</label>
+      <input type="text" class="prop-word" value="${esc(prop.word||'')}" placeholder="e.g. absorbent" />
+    </div>
+    <div class="field">
+      <label>Definition</label>
+      <textarea class="prop-def" placeholder="Clear definition for the child…">${esc(prop.definition||'')}</textarea>
+    </div>
+    <div class="field">
+      <label>Eval Hints (for Claude)</label>
+      <textarea class="prop-hints" placeholder="What objects qualify? What disqualifies?">${esc(prop.evaluationHints||'')}</textarea>
+    </div>
+    <div style="display:flex;align-items:flex-start;padding-top:20px">
+      <button class="btn btn-danger btn-sm" onclick="this.closest('.prop-card').remove()" title="Remove">✕</button>
+    </div>
+  `;
+  listEl.appendChild(div);
+}
+
+function collectProps(type) {
+  const cards = document.querySelectorAll(`#${type}-props-list .prop-card`);
+  return Array.from(cards).map(card => ({
+    word:            card.querySelector('.prop-word').value.trim(),
+    definition:      card.querySelector('.prop-def').value.trim(),
+    evaluationHints: card.querySelector('.prop-hints').value.trim() || undefined,
+  })).filter(p => p.word);
+}
+
+// ── Save quest ─────────────────────────────────────────────────────────────
+async function saveQuest() {
+  const name     = document.getElementById('f-name').value.trim();
+  const room     = document.getElementById('f-room').value.trim();
+  const enemy    = document.getElementById('f-enemy-name').value.trim();
+  const emoji    = document.getElementById('f-emoji').value.trim();
+  const band     = document.getElementById('f-band').value;
+  const tier     = document.getElementById('f-tier').value;
+  const xp1      = parseInt(document.getElementById('f-xp1').value);
+  const xp2      = parseInt(document.getElementById('f-xp2').value);
+  const vis      = document.getElementById('f-vis').value;
+  const editId   = document.getElementById('edit-id').value;
+
+  if (!name || !room || !enemy || !emoji) {
+    toast('Please fill in Name, Room, Enemy Name, and Emoji.', 'error'); return;
+  }
+
+  const reqProps  = collectProps('req');
+  const hardProps = collectProps('hard');
+
+  if (reqProps.length === 0) {
+    toast('Add at least one required property.', 'error'); return;
+  }
+
+  const payload = {
+    name,
+    room_label:           room,
+    enemy_name:           enemy,
+    enemy_emoji:          emoji,
+    min_age_band:         band,
+    tier,
+    xp_reward_first_try:  xp1,
+    xp_reward_retry:      xp2,
+    visibility:           vis,
+    required_properties:  reqProps,
+    hard_mode_properties: hardProps,
+    age_band_properties:  {},   // admin can extend via direct DB edit for now
+    approved_at:          vis === 'public' ? new Date().toISOString() : null,
+    created_by:           null,
+  };
+
+  const btn = document.getElementById('save-btn');
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+
+  let error;
+  if (editId) {
+    ({ error } = await sb.from('quests').update(payload).eq('id', editId));
+  } else {
+    ({ error } = await sb.from('quests').insert(payload));
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Save Quest';
+
+  if (error) { toast('Save failed: ' + error.message, 'error'); return; }
+
+  toast(editId ? 'Quest updated!' : 'Quest created!', 'success');
+  resetForm();
+  await loadAll();
+  showTab('quests', document.querySelectorAll('.tab')[0]);
+}
+
+function resetForm() {
+  document.getElementById('edit-id').value = '';
+  document.getElementById('form-title').textContent = 'New Quest';
+  ['f-name','f-room','f-enemy-name','f-emoji'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('f-band').value = '5-6';
+  document.getElementById('f-tier').value = 'apprentice';
+  document.getElementById('f-xp1').value  = '50';
+  document.getElementById('f-xp2').value  = '25';
+  document.getElementById('f-vis').value  = 'public';
+  document.getElementById('req-props-list').innerHTML  = '';
+  document.getElementById('hard-props-list').innerHTML = '';
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+function showTab(name, tabEl) {
+  ['quests','pending','create'].forEach(t => {
+    document.getElementById('tab-' + t).style.display = (t === name) ? 'block' : 'none';
+  });
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  if (tabEl) tabEl.classList.add('active');
+
+  if (name === 'create' && !document.getElementById('edit-id').value) {
+    resetForm();
+    addPropCard('req',  { word:'', definition:'', evaluationHints:'' });
+  }
+}
+
+function clearFilters() {
+  ['filter-tier','filter-band','filter-vis'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('filter-search').value = '';
+  renderTable();
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function tierBadge(tier) {
+  const map = {
+    apprentice: ['badge-ap','🌱 Apprentice'],
+    scholar:    ['badge-sc','📖 Scholar'],
+    sage:       ['badge-sg','🔮 Sage'],
+    archmage:   ['badge-ar','⚡ Archmage'],
+  };
+  const [cls, label] = map[tier] || ['badge-prv', tier];
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
+function visBadge(vis) {
+  const map = {
+    public:           ['badge-pub','● Public'],
+    private:          ['badge-prv','● Private'],
+    pending_approval: ['badge-pnd','⏳ Pending'],
+  };
+  const [cls, label] = map[vis] || ['badge-prv', vis];
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className   = type;
+  el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, 3500);
+}
+</script>
+
+</body>
+</html>
