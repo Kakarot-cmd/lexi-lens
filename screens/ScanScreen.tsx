@@ -562,6 +562,16 @@ export function ScanScreen({ route, navigation }: Props) {
     },
   });
 
+const { hasPermission, device, requestPermission, ...rest } = useObjectScanner({ ... });
+
+// Force camera to remount when permission is granted after being denied
+const [cameraKey, setCameraKey] = React.useState(0);
+
+React.useEffect(() => {
+  if (hasPermission && device) {
+    setCameraKey(k => k + 1);
+  }
+}, [hasPermission, device]);
   // ── Guards ────────────────────────────────────────────────────────────────
 
  // Replace the !hasPermission guard
@@ -615,6 +625,7 @@ if (!device) {
   return (
     <View style={styles.root}>
       <Camera
+	    key={cameraKey} 
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
         device={device}

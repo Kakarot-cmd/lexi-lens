@@ -32,7 +32,7 @@
  *   • [PERF] liveConfidence removed from triggerManualScan deps array — now read
  *     via ref, eliminating unnecessary callback recreation on every confidence tick.
  */
-
+import { AppState, AppStateStatus } from "react-native";
 import { useEffect, useRef, useCallback, useState } from "react";
 import { useCameraDevice, useCameraPermission, Camera } from "react-native-vision-camera";
 import { readAsStringAsync } from "expo-file-system/legacy";
@@ -155,6 +155,19 @@ export function useObjectScanner({
   useEffect(() => {
     if (!hasPermission) requestPermission();
   }, [hasPermission, requestPermission]);
+  
+  // Re-check permissions when app returns from background (e.g. user went to Settings)
+  useEffect(() => {
+  const subscription = AppState.addEventListener(
+    "change",
+    (nextState: AppStateStatus) => {
+      if (nextState === "active" && !hasPermission) {
+        requestPermission();
+      }
+    }
+  );
+  return () => subscription.remove();
+}, [hasPermission, requestPermission]);
 
   // Load ML Kit on mount — silently no-ops if native module isn't compiled yet
   useEffect(() => { loadMLKit(); }, []);
