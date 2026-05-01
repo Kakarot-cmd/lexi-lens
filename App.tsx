@@ -27,12 +27,13 @@ import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./lib/supabase";
 
 // ─── Screens ──────────────────────────────────────────────────────────────────
-import { AuthScreen }             from "./screens/AuthScreen";
-import { ChildSwitcherScreen }    from "./screens/ChildSwitcherScreen";
-import { QuestMapScreen }         from "./screens/QuestMapScreen";
-import { ParentDashboard }        from "./screens/ParentDashboard";
-import SpellBookScreen            from "./screens/SpellBookScreen";
-import { QuestGeneratorScreen }   from "./screens/QuestGeneratorScreen";
+import { AuthScreen }           from "./screens/AuthScreen";
+import { ChildSwitcherScreen }  from "./screens/ChildSwitcherScreen";
+import { QuestMapScreen }       from "./screens/QuestMapScreen";
+import { ParentDashboard }      from "./screens/ParentDashboard";
+import SpellBookScreen          from "./screens/SpellBookScreen";
+import { QuestGeneratorScreen } from "./screens/QuestGeneratorScreen";
+import { OnboardingScreen }     from "./screens/OnboardingScreen";   // ← N1
 
 // ─── Error boundary ───────────────────────────────────────────────────────────
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -43,7 +44,6 @@ import { useGameStore } from "./store/gameStore";
 // ─── Web placeholder (camera not available in browser) ───────────────────────
 function ScanPlaceholder() {
   return (
-  
     <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center", padding: 32 }}>
       <Text style={{ fontSize: 48, marginBottom: 16 }}>📱</Text>
       <Text style={{ fontSize: 20, fontWeight: "700", color: "#f3e8ff", textAlign: "center", marginBottom: 12 }}>
@@ -56,7 +56,7 @@ function ScanPlaceholder() {
   );
 }
 
-// Dynamically import ScanScreen only on native — unchanged from your original
+// Dynamically import ScanScreen only on native
 const ScanScreen = Platform.OS === "web"
   ? ScanPlaceholder
   : require("./screens/ScanScreen").ScanScreen;
@@ -131,6 +131,15 @@ function AppNavigator() {
           </ErrorBoundary>
         )}
       </AppNav.Screen>
+
+      {/* ── N1: First-session onboarding ────────────────────────────────── */}
+      <AppNav.Screen name="Onboarding">
+        {(props) => (
+          <ErrorBoundary screen="OnboardingScreen">
+            <OnboardingScreen {...props} />
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
     </AppNav.Navigator>
   );
 }
@@ -169,7 +178,6 @@ function App() {
         }
       }
     );
-	
 
     return () => subscription.unsubscribe();
   }, []);
@@ -180,7 +188,6 @@ function App() {
       setUserContext({
         childId:  activeChild.id,
         parentId: session.user.id,
-        // age_band is "7-8" → take upper digit as a proxy for exact age
         childAge: parseInt(activeChild.age_band?.split("-")[1] ?? "8", 10),
       });
       addGameBreadcrumb({
@@ -204,7 +211,7 @@ function App() {
     }
   }, []);
 
-  // ── Loading splash — identical to your original ────────────────────────────
+  // ── Loading splash ─────────────────────────────────────────────────────────
   if (initialising) {
     return (
       <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center" }}>
@@ -228,5 +235,4 @@ function App() {
 }
 
 // Sentry.wrap() registers the JS-level global error handler.
-// Must wrap the default export — this is what Expo loads as the entry point.
 export default Sentry.wrap(App);
