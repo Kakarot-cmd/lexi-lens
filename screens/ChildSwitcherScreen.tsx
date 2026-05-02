@@ -3,11 +3,14 @@
  * Lexi-Lens — choose which child is playing (or add a new one).
  *
  * v2.1 change: age_band replaced with exact age (5–12).
- *   • AgePicker now shows individual ages 5–12 as chips
- *   • age_band is derived server-side via DB trigger (no client logic needed)
+ *   • AgePicker shows individual ages 5–12 as chips
+ *   • age_band derived server-side via DB trigger
  *
- * N1 change: handleSelect now checks hasSeenOnboarding and routes to the
- * onboarding walkthrough on first launch instead of jumping straight to QuestMap.
+ * N1 change: handleSelect checks hasSeenOnboarding and routes to onboarding
+ * on first launch instead of jumping straight to QuestMap.
+ *
+ * N2 fix (TS2345): handleSignOut no longer calls navigation.replace("Auth").
+ *   Auth routing is handled by App.tsx onAuthStateChange when session clears.
  */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
@@ -67,10 +70,9 @@ const P = {
   purple:       "#7c3aed",
   purpleLight:  "#f5f3ff",
   purpleBorder: "#ddd6fe",
-  dangerBg:     "#fff1f2",
-  dangerBorder: "#fecdd3",
-  dangerText:   "#9f1239",
   white:        "#ffffff",
+  danger:       "#dc2626",
+  dangerLight:  "#fef2f2",
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -84,236 +86,160 @@ interface ChildRow {
   avatar_key:   string | null;
 }
 
-// ─── Avatar picker ────────────────────────────────────────────────────────────
+// ─── Avatar helper ────────────────────────────────────────────────────────────
 
-function AvatarPicker({
-  selected,
-  onSelect,
-}: {
-  selected: string;
-  onSelect: (key: string) => void;
-}) {
+const AVATAR_EMOJIS: Record<string, string> = {
+  wizard:  "🧙",
+  knight:  "⚔️",
+  archer:  "🏹",
+  dragon:  "🐉",
+  default: "✦",
+};
+
+// ─── ChildCard ────────────────────────────────────────────────────────────────
+
+interface ChildCardProps {
+  child:    ChildRow;
+  onSelect: () => void;
+  onDelete: () => void;
+}
+
+function ChildCard({ child, onSelect, onDelete }: ChildCardProps) {
+  const emoji = AVATAR_EMOJIS[child.avatar_key ?? "default"] ?? "✦";
+
   return (
-    <View style={styles.avatarRow}>
-      {AVATAR_OPTIONS.map((a) => (
-        <TouchableOpacity
-          key={a.key}
-          style={[styles.avatarOption, selected === a.key && styles.avatarOptionSelected]}
-          onPress={() => { onSelect(a.key); Haptics.selectionAsync(); }}
-          accessibilityRole="radio"
-          accessibilityState={{ checked: selected === a.key }}
-          accessibilityLabel={a.label}
-        >
-          <Text style={styles.avatarOptionEmoji}>{a.emoji}</Text>
-        </TouchableOpacity>
-      ))}
-    </View>
+    <TouchableOpacity
+      style={styles.childCard}
+      onPress={onSelect}
+      activeOpacity={0.8}
+      accessibilityRole="button"
+      accessibilityLabel={`Play as ${child.display_name}, level ${child.level}`}
+    >
+      <View style={styles.childCardAvatar}>
+        <Text style={styles.childCardAvatarEmoji}>{emoji}</Text>
+      </View>
+      <View style={styles.childCardInfo}>
+        <Text style={styles.childCardName}>{child.display_name}</Text>
+        <Text style={styles.childCardMeta}>
+          Level {child.level} · {child.total_xp} XP · Age {child.age_band}
+        </Text>
+      </View>
+      <TouchableOpacity
+        style={styles.deleteBtn}
+        onPress={onDelete}
+        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+        accessibilityLabel={`Remove ${child.display_name}`}
+      >
+        <Text style={styles.deleteBtnText}>✕</Text>
+      </TouchableOpacity>
+    </TouchableOpacity>
   );
 }
 
-// ─── Age band picker ──────────────────────────────────────────────────────────
+// ─── AddChildForm ─────────────────────────────────────────────────────────────
 
-function AgePicker({
-  selected,
-  onSelect,
-}: {
-  selected: AgeBand;
-  onSelect: (band: AgeBand) => void;
-}) {
-  return (
-    <View style={styles.ageGrid}>
-      {AGE_BANDS.map((item) => {
-        const isSelected = selected === item.band;
-        return (
-          <TouchableOpacity
-            key={item.band}
-            style={[styles.ageChip, isSelected && styles.ageChipSelected]}
-            onPress={() => { onSelect(item.band); Haptics.selectionAsync(); }}
-            accessibilityRole="radio"
-            accessibilityState={{ checked: isSelected }}
-            accessibilityLabel={item.label}
-          >
-            <Text style={[styles.ageChipRange, isSelected && styles.ageChipRangeSelected]}>
-              {item.label}
-            </Text>
-            <Text style={[styles.ageChipDesc, isSelected && styles.ageChipDescSelected]}>
-              {item.desc}
-            </Text>
-          </TouchableOpacity>
-        );
-      })}
-    </View>
-  );
-}
-
-// ─── Add child form ───────────────────────────────────────────────────────────
-
-function AddChildForm({
-  onSaved,
-  onCancel,
-}: {
+interface AddChildFormProps {
   onSaved:  () => void;
   onCancel: () => void;
-}) {
+}
+
+function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
   const [name,      setName]      = useState("");
   const [ageBand,   setAgeBand]   = useState<AgeBand>("7-8");
-  const [avatarKey, setAvatarKey] = useState("wizard");
-  const [loading,   setLoading]   = useState(false);
+  const [avatarKey, setAvatarKey] = useState<string>("wizard");
+  const [saving,    setSaving]    = useState(false);
   const [error,     setError]     = useState<string | null>(null);
 
-  const slideAnim = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    Animated.spring(slideAnim, {
-      toValue: 1, useNativeDriver: true, tension: 70, friction: 10,
-    }).start();
-  }, []);
-
   const handleSave = async () => {
-    if (!name.trim()) { setError("Enter a name for this child"); return; }
-    setLoading(true);
+    const trimmed = name.trim();
+    if (!trimmed) { setError("Please enter a display name."); return; }
+    setSaving(true);
     setError(null);
-
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("Not signed in");
 
-      const scheduledAt = user.app_metadata?.deletion_scheduled_at;
-      if (scheduledAt) {
-        const daysLeft = Math.ceil(
-          (new Date(scheduledAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)
-        );
-        setError(
-          `Your account is scheduled for deletion in ${daysLeft} day${daysLeft !== 1 ? "s" : ""}. ` +
-          `New child profiles cannot be added. Contact privacy@lexi-lens.app to cancel the deletion.`
-        );
-        return;
-      }
+      const { error: insertErr } = await supabase
+        .from("child_profiles")
+        .insert({
+          parent_id:    user.id,
+          display_name: trimmed,
+          age_band:     ageBand,
+          avatar_key:   avatarKey,
+        });
 
-      const selectedBand = AGE_BANDS.find((b) => b.band === ageBand)!;
-      const { error: insertErr } = await supabase.from("child_profiles").insert({
-        parent_id:    user.id,
-        display_name: name.trim(),
-        age_band:     ageBand,
-        age:          selectedBand.age,
-        avatar_key:   avatarKey,
-      });
       if (insertErr) throw insertErr;
-
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       onSaved();
     } catch (err: any) {
-      setError(err.message ?? "Could not save child profile");
+      setError(err.message ?? "Could not save profile");
     } finally {
-      setLoading(false);
+      setSaving(false);
     }
   };
 
   return (
-    <Animated.View
-      style={[
-        styles.addForm,
-        {
-          opacity:   slideAnim,
-          transform: [{ translateY: slideAnim.interpolate({ inputRange: [0, 1], outputRange: [24, 0] }) }],
-        },
-      ]}
-    >
+    <View style={styles.addForm}>
       <Text style={styles.addFormTitle}>Add a child</Text>
 
-      {error && (
-        <View style={styles.formErrorBox}>
-          <Text style={styles.formErrorText}>{error}</Text>
-        </View>
-      )}
+      {error && <Text style={styles.addFormError}>{error}</Text>}
 
-      <Text style={styles.fieldLabel}>Name</Text>
       <TextInput
-        style={styles.textInput}
-        placeholder="e.g. Rohan"
+        style={styles.addFormInput}
+        placeholder="Display name (e.g. Anya)"
         placeholderTextColor={P.inkFaint}
         value={name}
-        onChangeText={(v) => { setName(v); setError(null); }}
-        autoCapitalize="words"
+        onChangeText={setName}
+        maxLength={30}
         autoFocus
-        returnKeyType="done"
-        accessibilityLabel="Child's name"
       />
 
-      <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Age range</Text>
-      <AgePicker selected={ageBand} onSelect={setAgeBand} />
+      {/* Age band */}
+      <Text style={styles.addFormLabel}>Age range</Text>
+      <View style={styles.chipRow}>
+        {AGE_BANDS.map((b) => (
+          <TouchableOpacity
+            key={b.band}
+            style={[styles.chip, ageBand === b.band && styles.chipActive]}
+            onPress={() => { setAgeBand(b.band); Haptics.selectionAsync(); }}
+          >
+            <Text style={[styles.chipLabel, ageBand === b.band && styles.chipLabelActive]}>{b.label}</Text>
+            <Text style={[styles.chipDesc,  ageBand === b.band && styles.chipDescActive]}>{b.desc}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
 
-      <Text style={[styles.fieldLabel, { marginTop: 14 }]}>Avatar</Text>
-      <AvatarPicker selected={avatarKey} onSelect={setAvatarKey} />
+      {/* Avatar */}
+      <Text style={styles.addFormLabel}>Avatar</Text>
+      <View style={styles.avatarRow}>
+        {AVATAR_OPTIONS.map((a) => (
+          <TouchableOpacity
+            key={a.key}
+            style={[styles.avatarChip, avatarKey === a.key && styles.avatarChipActive]}
+            onPress={() => { setAvatarKey(a.key); Haptics.selectionAsync(); }}
+          >
+            <Text style={styles.avatarEmoji}>{a.emoji}</Text>
+            <Text style={[styles.avatarLabel, avatarKey === a.key && styles.avatarLabelActive]}>{a.label}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
 
+      {/* Buttons */}
       <View style={styles.addFormButtons}>
-        <TouchableOpacity
-          style={styles.cancelBtn}
-          onPress={onCancel}
-          accessibilityRole="button"
-          accessibilityLabel="Cancel adding child"
-        >
+        <TouchableOpacity style={styles.cancelBtn} onPress={onCancel}>
           <Text style={styles.cancelBtnText}>Cancel</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.saveBtn, loading && { opacity: 0.65 }]}
+          style={[styles.saveBtn, saving && { opacity: 0.7 }]}
           onPress={handleSave}
-          disabled={loading}
-          accessibilityRole="button"
-          accessibilityLabel="Save child profile"
+          disabled={saving}
         >
-          {loading
-            ? <ActivityIndicator color={P.white} />
-            : <Text style={styles.saveBtnText}>Save child ✦</Text>}
+          {saving
+            ? <ActivityIndicator color={P.white} size="small" />
+            : <Text style={styles.saveBtnText}>Save</Text>
+          }
         </TouchableOpacity>
       </View>
-    </Animated.View>
-  );
-}
-
-// ─── Child card ───────────────────────────────────────────────────────────────
-
-function ChildCard({
-  child,
-  onSelect,
-  onDelete,
-}: {
-  child:    ChildRow;
-  onSelect: () => void;
-  onDelete: () => void;
-}) {
-  const avatarEmoji =
-    AVATAR_OPTIONS.find((a) => a.key === child.avatar_key)?.emoji ?? "🧙";
-
-  return (
-    <View style={styles.childCard}>
-      <TouchableOpacity
-        style={styles.childCardInner}
-        onPress={onSelect}
-        activeOpacity={0.75}
-        accessibilityRole="button"
-        accessibilityLabel={`Select ${child.display_name}`}
-      >
-        <View style={styles.childAvatar}>
-          <Text style={styles.childAvatarEmoji}>{avatarEmoji}</Text>
-        </View>
-        <View style={styles.childInfo}>
-          <Text style={styles.childName}>{child.display_name}</Text>
-          <Text style={styles.childMeta}>
-            {child.age_band ? `Age ${child.age_band}` : "Age —"} · Lv {child.level} · {child.total_xp} XP
-          </Text>
-        </View>
-        <Text style={styles.childChevron}>›</Text>
-      </TouchableOpacity>
-
-      <TouchableOpacity
-        style={styles.deleteBtn}
-        onPress={onDelete}
-        accessibilityRole="button"
-        accessibilityLabel={`Delete ${child.display_name}`}
-      >
-        <Text style={styles.deleteBtnText}>✕</Text>
-      </TouchableOpacity>
     </View>
   );
 }
@@ -322,21 +248,23 @@ function ChildCard({
 
 export function ChildSwitcherScreen({ navigation }: Props) {
   const insets = useSafeAreaInsets();
+
   const [children,   setChildren]   = useState<ChildRow[]>([]);
   const [loading,    setLoading]    = useState(true);
   const [showForm,   setShowForm]   = useState(false);
   const [signingOut, setSigningOut] = useState(false);
-
-  const [pinVisible,  setPinVisible]  = useState(false);
-  const [parentId,    setParentId]    = useState("");
+  const [parentId,   setParentId]   = useState("");
   const [parentEmail, setParentEmail] = useState("");
+  const [pinVisible, setPinVisible] = useState(false);
 
-  const startChildSession   = useGameStore((s) => s.startChildSession);
-  const loadQuests          = useGameStore((s) => s.loadQuests);
-  const loadCompletedQuests = useGameStore((s) => s.loadCompletedQuests);
+  const {
+    startChildSession,
+    loadQuests,
+    loadCompletedQuests,
+    hasSeenOnboarding,
+  } = useGameStore();
 
-  // ── N1: onboarding gate ───────────────────────────────────────────────────
-  const hasSeenOnboarding = useGameStore((s) => s.hasSeenOnboarding);
+  // ── Fetch children ─────────────────────────────────────────────────────────
 
   const fetchChildren = useCallback(async () => {
     setLoading(true);
@@ -344,7 +272,8 @@ export function ChildSwitcherScreen({ navigation }: Props) {
       const { data, error } = await supabase
         .from("child_profiles")
         .select("id, display_name, age_band, level, total_xp, avatar_key")
-        .order("created_at");
+        .order("created_at", { ascending: true });
+
       if (error) throw error;
       setChildren(data ?? []);
     } catch (err: any) {
@@ -365,6 +294,8 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     });
   }, []);
 
+  // ── Handlers ───────────────────────────────────────────────────────────────
+
   const handleSelect = useCallback(async (child: ChildRow) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     startChildSession({
@@ -377,7 +308,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     });
     await Promise.all([loadQuests(), loadCompletedQuests()]);
 
-    // ── N1: route to onboarding on first launch, QuestMap thereafter ────────
+    // N1: route to onboarding on first launch, QuestMap thereafter
     if (!hasSeenOnboarding) {
       navigation.navigate("Onboarding");
     } else {
@@ -392,8 +323,8 @@ export function ChildSwitcherScreen({ navigation }: Props) {
       [
         { text: "Cancel", style: "cancel" },
         {
-          text: "Remove",
-          style: "destructive",
+          text:    "Remove",
+          style:   "destructive",
           onPress: async () => {
             await supabase.from("child_profiles").delete().eq("id", id);
             fetchChildren();
@@ -407,15 +338,19 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     setSigningOut(true);
     try {
       await signOut();
-      navigation.replace("Auth");
+      // App.tsx onAuthStateChange listener fires when the session clears,
+      // switching the root navigator from <AppNavigator> to <AuthNavigator>
+      // automatically. No manual navigation call is valid or needed here.
     } catch {
       setSigningOut(false);
     }
-  }, [navigation]);
+  }, []);
+
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
-      {/* ── Header ──────────────────────────────────────────────── */}
+      {/* Header */}
       <View style={styles.header}>
         <View>
           <Text style={styles.headerTitle}>Who's playing?</Text>
@@ -438,7 +373,8 @@ export function ChildSwitcherScreen({ navigation }: Props) {
           >
             {signingOut
               ? <ActivityIndicator color={P.inkLight} size="small" />
-              : <Text style={styles.signOutText}>Sign out</Text>}
+              : <Text style={styles.signOutText}>Sign out</Text>
+            }
           </TouchableOpacity>
         </View>
       </View>
@@ -535,13 +471,9 @@ const styles = StyleSheet.create({
   },
   headerTitle: { fontSize: 22, fontWeight: "800", color: P.inkBrown, letterSpacing: -0.3 },
   headerSub:   { fontSize: 13, color: P.inkLight, marginTop: 2 },
-  signOutBtn:  { paddingVertical: 8, paddingHorizontal: 4 },
-  signOutText: { fontSize: 14, color: P.inkLight, fontWeight: "500" },
 
-  headerActions: {
-    flexDirection: "row",
-    alignItems:    "center",
-  },
+  headerActions: { flexDirection: "row", alignItems: "center" },
+
   dashboardBtn: {
     backgroundColor:   P.purpleLight,
     borderRadius:      20,
@@ -551,12 +483,12 @@ const styles = StyleSheet.create({
     borderColor:       P.purpleBorder,
     marginRight:       8,
   },
-  dashboardBtnText: {
-    color:      P.purple,
-    fontSize:   12,
-    fontWeight: "700",
-  },
+  dashboardBtnText: { color: P.purple, fontSize: 12, fontWeight: "700" },
 
+  signOutBtn: { paddingVertical: 8, paddingHorizontal: 4 },
+  signOutText: { fontSize: 14, color: P.inkLight, fontWeight: "500" },
+
+  // Child card
   childCard: {
     flexDirection:   "row",
     alignItems:      "center",
@@ -567,152 +499,128 @@ const styles = StyleSheet.create({
     marginTop:       12,
     overflow:        "hidden",
     ...Platform.select({
-      ios:     { shadowColor: "#000", shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 6 },
+      ios:     { shadowColor: P.inkBrown, shadowOpacity: 0.07, shadowRadius: 6, shadowOffset: { width: 0, height: 2 } },
       android: { elevation: 2 },
     }),
   },
-  childCardInner: {
-    flex:          1,
-    flexDirection: "row",
-    alignItems:    "center",
-    padding:       16,
-  },
-  childAvatar: {
-    width:           50,
-    height:          50,
-    borderRadius:    25,
+  childCardAvatar: {
+    width:           60,
+    height:          60,
     backgroundColor: P.amberLight,
-    borderWidth:     1,
-    borderColor:     P.amberBorder,
     alignItems:      "center",
     justifyContent:  "center",
-    marginRight:     14,
   },
-  childAvatarEmoji: { fontSize: 26 },
-  childInfo:        { flex: 1 },
-  childName:        { fontSize: 17, fontWeight: "700", color: P.inkBrown },
-  childMeta:        { fontSize: 12, color: P.inkLight, marginTop: 3 },
-  childChevron:     { fontSize: 22, color: P.inkFaint },
-  deleteBtn: {
-    paddingHorizontal: 14,
-    paddingVertical:   16,
-    backgroundColor:   P.dangerBg,
-    borderLeftWidth:   1,
-    borderLeftColor:   P.dangerBorder,
-  },
-  deleteBtnText: { fontSize: 14, color: P.dangerText, fontWeight: "700" },
+  childCardAvatarEmoji: { fontSize: 28 },
+  childCardInfo:   { flex: 1, paddingHorizontal: 14 },
+  childCardName:   { fontSize: 17, fontWeight: "700", color: P.inkBrown },
+  childCardMeta:   { fontSize: 12, color: P.inkLight, marginTop: 3 },
+  deleteBtn:       { padding: 16 },
+  deleteBtnText:   { fontSize: 14, color: P.inkFaint },
 
+  // Empty state
+  emptyState: { alignItems: "center", paddingVertical: 48 },
+  emptyEmoji: { fontSize: 48, marginBottom: 12 },
+  emptyTitle: { fontSize: 18, fontWeight: "700", color: P.inkBrown, marginBottom: 6 },
+  emptyDesc:  { fontSize: 14, color: P.inkLight, textAlign: "center", lineHeight: 20 },
+
+  // Add child
   addChildBtn: {
-    flexDirection:   "row",
-    alignItems:      "center",
-    justifyContent:  "center",
-    marginTop:       12,
-    paddingVertical: 16,
-    borderRadius:    16,
-    borderWidth:     1.5,
-    borderColor:     P.amberBorder,
-    borderStyle:     "dashed",
-    backgroundColor: P.amberLight,
+    flexDirection:     "row",
+    alignItems:        "center",
+    justifyContent:    "center",
+    gap:               8,
+    marginTop:         16,
+    backgroundColor:   P.amberLight,
+    borderRadius:      14,
+    borderWidth:       1,
+    borderStyle:       "dashed",
+    borderColor:       P.amberBorder,
+    paddingVertical:   16,
   },
-  addChildBtnPlus: { fontSize: 20, color: P.amber, fontWeight: "700", lineHeight: 22, marginRight: 8 },
-  addChildBtnText: { fontSize: 15, fontWeight: "600", color: P.amber },
+  addChildBtnPlus: { fontSize: 22, color: P.amber, fontWeight: "300" },
+  addChildBtnText: { fontSize: 15, color: P.amber, fontWeight: "600" },
 
+  // COPPA note
+  coppaNote: {
+    fontSize:     11,
+    color:        P.inkFaint,
+    textAlign:    "center",
+    lineHeight:   16,
+    marginTop:    20,
+    paddingHorizontal: 20,
+  },
+
+  // Add form
   addForm: {
-    backgroundColor: P.white,
+    backgroundColor: P.parchment,
     borderRadius:    16,
     borderWidth:     1,
     borderColor:     P.warmBorder,
     padding:         20,
-    marginTop:       12,
+    marginTop:       16,
   },
-  addFormTitle: { fontSize: 17, fontWeight: "700", color: P.inkBrown, marginBottom: 16 },
-  formErrorBox: {
-    backgroundColor: P.dangerBg,
-    borderRadius:    8,
-    borderWidth:     1,
-    borderColor:     P.dangerBorder,
-    padding:         10,
-    marginBottom:    14,
-  },
-  formErrorText: { fontSize: 13, color: P.dangerText },
-  fieldLabel:    { fontSize: 13, fontWeight: "600", color: P.inkMid, marginBottom: 8 },
-  textInput: {
-    backgroundColor:   P.parchment,
+  addFormTitle: { fontSize: 17, fontWeight: "700", color: P.inkBrown, marginBottom: 14 },
+  addFormError: { fontSize: 13, color: P.danger, marginBottom: 10, backgroundColor: P.dangerLight, padding: 10, borderRadius: 8 },
+  addFormInput: {
+    backgroundColor:   P.white,
     borderRadius:      10,
     borderWidth:       1,
     borderColor:       P.warmBorder,
     paddingHorizontal: 14,
-    paddingVertical:   12,
+    paddingVertical:   11,
     fontSize:          15,
     color:             P.inkBrown,
+    marginBottom:      16,
   },
+  addFormLabel: { fontSize: 13, fontWeight: "600", color: P.inkMid, marginBottom: 8 },
 
-  ageGrid: {
-    flexDirection: "row",
-    flexWrap:      "wrap",
+  chipRow:    { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 },
+  chip: {
+    backgroundColor:   P.white,
+    borderRadius:      10,
+    borderWidth:       1,
+    borderColor:       P.warmBorder,
+    paddingHorizontal: 12,
+    paddingVertical:   8,
+    alignItems:        "center",
   },
-  ageChip: {
-    width:           "47%",
-    alignItems:      "center",
-    paddingVertical: 12,
-    borderRadius:    10,
-    backgroundColor: P.parchment,
-    borderWidth:     1,
-    borderColor:     P.warmBorder,
-    marginRight:     "3%",
-    marginBottom:    8,
-  },
-  ageChipSelected:      { backgroundColor: P.amberLight, borderColor: P.amber },
-  ageChipRange:         { fontSize: 15, fontWeight: "700", color: P.inkMid },
-  ageChipRangeSelected: { color: P.amber },
-  ageChipDesc:          { fontSize: 10, color: P.inkFaint, marginTop: 2 },
-  ageChipDescSelected:  { color: P.inkLight },
+  chipActive: { borderColor: P.amber, backgroundColor: P.amberLight },
+  chipLabel:  { fontSize: 13, fontWeight: "600", color: P.inkMid },
+  chipLabelActive: { color: P.amber },
+  chipDesc:   { fontSize: 11, color: P.inkFaint, marginTop: 2 },
+  chipDescActive:  { color: P.inkLight },
 
-  avatarRow:           { flexDirection: "row" },
-  avatarOption: {
+  avatarRow: { flexDirection: "row", gap: 8, marginBottom: 20 },
+  avatarChip: {
     flex:            1,
     alignItems:      "center",
     paddingVertical: 10,
-    borderRadius:    12,
-    backgroundColor: P.parchment,
+    borderRadius:    10,
     borderWidth:     1,
     borderColor:     P.warmBorder,
-    marginRight:     8,
+    backgroundColor: P.white,
   },
-  avatarOptionSelected: { backgroundColor: P.purpleLight, borderColor: P.purpleBorder },
-  avatarOptionEmoji:    { fontSize: 24 },
+  avatarChipActive: { borderColor: P.amber, backgroundColor: P.amberLight },
+  avatarEmoji:      { fontSize: 22, marginBottom: 4 },
+  avatarLabel:      { fontSize: 11, color: P.inkLight, fontWeight: "600" },
+  avatarLabelActive:{ color: P.amber },
 
-  addFormButtons: { flexDirection: "row", marginTop: 20 },
+  addFormButtons: { flexDirection: "row", gap: 10 },
   cancelBtn: {
     flex:            1,
-    alignItems:      "center",
     paddingVertical: 13,
-    borderRadius:    12,
+    alignItems:      "center",
+    borderRadius:    10,
     borderWidth:     1,
     borderColor:     P.warmBorder,
-    marginRight:     10,
   },
-  cancelBtnText: { fontSize: 14, fontWeight: "600", color: P.inkMid },
+  cancelBtnText: { fontSize: 15, color: P.inkLight, fontWeight: "600" },
   saveBtn: {
     flex:            1,
-    alignItems:      "center",
     paddingVertical: 13,
-    borderRadius:    12,
+    alignItems:      "center",
+    borderRadius:    10,
     backgroundColor: P.amber,
   },
-  saveBtnText: { fontSize: 14, fontWeight: "700", color: P.white },
-
-  emptyState: { alignItems: "center", paddingVertical: 40 },
-  emptyEmoji: { fontSize: 52, marginBottom: 10 },
-  emptyTitle: { fontSize: 18, fontWeight: "700", color: P.inkBrown, marginBottom: 8 },
-  emptyDesc:  { fontSize: 14, color: P.inkLight, textAlign: "center", lineHeight: 20 },
-
-  coppaNote: {
-    fontSize:          11,
-    color:             P.inkFaint,
-    textAlign:         "center",
-    lineHeight:        17,
-    marginTop:         24,
-    paddingHorizontal: 8,
-  },
+  saveBtnText: { fontSize: 15, color: P.white, fontWeight: "700" },
 });

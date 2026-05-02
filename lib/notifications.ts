@@ -1,6 +1,6 @@
 /**
  * notifications.ts
- * Lexi-Lens — Phase 2.3
+ * Lexi-Lens — Phase 2.3 + N4
  *
  * Uses DYNAMIC imports so expo-notifications native module is never loaded
  * at app startup — only when the parent actually toggles the reminder.
@@ -13,16 +13,19 @@
  * NOTE: After installing expo-notifications you must run a new native build:
  *   npx expo run:android
  * (not just expo start — the native module needs to be compiled in)
+ *
+ * N4 addition: sendBadgeNotification() — fires an immediate local push
+ * notification when a badge is earned.
  */
 
 import { Platform } from "react-native";
 
 const CHANNEL_ID      = "daily-quest";
 const REMINDER_ID_KEY = "lexi-daily-reminder";
+const BADGE_CHANNEL_ID = "lexi-achievements";
 
 /** Lazily load expo-notifications — never at module init time. */
 async function getNotifications() {
-  // Dynamic import — only loads native module when this function is called
   const Notifications = await import("expo-notifications");
   return Notifications;
 }
@@ -38,9 +41,9 @@ export async function setForegroundNotificationBehavior(): Promise<void> {
     const N = await getNotifications();
     N.setNotificationHandler({
       handleNotification: async () => ({
-        shouldShowAlert:  true,   // legacy Android path
-        shouldShowBanner: true,   // iOS 14+ banner (expo-notifications ≥0.28)
-        shouldShowList:   true,   // iOS 14+ notification centre
+        shouldShowAlert:  true,
+        shouldShowBanner: true,
+        shouldShowList:   true,
         shouldPlaySound:  true,
         shouldSetBadge:   false,
       }),
@@ -82,7 +85,7 @@ async function ensureChannel(): Promise<void> {
   }
 }
 
-// ─── Schedule ─────────────────────────────────────────────────────────────────
+// ─── Schedule daily reminder ──────────────────────────────────────────────────
 
 export async function scheduleDailyQuestReminder(
   hour      = 18,
@@ -120,7 +123,7 @@ export async function scheduleDailyQuestReminder(
   }
 }
 
-// ─── Cancel ───────────────────────────────────────────────────────────────────
+// ─── Cancel daily reminder ────────────────────────────────────────────────────
 
 export async function cancelDailyReminder(): Promise<void> {
   try {
@@ -145,5 +148,58 @@ export async function registerNotificationTapHandler(
     return () => sub.remove();
   } catch {
     return () => {};
+  }
+}
+
+// ─── N4: Badge earned notification ───────────────────────────────────────────
+
+/**
+ * Fire an immediate local push notification when a badge is earned.
+ * Uses trigger: null → fires instantly (expo-notifications 0.28+).
+ *
+ * Safe to call even if the user hasn't granted notification permission
+ * (requestNotificationPermission returns false silently).
+ *
+ * @param badge — Badge object from achievementService.ts
+ */
+export async function sendBadgeNotification(badge: {
+  emoji:       string;
+  name:        string;
+  description: string;
+  rarity:      string;
+}): Promise<void> {
+  try {
+    const granted = await requestNotificationPermission();
+    if (!granted) return;
+
+    const N = await getNotifications();
+
+    // Create the achievement channel (Android) — idempotent
+    if (Platform.OS === "android") {
+      await N.setNotificationChannelAsync(BADGE_CHANNEL_ID, {
+        name:             "Achievement Badges",
+        importance:       N.AndroidImportance.HIGH,
+        vibrationPattern: [0, 100, 80, 100],
+        lightColor:       "#f59e0b",
+      });
+    }
+
+    const isHighRarity = badge.rarity === "legendary" || badge.rarity === "epic";
+
+    await N.scheduleNotificationAsync({
+      identifier: `badge-${badge.name.replace(/\s+/g, "-").toLowerCase()}-${Date.now()}`,
+      content: {
+        title: isHighRarity
+          ? `${badge.emoji} ${badge.name} — ${badge.rarity.toUpperCase()} badge unlocked!`
+          : `${badge.emoji} Badge unlocked: ${badge.name}`,
+        body:  badge.description,
+        sound: true,
+        data:  { screen: "ParentDashboard", type: "badge" },
+        ...(Platform.OS === "android" && { channelId: BADGE_CHANNEL_ID }),
+      },
+      trigger: null,   // fire immediately
+    });
+  } catch (e) {
+    console.warn("[notifications] sendBadgeNotification failed:", e);
   }
 }

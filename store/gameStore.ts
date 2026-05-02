@@ -2,31 +2,36 @@
  * gameStore.ts
  * Lexi-Lens — Zustand store for all client-side game state.
  *
+ * N4 additions:
+ *   • AchievementRecord, Badge types (imported from achievementService)
+ *   • achievements: AchievementRecord[]      — earned badges cache
+ *   • newlyEarnedBadges: Badge[]              — queue feeding AchievementToast
+ *   • isLoadingAchievements: boolean
+ *   • loadAchievements()                      — called on session start
+ *   • checkAndAwardBadges()                   — called after scan + quest complete
+ *   • dismissEarnedBadge()                    — pops front of toast queue
+ *   • startChildSession now kicks loadAchievements
+ *   • markQuestCompletion now calls checkAndAwardBadges
+ *
  * N1 additions:
  *   • hasSeenOnboarding: boolean  — persisted; gates first-session walkthrough
  *   • markOnboardingComplete()    — flips flag, persists to AsyncStorage
  *
  * v2.4 additions (Phase 2.4 — Spell Book):
- *   • SpellUnlock type
- *   • spellBook: SpellUnlock[]
- *   • isLoadingSpells: boolean
- *   • loadSpellBook()
- *   • markQuestCompletion() now auto-calls loadSpellBook()
+ *   • SpellUnlock type + spellBook + isLoadingSpells + loadSpellBook()
+ *   • markQuestCompletion() auto-calls loadSpellBook()
  *
  * v2.3 additions (Phase 2.3 — Daily Quest + 7-day Streak):
  *   • StreakData + DailyQuestState types
  *   • streak, dailyQuest, isDailyQuestComplete
  *   • loadStreakData(), loadDailyQuest(), recordDailyCompletion()
- *   • selectStreakMultiplier — 2.0 at ≥7 days, 1.0 otherwise
  *
  * v2.1 additions (Phase 2.1 — Quest Tier System):
- *   • QuestTier union type
- *   • TIER_ORDER, TIER_META constants
+ *   • QuestTier union type + TIER_ORDER + TIER_META
  *   • selectUnlockedTiers(), selectQuestsGroupedByTier(), selectTierCleared()
  *
  * v1.4 additions:
- *   • hard mode support on ActiveQuest
- *   • quest completion tracking
+ *   • hard mode support + quest completion tracking
  *   • markQuestCompletion(), loadCompletedQuests()
  */
 
@@ -34,6 +39,15 @@ import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { supabase } from "../lib/supabase";
+
+// N4 — Achievement service imports
+import {
+  loadEarnedAchievements,
+  checkAndAward,
+  type Badge,
+  type AchievementRecord,
+  type BadgeCheckContext,
+} from "../services/achievementService";
 
 // ─── Utility helpers ──────────────────────────────────────────────────────────
 
@@ -93,29 +107,30 @@ export const TIER_META: Record<
 export interface PropertyRequirement {
   word:             string;
   definition:       string;
-  evaluationHints?: string;
+  evaluationHints?: string;   // single hint string — matches useLexiEvaluate EvaluatePayload
 }
 
 export interface Quest {
-  id:                    string;
-  name:                  string;
-  enemy_name:            string;
-  enemy_emoji:           string;
-  room_label:            string;
-  min_age_band:          string;
-  xp_reward_first_try:   number;
-  xp_reward_retry:       number;
-  required_properties:   PropertyRequirement[];
-  hard_mode_properties:  PropertyRequirement[];
-  tier:                  QuestTier;
-  age_band_properties:   Record<string, PropertyRequirement[]>;
-  created_by:            string | null;
-  visibility:            "public" | "private" | "pending_approval";
-  approved_at:           string | null;
-  sort_order:            number;
-  spell_name?:           string;
-  weapon_emoji?:         string;
-  spell_description?:    string;
+  id:                   string;
+  name:                 string;
+  enemy_name:           string;
+  enemy_emoji:          string;
+  room_label:           string;
+  min_age_band:         string;
+  xp_reward_first_try:  number;
+  xp_reward_retry:      number;
+  required_properties:  PropertyRequirement[];
+  age_band_properties?: Record<string, PropertyRequirement[]>;
+  // hard_mode_properties is always an array (empty if no hard mode)
+  hard_mode_properties: PropertyRequirement[];
+  is_active:            boolean;
+  // tier is required — all quests must have one (defaulted in loadQuests)
+  tier:                 QuestTier;
+  sort_order?:          number;
+  spell_name?:          string;
+  weapon_emoji?:        string;
+  spell_description?:   string;
+  created_by?:          string;   // AI-generated quests carry the parent's user id
 }
 
 export interface ComponentProgress {
@@ -221,32 +236,40 @@ interface GameState {
   hasSeenOnboarding:      boolean;
   markOnboardingComplete: () => void;
 
+  // ── N4: Achievement Badge System ───────────────────────────
+  achievements:           AchievementRecord[];
+  newlyEarnedBadges:      Badge[];
+  isLoadingAchievements:  boolean;
+  loadAchievements:       () => Promise<void>;
+  checkAndAwardBadges:    () => Promise<void>;
+  dismissEarnedBadge:     () => void;
+
   // ── Actions ────────────────────────────────────────────────
-  startChildSession:  (child: ChildSession) => void;
-  endChildSession:    () => void;
-  loadQuests:         () => Promise<void>;
-  beginQuest:         (quest: Quest, hardMode?: boolean) => void;
-  recordComponentFound: (opts: {
+  startChildSession:     (child: ChildSession) => void;
+  endChildSession:       () => void;
+  loadQuests:            () => Promise<void>;
+  beginQuest:            (quest: Quest, hardMode?: boolean) => void;
+  recordComponentFound:  (opts: {
     propertyWord:  string;
     objectUsed:    string;
     xpAwarded:     number;
     attemptCount:  number;
   }) => void;
-  recordMissedScan:   (propertyWord: string) => void;
-  completeQuest:      () => void;
-  abandonQuest:       () => void;
-  syncXpFromServer:   (newXp: number, newLevel: number) => void;
-  refreshChildFromDB: () => Promise<void>;
-  addWordToTome:      (entry: WordTomeEntry) => void;
-  setWordTomeCache:   (entries: WordTomeEntry[]) => void;
-  addScanHistory:     (item: ScanHistoryItem) => void;
-  clearScanHistory:   () => void;
-  markQuestCompletion: (questId: string, mode: "normal" | "hard", totalXp: number) => Promise<void>;
-  loadCompletedQuests: () => Promise<void>;
-  loadStreakData:       () => Promise<void>;
-  loadDailyQuest:      () => Promise<void>;
+  recordMissedScan:      (propertyWord: string) => void;
+  completeQuest:         () => void;
+  abandonQuest:          () => void;
+  syncXpFromServer:      (newXp: number, newLevel: number) => void;
+  refreshChildFromDB:    () => Promise<void>;
+  addWordToTome:         (entry: WordTomeEntry) => void;
+  setWordTomeCache:      (entries: WordTomeEntry[]) => void;
+  addScanHistory:        (item: ScanHistoryItem) => void;
+  clearScanHistory:      () => void;
+  markQuestCompletion:   (questId: string, mode: "normal" | "hard", totalXp: number) => Promise<void>;
+  loadCompletedQuests:   () => Promise<void>;
+  loadStreakData:         () => Promise<void>;
+  loadDailyQuest:        () => Promise<void>;
   recordDailyCompletion: (questId: string) => Promise<void>;
-  loadSpellBook:       () => Promise<void>;
+  loadSpellBook:         () => Promise<void>;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -314,6 +337,11 @@ export const useGameStore = create<GameState>()(
       hasSeenOnboarding:      false,
       markOnboardingComplete: () => set({ hasSeenOnboarding: true }),
 
+      // ── N4: Achievement initial state ──────────────────────
+      achievements:          [],
+      newlyEarnedBadges:     [],
+      isLoadingAchievements: false,
+
       // ── Session ────────────────────────────────────────────
       startChildSession: (child) => {
         const { activeChild: prev } = get();
@@ -333,6 +361,8 @@ export const useGameStore = create<GameState>()(
 
         get().loadStreakData();
         get().loadSpellBook();
+        // N4 — load earned badges on session start (fire & forget)
+        setTimeout(() => { get().loadAchievements(); }, 0);
       },
 
       endChildSession: () =>
@@ -347,6 +377,8 @@ export const useGameStore = create<GameState>()(
           streak:                DEFAULT_STREAK,
           dailyQuest:            DEFAULT_DAILY_QUEST,
           isDailyQuestComplete:  false,
+          achievements:          [],
+          newlyEarnedBadges:     [],
         }),
 
       // ── Quest library ──────────────────────────────────────
@@ -358,19 +390,28 @@ export const useGameStore = create<GameState>()(
             .from("quests")
             .select("*")
             .eq("is_active", true)
-            .order("tier", { ascending: true })
+            .order("tier",       { ascending: true })
             .order("sort_order", { ascending: true });
 
           if (error) throw error;
 
-          const filtered = (data ?? [])
-            .filter((q: Quest) =>
+          const filtered: Quest[] = (data ?? [])
+            .filter((q: any) =>
               activeChild ? childMinAgeBandOk(activeChild.age_band, q.min_age_band) : true
             )
+            .map((q: any): Quest => ({
+              ...q,
+              // Guarantee tier is always a valid QuestTier (never undefined)
+              tier:                 (q.tier as QuestTier) ?? "apprentice",
+              // Guarantee hard_mode_properties is always an array
+              hard_mode_properties: Array.isArray(q.hard_mode_properties)
+                ? q.hard_mode_properties
+                : [],
+            }))
             .sort((a: Quest, b: Quest) => {
               const tierDiff =
-                TIER_ORDER.indexOf(a.tier ?? "apprentice") -
-                TIER_ORDER.indexOf(b.tier ?? "apprentice");
+                TIER_ORDER.indexOf(a.tier) -
+                TIER_ORDER.indexOf(b.tier);
               if (tierDiff !== 0) return tierDiff;
               return (a.sort_order ?? 8) - (b.sort_order ?? 8);
             });
@@ -462,7 +503,7 @@ export const useGameStore = create<GameState>()(
       abandonQuest: () =>
         set((state) => {
           if (!state.activeQuest || !state.activeChild) return { activeQuest: null };
-          const earnedSoFar     = state.activeQuest.components
+          const earnedSoFar  = state.activeQuest.components
             .filter((c) => c.found)
             .reduce((sum, c) => sum + c.xpEarned, 0);
           const rolledBackXp    = Math.max(0, state.activeChild.total_xp - earnedSoFar);
@@ -574,6 +615,8 @@ export const useGameStore = create<GameState>()(
 
         get().recordDailyCompletion(questId);
         get().loadSpellBook();
+        // N4 — check for newly earned badges after quest complete
+        get().checkAndAwardBadges();
       },
 
       loadCompletedQuests: async () => {
@@ -743,6 +786,72 @@ export const useGameStore = create<GameState>()(
           set({ isLoadingSpells: false });
         }
       },
+
+      // ── N4: Achievement Badge System ───────────────────────
+
+      loadAchievements: async () => {
+        const { activeChild } = get();
+        if (!activeChild) return;
+        set({ isLoadingAchievements: true });
+        try {
+          const records = await loadEarnedAchievements(activeChild.id);
+          set({ achievements: records, isLoadingAchievements: false });
+        } catch {
+          set({ isLoadingAchievements: false });
+        }
+      },
+
+      checkAndAwardBadges: async () => {
+        const {
+          activeChild,
+          wordTomeCache,
+          streak,
+          completedQuestIds,
+          hardCompletedQuestIds,
+          spellBook,
+        } = get();
+        if (!activeChild) return;
+
+        // Always load fresh from DB — prevents double-awarding across sessions
+        const currentEarned = await loadEarnedAchievements(activeChild.id);
+
+        const ctx: BadgeCheckContext = {
+          childId:           activeChild.id,
+          totalXp:           activeChild.total_xp,
+          wordCount:         wordTomeCache.length,
+          streak:            streak.currentStreak,
+          completedQuestIds,
+          hardCompletedIds:  hardCompletedQuestIds,
+          completedTiers:    [...new Set(spellBook.map((s) => s.tier.toLowerCase()))],
+          hasScanned:        wordTomeCache.length > 0 || completedQuestIds.length > 0,
+        };
+
+        const newBadges = await checkAndAward(ctx, currentEarned);
+        if (newBadges.length === 0) return;
+
+        const nowStr     = new Date().toISOString();
+        const newRecords = newBadges.map((b) => ({ badge_id: b.id, earned_at: nowStr }));
+
+        // Update cache + push to toast queue
+        set((state) => ({
+          achievements:      [...state.achievements, ...newRecords],
+          newlyEarnedBadges: [...state.newlyEarnedBadges, ...newBadges],
+        }));
+
+        // Fire push notification per badge (stagger 1.5s apart)
+        newBadges.forEach((badge, i) => {
+          setTimeout(async () => {
+            try {
+              const { sendBadgeNotification } = await import("../lib/notifications");
+              await sendBadgeNotification(badge);
+            } catch { /* non-fatal */ }
+          }, i * 1500);
+        });
+      },
+
+      dismissEarnedBadge: () =>
+        set((state) => ({ newlyEarnedBadges: state.newlyEarnedBadges.slice(1) })),
+
     }),
 
     {
@@ -756,7 +865,8 @@ export const useGameStore = create<GameState>()(
         streak:                state.streak,
         isDailyQuestComplete:  state.isDailyQuestComplete,
         spellBook:             state.spellBook,
-        hasSeenOnboarding:     state.hasSeenOnboarding,   // ← N1
+        hasSeenOnboarding:     state.hasSeenOnboarding,
+        // achievements are NOT persisted — always loaded fresh from DB
       }),
     }
   )
@@ -767,70 +877,48 @@ export const useGameStore = create<GameState>()(
 export const selectCurrentComponent = (state: GameState): ComponentProgress | null =>
   state.activeQuest?.components.find((c) => !c.found) ?? null;
 
+export const selectCurrentAttempts = (state: GameState): number =>
+  state.activeQuest?.components.find((c) => !c.found)?.attemptCount ?? 0;
+
 export const selectQuestComplete = (state: GameState): boolean =>
   !!state.activeQuest && state.activeQuest.components.every((c) => c.found);
 
-export const selectCurrentAttempts = (state: GameState): number =>
-  selectCurrentComponent(state)?.attemptCount ?? 0;
+export const selectUnlockedTiers = (state: GameState): QuestTier[] => {
+  const completed = new Set(state.completedQuestIds);
+  const unlocked: QuestTier[] = [];
 
-export const selectLevelProgress = (state: GameState): number => {
-  const xp    = state.activeChild?.total_xp ?? 0;
-  const level = state.activeChild?.level ?? 1;
-  const prev  = Math.pow(level - 1, 2) * 50;
-  const next  = Math.pow(level, 2) * 50;
-  return next === prev ? 0 : Math.min(1, (xp - prev) / (next - prev));
-};
-
-export const selectHasHardMode = (quest: Quest): boolean =>
-  Array.isArray(quest.hard_mode_properties) && quest.hard_mode_properties.length > 0;
-
-export const selectQuestCompletionMode = (
-  state: GameState,
-  questId: string
-): "none" | "normal" | "hard" => {
-  if (state.hardCompletedQuestIds.includes(questId)) return "hard";
-  if (state.completedQuestIds.includes(questId)) return "normal";
-  return "none";
-};
-
-// ── v2.1 Tier selectors ───────────────────────────────────────────────────────
-
-export const selectTierCleared = (state: GameState, tier: QuestTier): boolean => {
-  const questsInTier = state.questLibrary.filter((q) => q.tier === tier);
-  if (questsInTier.length === 0) return false;
-  return questsInTier.every((q) => state.completedQuestIds.includes(q.id));
-};
-
-export const selectUnlockedTiers = (state: GameState): Set<QuestTier> => {
-  const unlocked = new Set<QuestTier>(["apprentice"]);
-  for (let i = 0; i < TIER_ORDER.length - 1; i++) {
-    const current = TIER_ORDER[i];
-    const next    = TIER_ORDER[i + 1];
-    if (selectTierCleared(state, current)) {
-      unlocked.add(next);
-    } else {
-      break;
-    }
+  for (const tier of TIER_ORDER) {
+    unlocked.push(tier);
+    const tierQuests = state.questLibrary.filter((q) => q.tier === tier);
+    const allDone    = tierQuests.length > 0 && tierQuests.every((q) => completed.has(q.id));
+    if (!allDone) break;
   }
+
   return unlocked;
 };
 
 export const selectQuestsGroupedByTier = (state: GameState): TierGroup[] => {
-  const unlocked = selectUnlockedTiers(state);
-  return TIER_ORDER
-    .map((tier) => ({
-      tier,
-      quests:   state.questLibrary.filter((q) => q.tier === tier),
-      unlocked: unlocked.has(tier),
-      cleared:  selectTierCleared(state, tier),
-    }))
-    .filter((group) => group.quests.length > 0);
+  const completed     = new Set(state.completedQuestIds);
+  const unlockedTiers = selectUnlockedTiers(state);
+
+  return TIER_ORDER.map((tier) => ({
+    tier,
+    quests:   state.questLibrary.filter((q) => q.tier === tier),
+    unlocked: unlockedTiers.includes(tier),
+    cleared:  state.questLibrary
+      .filter((q) => q.tier === tier)
+      .every((q) => completed.has(q.id)),
+  }));
 };
 
-// ── v2.3 Streak selectors ─────────────────────────────────────────────────────
+export const selectTierCleared = (tier: QuestTier) => (state: GameState): boolean => {
+  const tierQuests = state.questLibrary.filter((q) => q.tier === tier);
+  const completed  = new Set(state.completedQuestIds);
+  return tierQuests.length > 0 && tierQuests.every((q) => completed.has(q.id));
+};
 
 export const selectStreakMultiplier = (state: GameState): number =>
-  state.streak?.gotMultiplier ? 2.0 : 1.0;
+  state.streak.gotMultiplier ? 2.0 : 1.0;
 
 export const selectIsPlayingDailyQuest = (state: GameState): boolean =>
   !!state.activeQuest &&
@@ -841,8 +929,6 @@ export const selectDailyQuest = (state: GameState): Quest | null =>
   state.dailyQuest.questId
     ? (state.questLibrary.find((q) => q.id === state.dailyQuest.questId) ?? null)
     : null;
-
-// ── v2.4 Spell Book selectors ─────────────────────────────────────────────────
 
 export const selectSpellsUnlockedCount = (state: GameState): number => {
   const unique = new Set(state.spellBook.map((s) => s.questId));
@@ -855,19 +941,47 @@ export const selectSpellsByTier = (
 ): SpellUnlock[] =>
   state.spellBook.filter((s) => s.tier === tier);
 
-// ── Age-band property helper ───────────────────────────────────────────────────
+// ── Missing selectors (QuestMapScreen) ────────────────────────────────────────
 
 /**
- * Returns the vocabulary properties that will actually be used when a child
- * plays a quest — mirroring the priority logic in beginQuest().
- *
- * Priority:
- *   1. age_band_properties[ageBand]  (enriched with definitions if bare)
- *   2. required_properties            (fallback)
- *
- * Use this everywhere word chips are rendered so the UI always matches
- * what the child will actually have to scan for.
+ * Per-quest completion mode — takes (state, questId).
+ * Called as: useGameStore((s) => selectQuestCompletionMode(s, quest.id))
+ * Returns the highest mode the child has completed this quest in, or null.
  */
+export const selectQuestCompletionMode = (
+  state:   GameState,
+  questId: string
+): "normal" | "hard" | null => {
+  if (state.hardCompletedQuestIds.includes(questId))   return "hard";
+  if (state.completedQuestIds.includes(questId))        return "normal";
+  return null;
+};
+
+/**
+ * Pure function — takes a Quest object, NOT the store state.
+ * Called as: selectHasHardMode(quest)
+ * Returns true when the quest has hard-mode properties defined.
+ */
+export const selectHasHardMode = (quest: Quest): boolean =>
+  Array.isArray(quest.hard_mode_properties) && quest.hard_mode_properties.length > 0;
+
+/**
+ * Returns fractional XP progress toward the next level (0 – 1).
+ * XP formula mirrors the server-side award_xp stored procedure:
+ *   level = floor(sqrt(total_xp / 50)) + 1
+ *   threshold_for_level_n = (n-1)^2 * 50
+ */
+export const selectLevelProgress = (state: GameState): number => {
+  const xp    = state.activeChild?.total_xp ?? 0;
+  const level = Math.max(1, state.activeChild?.level ?? 1);
+  const lo    = Math.pow(level - 1, 2) * 50;
+  const hi    = Math.pow(level, 2) * 50;
+  const range = hi - lo;
+  if (range <= 0) return 1;
+  return Math.min(1, Math.max(0, (xp - lo) / range));
+};
+
+// ── Age-band property helper ───────────────────────────────────────────────────
 export function getDisplayProperties(
   quest: Quest,
   ageBand: string

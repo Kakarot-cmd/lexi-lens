@@ -34,22 +34,23 @@ import { supabase } from "./lib/supabase";
 
 // ─── Navigation param lists ───────────────────────────────────────────────────
 
- import type { RootStackParamList, AuthStackParamList } from "./types/navigation";
+import type { RootStackParamList, AuthStackParamList } from "./types/navigation";
 
 // ─── Screens ──────────────────────────────────────────────────────────────────
 
-import { AuthScreen } from "./screens/AuthScreen";
+import { AuthScreen }          from "./screens/AuthScreen";
 import { ChildSwitcherScreen } from "./screens/ChildSwitcherScreen";
-import { QuestMapScreen } from "./screens/QuestMapScreen";
-import { ParentDashboard } from "./screens/ParentDashboard";
-import SpellBookScreen from "./screens/SpellBookScreen";
-// FIX TS2614: QuestGeneratorScreen uses a default export — import accordingly
-import QuestGeneratorScreen from "./screens/QuestGeneratorScreen";
-import { OnboardingScreen } from "./screens/OnboardingScreen";
+import { QuestMapScreen }      from "./screens/QuestMapScreen";
+import { ParentDashboard }     from "./screens/ParentDashboard";
+import SpellBookScreen         from "./screens/SpellBookScreen";
+import QuestGeneratorScreen    from "./screens/QuestGeneratorScreen";
+import { OnboardingScreen }    from "./screens/OnboardingScreen";
 
-// ─── Error boundary ───────────────────────────────────────────────────────────
+// ─── Components ───────────────────────────────────────────────────────────────
 
-import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ErrorBoundary }           from "./components/ErrorBoundary";
+// N4 — Achievement badge toast overlay (global, above all screens)
+import { AchievementToastOverlay } from "./components/AchievementToast";
 
 // ─── Store ────────────────────────────────────────────────────────────────────
 
@@ -77,7 +78,6 @@ const ScanScreen = Platform.OS === "web"
   : require("./screens/ScanScreen").ScanScreen;
 
 // ─── Navigators ───────────────────────────────────────────────────────────────
-// Typed with param lists so screen route props resolve correctly in strict mode.
 
 const AuthNav = createNativeStackNavigator<AuthStackParamList>();
 const AppNav  = createNativeStackNavigator<RootStackParamList>();
@@ -85,10 +85,6 @@ const AppNav  = createNativeStackNavigator<RootStackParamList>();
 function AuthNavigator() {
   return (
     <AuthNav.Navigator screenOptions={{ headerShown: false }}>
-      {/*
-        FIX TS2559: AuthScreen accepts zero props — don't spread navigator
-        props into it.  The screen manages its own navigation via useNavigation.
-      */}
       <AuthNav.Screen name="Auth">
         {() => (
           <ErrorBoundary screen="AuthScreen">
@@ -146,8 +142,6 @@ function AppNavigator() {
       <AppNav.Screen name="QuestGenerator">
         {({ navigation }) => (
           <ErrorBoundary screen="QuestGeneratorScreen">
-            {/* QuestGeneratorScreen is a modal component: always visible when
-                navigated to; onClose pops back to the previous screen. */}
             <QuestGeneratorScreen
               visible={true}
               onClose={() => navigation.goBack()}
@@ -156,7 +150,7 @@ function AppNavigator() {
         )}
       </AppNav.Screen>
 
-      {/* ── N1: First-session onboarding ────────────────────────────────── */}
+      {/* ── N1: First-session onboarding ──────────────────────────────────── */}
       <AppNav.Screen name="Onboarding">
         {(props) => (
           <ErrorBoundary screen="OnboardingScreen">
@@ -171,11 +165,10 @@ function AppNavigator() {
 // ─── Root component ───────────────────────────────────────────────────────────
 
 function App() {
-  const [session, setSession] = useState<Session | null>(null);
+  const [session, setSession]           = useState<Session | null>(null);
   const [initialising, setInitialising] = useState(true);
-  const activeChild = useGameStore((s) => s.activeChild);
+  const activeChild                     = useGameStore((s) => s.activeChild);
 
-  // Navigation ref — feeds screen names into Sentry breadcrumbs
   const navigationRef = useNavigationContainerRef();
 
   // ── Auth listener ──────────────────────────────────────────────────────────
@@ -195,42 +188,35 @@ function App() {
         } else {
           addGameBreadcrumb({
             category: "auth",
-            message: "Session established",
-            data: { userId: s.user.id },
+            message:  "Session established",
+            data:     { userId: s.user.id },
           });
         }
       }
     );
 
     // ── Deep-link handler — email-confirmation redirect ─────────────────────
-    // When the user taps the confirmation link in their email client, the OS
-    // opens the app via the "lexilens://auth/confirm" custom scheme.
-    // Supabase appends either a PKCE ?code=… param (v2 default) or a legacy
-    // #access_token=… fragment. We handle both.
-
     const handleDeepLink = async ({ url }: { url: string | null }) => {
       if (!url) return;
       try {
         const parsed = new URL(url);
 
-        // PKCE code exchange — Supabase JS v2 default
         const code = parsed.searchParams.get("code");
         if (code) {
           const { error } = await supabase.auth.exchangeCodeForSession(code);
           if (error) {
             addGameBreadcrumb({
               category: "auth",
-              message: "Email confirm code exchange failed",
-              data: { error: error.message },
+              message:  "Email confirm code exchange failed",
+              data:     { error: error.message },
             });
           }
           return;
         }
 
-        // Legacy implicit-flow fragment: #access_token=…&refresh_token=…
         const fragment = parsed.hash.replace(/^#/, "");
         if (fragment) {
-          const params       = new URLSearchParams(fragment);
+          const params        = new URLSearchParams(fragment);
           const access_token  = params.get("access_token");
           const refresh_token = params.get("refresh_token");
           if (access_token && refresh_token) {
@@ -242,10 +228,7 @@ function App() {
       }
     };
 
-    // Cold-start: app launched directly via the confirmation link
     Linking.getInitialURL().then((url) => handleDeepLink({ url }));
-
-    // Warm-start: app was already running when the link was tapped
     const linkingSub = Linking.addEventListener("url", handleDeepLink);
 
     return () => {
@@ -254,7 +237,7 @@ function App() {
     };
   }, []);
 
-  // ── Sentry user context — sync whenever active child changes ──────────────
+  // ── Sentry user context ────────────────────────────────────────────────────
 
   useEffect(() => {
     if (activeChild && session?.user) {
@@ -265,8 +248,8 @@ function App() {
       });
       addGameBreadcrumb({
         category: "auth",
-        message: "Active child set",
-        data: { childId: activeChild.id },
+        message:  "Active child set",
+        data:     { childId: activeChild.id },
       });
     }
   }, [activeChild?.id, session?.user?.id]);
@@ -278,8 +261,8 @@ function App() {
     if (route) {
       addGameBreadcrumb({
         category: "navigation",
-        message: `→ ${route.name}`,
-        data: { routeName: route.name },
+        message:  `→ ${route.name}`,
+        data:     { routeName: route.name },
       });
       Sentry.setTag("active_screen", route.name);
     }
@@ -304,10 +287,13 @@ function App() {
         >
           {session ? <AppNavigator /> : <AuthNavigator />}
         </NavigationContainer>
+
+        {/* N4 — Badge toast overlay — floats above all screens, touches pass through */}
+        <AchievementToastOverlay />
+
       </SafeAreaProvider>
     </ErrorBoundary>
   );
 }
 
-// Sentry.wrap() registers the JS-level global error handler.
 export default Sentry.wrap(App);
