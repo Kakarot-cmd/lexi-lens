@@ -16,6 +16,13 @@
  *   • Step 2 adds an "+ Add property" dashed button (visible when count < 5).
  *   • A "N / 5" badge sits top-right of the properties section.
  *
+ * Validation changes (Phase word-audit):
+ *   • buildKnownWordsSet() replaces inline Supabase tome query — fixes forAllChildren gap.
+ *   • validateQuestWords() runs client-side after Edge Function returns — catches both
+ *     required_properties AND hard_mode_properties that Claude may have repeated.
+ *   • StepPreview shows an amber warning banner + flagged property cards when any
+ *     known word slips through. Non-blocking — parent can still save or regenerate.
+ *
  * The saved quest appears in the child's QuestMap immediately
  * (visibility: 'private', created_by: parent uid).
  */
@@ -37,6 +44,12 @@ import {
 } from "react-native";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
+import {
+  buildKnownWordsSet,
+  validateQuestWords,
+  flaggedRequiredIndexSet,
+  type ValidationResult,
+} from "../utils/questValidation";
 
 const { width: W } = Dimensions.get("window");
 
@@ -319,18 +332,28 @@ function PropertyEditor({
   onChange,
   onDelete,
   canDelete,
+  isFlagged = false,
 }: {
-  prop:      PropertyRequirement;
-  index:     number;
-  onChange:  (updated: PropertyRequirement) => void;
-  onDelete:  () => void;
-  canDelete: boolean;
+  prop:       PropertyRequirement;
+  index:      number;
+  onChange:   (updated: PropertyRequirement) => void;
+  onDelete:   () => void;
+  canDelete:  boolean;
+  isFlagged?: boolean;
 }) {
   return (
-    <View style={styles.propEditor}>
-      {/* Header: label + delete */}
+    <View style={[styles.propEditor, isFlagged && styles.propEditorFlagged]}>
+      {/* Header: label + flagged badge + delete */}
       <View style={styles.propHeader}>
         <Text style={styles.propIndex}>Property {index + 1}</Text>
+
+        {/* Amber "Already in Tome" badge — only shown when flagged */}
+        {isFlagged && (
+          <View style={styles.flaggedBadge}>
+            <Text style={styles.flaggedBadgeText}>⚠ Already in Tome</Text>
+          </View>
+        )}
+
         {canDelete && (
           <TouchableOpacity
             onPress={() => {
@@ -386,16 +409,23 @@ function StepPreview({
   onSave,
   onRegenerate,
   saving,
+  validationResult,
 }: {
-  quest:        GeneratedQuest;
-  ageBand:      AgeBand;
-  tier:         Tier;
-  onSave:       (q: GeneratedQuest) => void;
-  onRegenerate: () => void;
-  saving:       boolean;
+  quest:             GeneratedQuest;
+  ageBand:           AgeBand;
+  tier:              Tier;
+  onSave:            (q: GeneratedQuest) => void;
+  onRegenerate:      () => void;
+  saving:            boolean;
+  validationResult?: ValidationResult | null;
 }) {
   const [quest, setQuest] = useState<GeneratedQuest>(initial);
   const color = TIER_COLOR[tier];
+
+  // Pre-compute which required_property indices are flagged — O(1) lookup in the list.
+  const flaggedReqIdxs = validationResult
+    ? flaggedRequiredIndexSet(validationResult)
+    : new Set<number>();
 
   // ── Property handlers ─────────────────────────────────────────────────────
   const updateProp = (i: number, updated: PropertyRequirement) => {
@@ -437,6 +467,24 @@ function StepPreview({
     >
       <Text style={styles.stepTitle}>📜 Preview Your Quest</Text>
       <Text style={styles.stepSub}>Edit any field before saving to your child's dungeon.</Text>
+
+      {/* ── Validation warning banner ─────────────────────────────────────────
+          Only shown when at least one word slipped through that the child
+          already knows. Non-blocking — parent can regenerate or edit manually. */}
+      {validationResult && !validationResult.isClean && (
+        <View style={styles.validationBanner}>
+          <Text style={styles.validationBannerIcon}>⚠</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.validationBannerTitle}>
+              {validationResult.totalFlags} word
+              {validationResult.totalFlags > 1 ? "s" : ""} already in child's Tome
+            </Text>
+            <Text style={styles.validationBannerBody}>
+              {validationResult.summary}
+            </Text>
+          </View>
+        </View>
+      )}
 
       {/* Quest identity card */}
       <View style={[styles.previewCard, { borderColor: color }]}>
@@ -546,6 +594,7 @@ function StepPreview({
           onChange={(u) => updateProp(i, u)}
           onDelete={() => deleteProp(i)}
           canDelete={!atMin}
+          isFlagged={flaggedReqIdxs.has(i)}
         />
       ))}
 
@@ -655,28 +704,30 @@ export default function QuestGeneratorScreen({
   defaultAgeBand = "7-8",
   targetChild,
 }: Props) {
-  const [step,           setStep]           = useState<Step>("input");
-  const [theme,          setTheme]          = useState("");
-  const [ageBand,        setAgeBand]        = useState<AgeBand>(defaultAgeBand);
-  const [tier,           setTier]           = useState<Tier>("apprentice");
-  const [propCount,      setPropCount]      = useState(3);           // ← NEW
-  const [generated,      setGenerated]      = useState<GeneratedQuest | null>(null);
-  const [savedQuest,     setSavedQuest]     = useState<GeneratedQuest | null>(null);
-  const [saving,         setSaving]         = useState(false);
-  const [error,          setError]          = useState<string | null>(null);
-  const [forAllChildren, setForAllChildren] = useState(!targetChild);
+  const [step,             setStep]             = useState<Step>("input");
+  const [theme,            setTheme]            = useState("");
+  const [ageBand,          setAgeBand]          = useState<AgeBand>(defaultAgeBand);
+  const [tier,             setTier]             = useState<Tier>("apprentice");
+  const [propCount,        setPropCount]        = useState(3);
+  const [generated,        setGenerated]        = useState<GeneratedQuest | null>(null);
+  const [savedQuest,       setSavedQuest]       = useState<GeneratedQuest | null>(null);
+  const [saving,           setSaving]           = useState(false);
+  const [error,            setError]            = useState<string | null>(null);
+  const [forAllChildren,   setForAllChildren]   = useState(!targetChild);
+  const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
 
   const reset = useCallback(() => {
     setStep("input");
     setTheme("");
     setAgeBand(defaultAgeBand);
     setTier("apprentice");
-    setPropCount(3);                                                 // ← reset to default
+    setPropCount(3);
     setGenerated(null);
     setSavedQuest(null);
     setError(null);
     setSaving(false);
     setForAllChildren(!targetChild);
+    setValidationResult(null);           // clear warnings when starting a fresh quest
   }, [targetChild, defaultAgeBand]);
 
   // ── Call Edge Function ────────────────────────────────────────────────────
@@ -684,17 +735,31 @@ export default function QuestGeneratorScreen({
     inputTheme:     string,
     inputBand:      AgeBand,
     inputTier:      Tier,
-    inputPropCount: number,                                          // ← NEW
+    inputPropCount: number,
   ) => {
     setTheme(inputTheme);
     setAgeBand(inputBand);
     setTier(inputTier);
-    setPropCount(inputPropCount);                                    // ← persist for regen
+    setPropCount(inputPropCount);
     setStep("generating");
     setError(null);
+    setValidationResult(null);           // clear any previous warnings while generating
 
     try {
-      let knownWords:     string[] = [];
+      const childId = targetChild?.id ?? null;
+
+      // ── Build known-words Set ──────────────────────────────────────────────
+      // buildKnownWordsSet handles both single-child and forAllChildren modes.
+      // Previously: only fetched if childId existed, leaving forAllChildren with
+      // an empty knownWords list — the server guard was silently bypassed.
+      // Now: when childId is null it unions ALL children's word_tomes so every
+      // sibling's vocabulary is excluded from the generated quest.
+      const knownWordsSet = await buildKnownWordsSet(childId, forAllChildren);
+      const knownWords    = Array.from(knownWordsSet);
+
+      // ── Mastery profile — separate query, still needs scores ──────────────
+      // knownWordsSet is words-only; the mastery profile needs score + timesUsed
+      // to calibrate Claude's difficulty. Only relevant for a specific child.
       let masteryProfile: Array<{
         word:        string;
         mastery:     number;
@@ -702,7 +767,6 @@ export default function QuestGeneratorScreen({
         timesUsed:   number;
       }> = [];
 
-      const childId = targetChild?.id ?? null;
       if (childId) {
         const { data: tomeData } = await supabase
           .from("word_tome")
@@ -710,7 +774,6 @@ export default function QuestGeneratorScreen({
           .eq("child_id", childId);
 
         if (tomeData && tomeData.length > 0) {
-          knownWords = tomeData.map((r: any) => r.word as string);
           masteryProfile = tomeData.map((r: any) => {
             const score: number = r.mastery_score ?? 0;
             const mt =
@@ -728,12 +791,13 @@ export default function QuestGeneratorScreen({
         }
       }
 
+      // ── Invoke Edge Function ───────────────────────────────────────────────
       const { data, error: fnError } = await supabase.functions.invoke("generate-quest", {
         body: {
           theme:         inputTheme,
           ageBand:       inputBand,
           tier:          inputTier,
-          propCount:     inputPropCount,    // ← NEW: tell Claude exactly how many to generate
+          propCount:     inputPropCount,
           knownWords,
           masteryProfile,
         },
@@ -742,14 +806,24 @@ export default function QuestGeneratorScreen({
       if (fnError) throw new Error(fnError.message ?? "Generation failed");
       if (!data?.quest) throw new Error("No quest returned from AI");
 
-      setGenerated(data.quest);
+      // ── Client-side validation ─────────────────────────────────────────────
+      // The Edge Function already guards required_properties server-side, but:
+      //   1. hard_mode_properties are NOT checked server-side.
+      //   2. Claude occasionally slips a known word through anyway (~5% rate).
+      //   3. The server guard only fires a 422 — this surfaces inline warnings
+      //      instead of a crash, giving parents context and a Regenerate option.
+      const generatedQuest = data.quest;
+      const result         = validateQuestWords(generatedQuest, knownWordsSet);
+      setValidationResult(result);
+      setGenerated(generatedQuest);
       setStep("preview");
+
     } catch (err: any) {
       setError(err.message ?? "Something went wrong");
       setStep("input");
       Alert.alert("Generation failed", err.message ?? "Please try again.");
     }
-  }, [targetChild]);
+  }, [targetChild, forAllChildren]);   // forAllChildren added — affects knownWords fetch
 
   // ── Save to Supabase ──────────────────────────────────────────────────────
   const handleSave = useCallback(async (quest: GeneratedQuest) => {
@@ -867,6 +941,7 @@ export default function QuestGeneratorScreen({
             onSave={handleSave}
             onRegenerate={() => handleGenerate(theme, ageBand, tier, propCount)}
             saving={saving}
+            validationResult={validationResult}
           />
         )}
         {step === "saved" && savedQuest && (
@@ -894,22 +969,22 @@ const styles = StyleSheet.create({
     alignItems:        "center",
     justifyContent:    "space-between",
     paddingHorizontal: 20,
-    paddingTop:        Platform.OS === "ios" ? 16 : 20,
+    paddingTop:        Platform.OS === "ios" ? 16 : 12,
     paddingBottom:     12,
     borderBottomWidth: 1,
     borderBottomColor: P.warmBorder,
-    backgroundColor:   P.cream,
   },
-  headerTitle:   { fontSize: 18, fontWeight: "700", color: P.inkBrown },
-  headerBtn:     { paddingVertical: 4, paddingHorizontal: 4 },
+  headerTitle: { fontSize: 17, fontWeight: "700", color: P.inkBrown },
+  headerBtn:   { paddingHorizontal: 4, paddingVertical: 4 },
   headerBtnText: { fontSize: 15, color: P.purple, fontWeight: "600" },
 
-  // Step indicator
+  // Stepper
   stepper: {
-    flexDirection:   "row",
-    alignItems:      "center",
-    justifyContent:  "center",
+    flexDirection:  "row",
+    alignItems:     "center",
+    justifyContent: "center",
     paddingVertical: 12,
+    gap: 8,
   },
   stepDot: {
     width:           28,
@@ -921,47 +996,34 @@ const styles = StyleSheet.create({
     alignItems:      "center",
     justifyContent:  "center",
   },
-  stepDotActive: { backgroundColor: P.purple, borderColor: P.purple },
-  stepDotDone:   { backgroundColor: P.green,  borderColor: P.green  },
-  stepDotText:   { fontSize: 12, fontWeight: "700", color: P.white  },
-  stepLine: {
-    width:            48,
-    height:           2,
-    backgroundColor:  P.warmBorder,
-    marginHorizontal: 6,
-  },
-  stepLineDone: { backgroundColor: P.green },
+  stepDotActive: { backgroundColor: P.purple,   borderColor: P.purple   },
+  stepDotDone:   { backgroundColor: P.amber,    borderColor: P.amber    },
+  stepDotText:   { fontSize: 12, fontWeight: "700", color: P.white },
+  stepLine:      { flex: 1, height: 1, backgroundColor: P.warmBorder,    maxWidth: 60 },
+  stepLineDone:  { backgroundColor: P.amber },
 
-  stepPad: {
-    paddingHorizontal: 20,
-    paddingTop:        12,
-    paddingBottom:     40,
-  },
-
-  // Step 1 — shared
+  // Shared step layout
+  stepPad: { paddingHorizontal: 20, paddingBottom: 40, paddingTop: 8 },
   stepTitle: {
     fontSize:     22,
     fontWeight:   "800",
     color:        P.inkBrown,
     marginBottom: 6,
-    letterSpacing: -0.3,
+    marginTop:    8,
   },
   stepSub: {
     fontSize:     14,
     color:        P.inkLight,
     lineHeight:   20,
-    marginBottom: 24,
+    marginBottom: 20,
   },
-  fieldLabel: {
-    fontSize:     13,
-    fontWeight:   "600",
-    color:        P.inkMid,
-    marginBottom: 8,
-  },
+
+  // Theme input
+  fieldLabel: { fontSize: 13, fontWeight: "700", color: P.inkMid, marginBottom: 8 },
   themeInput: {
     backgroundColor:   P.white,
     borderRadius:      12,
-    borderWidth:       1,
+    borderWidth:       1.5,
     borderColor:       P.warmBorder,
     paddingHorizontal: 14,
     paddingVertical:   12,
@@ -970,87 +1032,59 @@ const styles = StyleSheet.create({
     minHeight:         80,
     textAlignVertical: "top",
   },
-  charCount: {
-    fontSize:  11,
-    color:     P.inkFaint,
-    textAlign: "right",
-    marginTop: 4,
-  },
+  charCount: { fontSize: 11, color: P.inkFaint, textAlign: "right", marginTop: 4 },
 
-  // ── Property count picker ──────────────────────────────────────────────────
-  propCountSub: {
-    fontSize:     12,
-    color:        P.inkLight,
-    lineHeight:   17,
-    marginBottom: 10,
-  },
-  propCountRow: {
-    flexDirection: "row",
-    gap:           8,
-  },
+  // Property count picker
+  propCountSub: { fontSize: 12, color: P.inkLight, marginBottom: 10, lineHeight: 17 },
+  propCountRow: { flexDirection: "row", gap: 8, marginBottom: 4 },
   propCountChip: {
-    flex:            1,
-    alignItems:      "center",
-    paddingVertical: 10,
-    borderRadius:    10,
-    borderWidth:     1.5,
-    borderColor:     P.warmBorder,
-    backgroundColor: P.white,
+    flex:              1,
+    paddingVertical:   10,
+    borderRadius:      10,
+    borderWidth:       1.5,
+    borderColor:       P.warmBorder,
+    backgroundColor:   P.white,
+    alignItems:        "center",
   },
   propCountChipActive: {
     borderColor:     P.purple,
-    backgroundColor: "#f5f3ff",
+    backgroundColor: P.purpleLight,
   },
-  propCountNum: {
-    fontSize:   18,
-    fontWeight: "800",
-    color:      P.inkMid,
-  },
+  propCountNum: { fontSize: 16, fontWeight: "700", color: P.inkMid },
   propCountNumActive: { color: P.purple },
-  propCountDesc: {
-    fontSize:  10,
-    fontWeight: "600",
-    color:     P.inkFaint,
-    marginTop: 2,
-  },
+  propCountDesc: { fontSize: 10, color: P.inkFaint, marginTop: 2 },
   propCountDescActive: { color: P.purple },
 
-  // Age / tier chips
-  chipRow: {
-    flexDirection: "row",
-    flexWrap:      "wrap",
-  },
+  // Age band chips
+  chipRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   chip: {
-    width:           "47%",
-    alignItems:      "center",
-    paddingVertical: 10,
-    borderRadius:    10,
-    backgroundColor: P.parchment,
-    borderWidth:     1,
-    borderColor:     P.warmBorder,
-    marginRight:     "3%",
-    marginBottom:    8,
+    paddingVertical:   8,
+    paddingHorizontal: 14,
+    borderRadius:      10,
+    borderWidth:       1.5,
+    borderColor:       P.warmBorder,
+    backgroundColor:   P.white,
+    alignItems:        "center",
+    minWidth:          (W - 56) / 4,
   },
-  chipLabel: { fontSize: 14, fontWeight: "700", color: P.inkMid },
-  chipDesc:  { fontSize: 10, color: P.inkFaint, marginTop: 2 },
-  tierRow: {
-    flexDirection: "row",
-    flexWrap:      "wrap",
-  },
+  chipLabel: { fontSize: 13, fontWeight: "700", color: P.inkMid },
+  chipDesc:  { fontSize: 10, color: P.inkFaint, marginTop: 1 },
+
+  // Tier chips
+  tierRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   tierChip: {
-    width:           "47%",
-    alignItems:      "center",
-    paddingVertical: 10,
-    borderRadius:    10,
-    backgroundColor: P.parchment,
-    borderWidth:     1.5,
-    borderColor:     P.warmBorder,
-    marginRight:     "3%",
-    marginBottom:    8,
+    flex:              1,
+    paddingVertical:   10,
+    borderRadius:      10,
+    borderWidth:       1.5,
+    borderColor:       P.warmBorder,
+    backgroundColor:   P.white,
+    alignItems:        "center",
+    minWidth:          (W - 72) / 4,
   },
-  tierEmoji:     { fontSize: 20, marginBottom: 3 },
-  tierChipLabel: { fontSize: 13, fontWeight: "700", color: P.inkMid },
-  tierChipDesc:  { fontSize: 10, color: P.inkFaint, marginTop: 2 },
+  tierEmoji:      { fontSize: 20 },
+  tierChipLabel:  { fontSize: 12, fontWeight: "700", color: P.inkMid, marginTop: 4 },
+  tierChipDesc:   { fontSize: 10, color: P.inkFaint },
 
   // Generate button
   generateBtn: {
@@ -1058,33 +1092,28 @@ const styles = StyleSheet.create({
     borderRadius:    14,
     paddingVertical: 15,
     alignItems:      "center",
-    marginTop:       24,
+    marginTop:       28,
+    marginBottom:    16,
   },
   generateBtnDisabled: { backgroundColor: P.inkFaint },
-  generateBtnText: {
-    color:         P.white,
-    fontSize:      16,
-    fontWeight:    "700",
-    letterSpacing: 0.3,
-  },
+  generateBtnText: { color: P.white, fontSize: 16, fontWeight: "700" },
 
-  // Target child chips
+  // Child targeting row
   targetRow: {
     flexDirection: "row",
     alignItems:    "center",
-    marginTop:     16,
-    marginBottom:  4,
-    flexWrap:      "wrap",
     gap:           8,
+    flexWrap:      "wrap",
+    marginBottom:  8,
   },
-  targetLabel: { fontSize: 13, fontWeight: "600", color: P.inkMid, marginRight: 4 },
+  targetLabel:       { fontSize: 13, color: P.inkLight, fontWeight: "600" },
   targetChip: {
     paddingVertical:   6,
     paddingHorizontal: 12,
     borderRadius:      20,
     borderWidth:       1,
     borderColor:       P.warmBorder,
-    backgroundColor:   P.parchment,
+    backgroundColor:   P.white,
   },
   targetChipActive: {
     borderColor:     P.purple,
@@ -1099,6 +1128,35 @@ const styles = StyleSheet.create({
     textAlign: "center",
     marginTop: 12,
     lineHeight: 16,
+  },
+
+  // ── Validation warning banner ─────────────────────────────────────────────
+  validationBanner: {
+    flexDirection:   "row",
+    alignItems:      "flex-start",
+    gap:             10,
+    backgroundColor: P.amberLight,
+    borderWidth:     1,
+    borderColor:     P.amberBorder,
+    borderRadius:    10,
+    padding:         12,
+    marginBottom:    14,
+  },
+  validationBannerIcon: {
+    fontSize:   16,
+    lineHeight: 20,
+    color:      P.amber,
+  },
+  validationBannerTitle: {
+    fontSize:     13,
+    fontWeight:   "700",
+    color:        "#92400e",
+    marginBottom: 2,
+  },
+  validationBannerBody: {
+    fontSize:   12,
+    color:      "#b45309",
+    lineHeight: 17,
   },
 
   // ── Step 2 — preview card ─────────────────────────────────────────────────
@@ -1215,6 +1273,12 @@ const styles = StyleSheet.create({
     padding:         14,
     marginBottom:    12,
   },
+  // Amber variant when this word is already in the child's Tome
+  propEditorFlagged: {
+    borderColor:     P.amberBorder,
+    borderWidth:     1.5,
+    backgroundColor: P.amberLight,
+  },
   propHeader: {
     flexDirection:  "row",
     alignItems:     "center",
@@ -1222,6 +1286,22 @@ const styles = StyleSheet.create({
     marginBottom:   6,
   },
   propIndex:      { fontSize: 12, fontWeight: "700", color: P.purple },
+
+  // "Already in Tome" badge inside a flagged property card
+  flaggedBadge: {
+    backgroundColor:   "#fef3c7",
+    borderRadius:      6,
+    paddingHorizontal: 7,
+    paddingVertical:   2,
+    marginRight:       "auto",  // push delete button to far right
+    marginLeft:        8,
+  },
+  flaggedBadgeText: {
+    fontSize:   11,
+    color:      P.amber,
+    fontWeight: "600",
+  },
+
   propDeleteBtn: {
     paddingVertical:   3,
     paddingHorizontal: 10,
