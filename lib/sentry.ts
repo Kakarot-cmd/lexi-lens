@@ -152,7 +152,8 @@ export type GameBreadcrumbCategory =
   | "auth"          // login / logout
   | "mastery"       // word mastery updates
   | "cache"         // Redis hit / miss
-  | "xp";           // XP awarded
+  | "xp"            // XP awarded
+  | "pdf_export";   // Word Tome PDF generation
 
 export function addGameBreadcrumb(opts: {
   category: GameBreadcrumbCategory;

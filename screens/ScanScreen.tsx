@@ -265,8 +265,8 @@ function QuestIntro({
   isHardMode,
   onBegin,
 }: {
-  quest:               NonNullable<ReturnType<typeof useGameStore>["activeQuest"]>["quest"];
-  effectiveProperties: NonNullable<ReturnType<typeof useGameStore>["activeQuest"]>["effectiveProperties"];
+  quest:               NonNullable<ReturnType<typeof useGameStore.getState>["activeQuest"]>["quest"];
+  effectiveProperties: NonNullable<ReturnType<typeof useGameStore.getState>["activeQuest"]>["effectiveProperties"];
   isHardMode:          boolean;
   onBegin:             () => void;
 }) {

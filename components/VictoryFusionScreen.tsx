@@ -42,6 +42,7 @@ import Animated, {
   interpolate,
   Easing,
   runOnJS,
+  SharedValue,
 } from "react-native-reanimated";
 import * as Haptics from "expo-haptics";
 import LottieView from "lottie-react-native";
@@ -260,7 +261,7 @@ interface WordRowProps {
   propertyWord: string;
   objectUsed:   string | null;
   index:        number;
-  parentOp:     Animated.SharedValue<number>;
+  parentOp:     SharedValue<number>;
   wordBg:       string;
   wordColor:    string;
   objColor:     string;

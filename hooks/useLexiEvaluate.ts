@@ -48,6 +48,7 @@
 
 import { useState, useCallback, useRef } from "react";
 import * as FileSystem from "expo-file-system";
+import { EncodingType } from "expo-file-system";
 import { supabase } from "../lib/supabase";
 import {
   updateMastery,
@@ -183,7 +184,7 @@ class RateLimitResponseError extends Error {
 async function uriToBase64(uri: string): Promise<string | null> {
   try {
     const base64 = await FileSystem.readAsStringAsync(uri, {
-      encoding: FileSystem.EncodingType.Base64,
+      encoding: EncodingType.Base64,
     });
     if (base64.length > MAX_FRAME_BASE64_CHARS) {
       console.warn("[LexiEvaluate] Frame too large — sending without image");
