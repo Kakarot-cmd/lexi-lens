@@ -39,6 +39,7 @@ export default {
       infoPlist: {
         NSCameraUsageDescription:
           "Lexi-Lens uses your camera to scan real-world objects and bring vocabulary quests to life.",
+		ITSAppUsesNonExemptEncryption: false,
       },
     },
 
