@@ -121,38 +121,38 @@ jobs:
   #   ✅  iOS distribution certificate + provisioning profile configured in EAS
   #   ✅  eas.json `ios` profile filled out (already stubbed below)
   #
-  # build-ios:
-  #   name: EAS · iOS production IPA
-  #   runs-on: ubuntu-latest
-  #   needs: typecheck
-  #   timeout-minutes: 15
-  #
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #
-  #     - uses: actions/setup-node@v4
-  #       with:
-  #         node-version: '20'
-  #         cache: 'npm'
-  #
-  #     - name: Setup EAS
-  #       uses: expo/expo-github-action@v8
-  #       with:
-  #         eas-version: latest
-  #         token: ${{ secrets.EXPO_TOKEN }}
-  #
-  #     - name: Install dependencies
-  #       run: npm ci
-  #
-  #     - name: EAS Build · iOS production
-  #       run: |
-  #         eas build \
-  #           --platform ios \
-  #           --profile ios \
-  #           --non-interactive \
-  #           --no-wait
-  #
-  #     - name: iOS build submitted
-  #       run: |
-  #         echo "### 🍎 iOS IPA submitted to EAS" >> $GITHUB_STEP_SUMMARY
-  #         echo "Monitor at expo.dev · Profile: \`ios\`" >> $GITHUB_STEP_SUMMARY
+   build-ios:
+     name: EAS · iOS production IPA
+     runs-on: ubuntu-latest
+     needs: typecheck
+     timeout-minutes: 15
+  
+     steps:
+       - uses: actions/checkout@v4
+  
+       - uses: actions/setup-node@v4
+         with:
+           node-version: '20'
+           cache: 'npm'
+  
+       - name: Setup EAS
+         uses: expo/expo-github-action@v8
+         with:
+           eas-version: latest
+           token: ${{ secrets.EXPO_TOKEN }}
+  
+       - name: Install dependencies
+         run: npm ci
+  
+       - name: EAS Build · iOS production
+         run: |
+           eas build \
+             --platform ios \
+             --profile ios \
+             --non-interactive \
+             --no-wait
+  
+       - name: iOS build submitted
+         run: |
+           echo "### 🍎 iOS IPA submitted to EAS" >> $GITHUB_STEP_SUMMARY
+           echo "Monitor at expo.dev · Profile: \`ios\`" >> $GITHUB_STEP_SUMMARY
