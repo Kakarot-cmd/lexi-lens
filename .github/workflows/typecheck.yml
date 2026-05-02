@@ -78,7 +78,7 @@ jobs:
     # To harden: go to Settings → Security and analysis → Dependency graph → Enable
     # then remove the continue-on-error line below.
     continue-on-error: true
-
+ 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
