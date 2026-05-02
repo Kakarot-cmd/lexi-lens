@@ -63,6 +63,8 @@ import { MasteryRadarPanel }    from "../components/MasteryRadarPanel";
 // 2.6 — PDF Export
 import { usePdfExport }         from "../hooks/usePdfExport";
 
+import SiblingLeaderboard from "../components/SiblingLeaderboard";
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface ChildProfile {
@@ -131,11 +133,7 @@ const P = {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-type RootStackParamList = {
-  QuestMap:        undefined;
-  ParentDashboard: undefined;
-  Auth:            undefined;    // v2.4 — navigate here after account deletion
-};
+import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "ParentDashboard">;
 
 function xpToNextLevel(currentXp: number, level: number): number {
@@ -739,6 +737,11 @@ export function ParentDashboard({ navigation }: Props) {
                 childName={selectedChild.display_name}
                 refreshKey={sessionRefreshKey}
               />
+			  <SiblingLeaderboard
+  activeChildId={selectedChild?.id ?? null}
+  refreshKey={refreshKey}
+  onAddSibling={() => navigation.navigate("ChildSwitcher")}
+/>
             </View>
           )}
 

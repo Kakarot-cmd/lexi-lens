@@ -33,23 +33,8 @@ import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./lib/supabase";
 
 // ─── Navigation param lists ───────────────────────────────────────────────────
-// Typed navigators fix the RouteProp<ParamListBase, …> mismatch that tsc
-// catches in strict mode.  Screen files that define a local RootStackParamList
-// will match structurally as long as the route names align.
 
-export type AuthStackParamList = {
-  Auth: undefined;
-};
-
-export type RootStackParamList = {
-  ChildSwitcher: undefined;
-  QuestMap: undefined;
-  Scan: undefined;
-  ParentDashboard: undefined;
-  SpellBook: undefined;
-  QuestGenerator: undefined;
-  Onboarding: undefined;
-};
+ import type { RootStackParamList, AuthStackParamList } from "./types/navigation";
 
 // ─── Screens ──────────────────────────────────────────────────────────────────
 

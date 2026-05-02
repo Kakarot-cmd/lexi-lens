@@ -54,12 +54,7 @@ import {
 import { DailyQuestBanner } from "../components/DailyQuestBanner";
 import { StreakBar }         from "../components/StreakBar";
 
-type RootStackParamList = {
-  QuestMap:       undefined;
-  Scan:           { questId: string; hardMode?: boolean };
-  SpellBook:      undefined;
-  ParentDashboard:undefined;
-};
+import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "QuestMap">;
 
 // ─── Palette ──────────────────────────────────────────────────────────────────

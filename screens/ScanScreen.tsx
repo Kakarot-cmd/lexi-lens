@@ -54,9 +54,7 @@ import { RateLimitWall, ApproachingLimitBanner } from "../components/RateLimitWa
 
 // ─── Navigation types ─────────────────────────────────────────────────────────
 
-type RootStackParamList = {
-  Scan: { questId: string; hardMode?: boolean };
-};
+import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "Scan">;
 
 type ScreenPhase =

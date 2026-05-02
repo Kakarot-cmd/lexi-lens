@@ -68,15 +68,7 @@ import { useGameStore } from "../store/gameStore";
 // Must stay consistent with the RootStackParamList in App.tsx after you add
 // "Onboarding: undefined" there (see _patches/App.additions.ts).
 
-type RootStackParamList = {
-  ChildSwitcher:   undefined;
-  QuestMap:        undefined;
-  Scan:            { questId: string; hardMode?: boolean };
-  ParentDashboard: undefined;
-  SpellBook:       undefined;
-  QuestGenerator:  undefined;
-  Onboarding:      undefined;
-};
+ import type { RootStackParamList } from "../types/navigation";
 
 type Props = NativeStackScreenProps<RootStackParamList, "Onboarding">;
 

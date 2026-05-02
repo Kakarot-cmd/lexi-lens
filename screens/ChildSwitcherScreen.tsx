@@ -33,13 +33,7 @@ import { useGameStore }       from "../store/gameStore";
 
 // ─── Navigation types ─────────────────────────────────────────────────────────
 
-type RootStackParamList = {
-  Auth:            undefined;
-  ChildSwitcher:   undefined;
-  QuestMap:        undefined;
-  ParentDashboard: undefined;
-  Onboarding:      undefined;   // ← N1
-};
+import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "ChildSwitcher">;
 
 // ─── Constants ────────────────────────────────────────────────────────────────

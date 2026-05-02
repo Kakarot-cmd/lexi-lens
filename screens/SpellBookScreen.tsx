@@ -34,11 +34,7 @@ import { useGameStore, QuestTier, TIER_META, TIER_ORDER } from "../store/gameSto
 
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
-type RootStackParamList = {
-  QuestMap:  undefined;
-  Scan:      { questId: string; hardMode?: boolean };
-  SpellBook: undefined;
-};
+import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "SpellBook">;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
