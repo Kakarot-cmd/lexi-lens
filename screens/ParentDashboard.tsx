@@ -60,6 +60,8 @@ import { PrivacyPolicyScreen }  from "../components/PrivacyPolicyScreen";
 import { RecentSessionsPanel }  from "../components/RecentSessionsPanel";
 // N3 — Mastery Radar panel
 import { MasteryRadarPanel }    from "../components/MasteryRadarPanel";
+// 2.6 — PDF Export
+import { usePdfExport }         from "../hooks/usePdfExport";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -321,6 +323,16 @@ export function ParentDashboard({ navigation }: Props) {
   const [cancellingDeletion,   setCancellingDeletion]   = useState(false);
   // N5 / N3 — bumped on pull-to-refresh so RecentSessionsPanel + MasteryRadarPanel reload in sync
   const [sessionRefreshKey,    setSessionRefreshKey]    = useState(0);
+
+  // 2.6 — PDF export
+  const {
+    exportPdf,
+    isExporting,
+    statusMessage,
+    error:  exportError,
+    status: exportStatus,
+    reset:  resetExport,
+  } = usePdfExport();
 
   const selectedChild = dashboard?.child ?? null;
 
@@ -620,7 +632,65 @@ export function ParentDashboard({ navigation }: Props) {
               <View style={styles.wordCountBadge}>
                 <Text style={styles.wordCountText}>{dashboard.wordTome.length}</Text>
               </View>
+
+              {/* 2.6 — PDF Export button */}
+              <TouchableOpacity
+                style={[styles.exportBtn, isExporting && styles.exportBtnLoading]}
+                onPress={() => {
+                  if (!selectedChild) return;
+                  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                  exportPdf(selectedChild.id, selectedChild.display_name);
+                }}
+                disabled={isExporting || dashboard.wordTome.length === 0}
+                accessibilityLabel={
+                  isExporting
+                    ? statusMessage
+                    : `Export ${selectedChild?.display_name ?? "child"}'s Word Tome as PDF`
+                }
+                accessibilityRole="button"
+              >
+                {isExporting ? (
+                  <ActivityIndicator size="small" color={P.amberAccent} />
+                ) : (
+                  <Text style={styles.exportBtnText}>
+                    {dashboard.wordTome.length === 0 ? "📄 No words yet" : "📄 Export PDF"}
+                  </Text>
+                )}
+              </TouchableOpacity>
             </View>
+            {/* 2.6 — Export status feedback */}
+            {isExporting && (
+              <View style={styles.exportStatus}>
+                <Text style={styles.exportStatusText}>{statusMessage}</Text>
+              </View>
+            )}
+            {exportStatus === "done" && (
+              <View style={[styles.exportStatus, styles.exportStatusDone]}>
+                <Text style={[styles.exportStatusText, styles.exportStatusTextDone]}>
+                  ✅ Portfolio exported successfully!
+                </Text>
+                <TouchableOpacity
+                  onPress={resetExport}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Text style={styles.exportStatusDismiss}>Dismiss</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+            {exportStatus === "error" && exportError && (
+              <View style={[styles.exportStatus, styles.exportStatusError]}>
+                <Text style={[styles.exportStatusText, styles.exportStatusTextError]}>
+                  ⚠ {exportError}
+                </Text>
+                <TouchableOpacity
+                  onPress={resetExport}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Text style={styles.exportStatusDismiss}>Retry</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
             <Text style={styles.sectionDesc}>
               Every word {selectedChild?.display_name} has learned, with the real object they used to prove it.
             </Text>
@@ -951,6 +1021,64 @@ const styles = StyleSheet.create({
     borderColor:       P.amberBorder,
   },
   wordCountText: { fontSize: 12, fontWeight: "600", color: P.amberAccent },
+
+  // 2.6 — PDF export button
+  exportBtn: {
+    flexDirection:     "row",
+    alignItems:        "center",
+    gap:               4,
+    backgroundColor:   P.amberLight,
+    borderRadius:      8,
+    paddingHorizontal: 10,
+    paddingVertical:   5,
+    borderWidth:       1,
+    borderColor:       P.amberBorder,
+    marginLeft:        "auto",
+    minWidth:          38,
+    justifyContent:    "center",
+  },
+  exportBtnLoading: { opacity: 0.7 },
+  exportBtnText: {
+    fontSize:   12,
+    fontWeight: "600",
+    color:      P.amberAccent,
+  },
+  // Export status feedback strip
+  exportStatus: {
+    flexDirection:     "row",
+    alignItems:        "center",
+    justifyContent:    "space-between",
+    backgroundColor:   P.amberLight,
+    borderRadius:      8,
+    borderWidth:       1,
+    borderColor:       P.amberBorder,
+    paddingHorizontal: 12,
+    paddingVertical:   8,
+    marginTop:         8,
+    marginBottom:      4,
+    gap:               8,
+  },
+  exportStatusDone: {
+    backgroundColor: "#f0fdf4",
+    borderColor:     "#86efac",
+  },
+  exportStatusError: {
+    backgroundColor: "#fff7ed",
+    borderColor:     "#fed7aa",
+  },
+  exportStatusText: {
+    fontSize:   12,
+    color:      P.amberAccent,
+    flex:       1,
+    flexShrink: 1,
+  },
+  exportStatusTextDone:  { color: "#166534" },
+  exportStatusTextError: { color: "#c2410c" },
+  exportStatusDismiss: {
+    fontSize:   11,
+    color:      P.inkLight,
+    fontWeight: "600",
+  },
 
   // Search
   searchInput: {
