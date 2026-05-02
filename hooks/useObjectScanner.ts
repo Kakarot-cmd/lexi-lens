@@ -187,8 +187,7 @@ export function useObjectScanner({
       try {
         // Low quality — only need ML Kit labels, not a nice image
         const photo = await cameraRef.current.takeSnapshot({
-          quality:      30,
-          skipMetadata: true,
+          quality: 30,
         });
 
         const uri = photo.path.startsWith("file://")
@@ -223,8 +222,7 @@ export function useObjectScanner({
     try {
       // High quality snapshot — sent to Claude for image evaluation
       const photo = await cameraRef.current.takeSnapshot({
-        quality:      80,
-        skipMetadata: true,
+        quality: 80,
       });
 
       const uri = photo.path.startsWith("file://")

@@ -558,6 +558,12 @@ const styles = StyleSheet.create({
   headerTitle: { fontSize: 22, fontWeight: "800", color: P.textPrimary },
   headerSub:   { fontSize: 13, color: P.textMuted, marginTop: 1 },
 
+  headerCenter: {
+    flex:           1,
+    alignItems:     "center",
+    justifyContent: "center",
+  },
+
   headerRight: {
     flexDirection: "row",
     alignItems:    "center",

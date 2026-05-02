@@ -265,8 +265,8 @@ function QuestIntro({
   isHardMode,
   onBegin,
 }: {
-  quest:               NonNullable<ReturnType<typeof useGameStore>["activeQuest"]>["quest"];
-  effectiveProperties: NonNullable<ReturnType<typeof useGameStore>["activeQuest"]>["effectiveProperties"];
+  quest:               NonNullable<ReturnType<typeof useGameStore.getState>["activeQuest"]>["quest"];
+  effectiveProperties: NonNullable<ReturnType<typeof useGameStore.getState>["activeQuest"]>["effectiveProperties"];
   isHardMode:          boolean;
   onBegin:             () => void;
 }) {
@@ -522,7 +522,9 @@ export function ScanScreen({ route, navigation }: Props) {
         failedAttempts:     currentAttempts,
         xp_reward_first_try:  activeQuest.quest.xp_reward_first_try  ?? 40,
         xp_reward_retry:      activeQuest.quest.xp_reward_retry      ?? 25,
-        xp_reward_third_plus: activeQuest.quest.xp_reward_third_plus ?? 10,
+        // xp_reward_third_plus exists in DB but is not yet in the Quest TS type
+        // TODO: add xp_reward_third_plus?: number to the Quest type definition
+        xp_reward_third_plus: (activeQuest.quest as any).xp_reward_third_plus ?? 10,
       });
     },
   });

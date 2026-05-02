@@ -1,0 +1,158 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Lexi-Lens  ·  EAS Production Build
+#
+# Triggers : git tag matching  v<major>.<minor>.<patch>
+#             e.g.  git tag v1.0.0 && git push origin v1.0.0
+#
+# Jobs     :
+#   1. typecheck      — strict tsc --noEmit (fast fail before burning EAS quota)
+#   2. build-android  — EAS Android production AAB (submitted to EAS cloud)
+#   3. build-ios      — EAS iOS production IPA  [READY — activate post Apple
+#                       Developer enrollment + EAS Production plan]
+#
+# EAS builds run on Expo's cloud workers — the GitHub runner only submits the
+# job and exits  (--no-wait).  Monitor progress at expo.dev/accounts/<you>.
+#
+# Required secret  :  EXPO_TOKEN
+# See              :  .github/SETUP.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: 🚀 EAS Production Build
+
+on:
+  push:
+    tags:
+      # Matches v1.0.0, v1.2.3, v2.0.0 — rejects v1.0.0-beta, v1.0, etc.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 0. Validate the tag is proper semver ───────────────────────────────────
+  validate-tag:
+    name: Validate semver tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+
+    steps:
+      - name: Parse tag
+        id: parse
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "### 🏷️ Building tag: \`$TAG\`  →  version \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+
+  # ── 1. TypeScript pre-flight ───────────────────────────────────────────────
+  typecheck:
+    name: TypeScript · pre-flight
+    runs-on: ubuntu-latest
+    needs: validate-tag
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      - name: TS pre-flight passed
+        run: echo "### ✅ TypeScript pre-flight passed for \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ── 2. Android production AAB ──────────────────────────────────────────────
+  build-android:
+    name: EAS · Android production AAB
+    runs-on: ubuntu-latest
+    needs: typecheck
+    timeout-minutes: 15   # submitting to EAS is fast; the actual build is on Expo servers
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # expo/expo-github-action installs EAS CLI and exports EXPO_TOKEN
+      - name: Setup EAS
+        uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      # --no-wait  : submit job to EAS cloud and exit — don't block the runner
+      # --non-interactive : no prompts in CI
+      # autoIncrement:true in eas.json will bump versionCode automatically
+      - name: EAS Build · Android production
+        run: |
+          eas build \
+            --platform android \
+            --profile production \
+            --non-interactive \
+            --no-wait
+
+      - name: Android build submitted
+        run: |
+          echo "### 🤖 Android AAB submitted to EAS" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Monitor at [expo.dev](https://expo.dev) · Build profile: \`production\`" >> $GITHUB_STEP_SUMMARY
+          echo "EAS will email you when the AAB is ready for Play Store upload." >> $GITHUB_STEP_SUMMARY
+
+  # ── 3. iOS production IPA  [ACTIVATE when Apple Developer enrolled] ────────
+  #
+  # Uncomment this entire job block when you have:
+  #   ✅  Apple Developer account ($99/yr — enroll at developer.apple.com)
+  #   ✅  EAS Production plan ($99/mo — for M4 Pro iOS build workers)
+  #   ✅  iOS distribution certificate + provisioning profile configured in EAS
+  #   ✅  eas.json `ios` profile filled out (already stubbed below)
+  #
+  # build-ios:
+  #   name: EAS · iOS production IPA
+  #   runs-on: ubuntu-latest
+  #   needs: typecheck
+  #   timeout-minutes: 15
+  #
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - uses: actions/setup-node@v4
+  #       with:
+  #         node-version: '20'
+  #         cache: 'npm'
+  #
+  #     - name: Setup EAS
+  #       uses: expo/expo-github-action@v8
+  #       with:
+  #         eas-version: latest
+  #         token: ${{ secrets.EXPO_TOKEN }}
+  #
+  #     - name: Install dependencies
+  #       run: npm ci
+  #
+  #     - name: EAS Build · iOS production
+  #       run: |
+  #         eas build \
+  #           --platform ios \
+  #           --profile ios \
+  #           --non-interactive \
+  #           --no-wait
+  #
+  #     - name: iOS build submitted
+  #       run: |
+  #         echo "### 🍎 iOS IPA submitted to EAS" >> $GITHUB_STEP_SUMMARY
+  #         echo "Monitor at expo.dev · Profile: \`ios\`" >> $GITHUB_STEP_SUMMARY

@@ -38,9 +38,11 @@ export async function setForegroundNotificationBehavior(): Promise<void> {
     const N = await getNotifications();
     N.setNotificationHandler({
       handleNotification: async () => ({
-        shouldShowAlert: true,
-        shouldPlaySound: true,
-        shouldSetBadge:  false,
+        shouldShowAlert:  true,   // legacy Android path
+        shouldShowBanner: true,   // iOS 14+ banner (expo-notifications ≥0.28)
+        shouldShowList:   true,   // iOS 14+ notification centre
+        shouldPlaySound:  true,
+        shouldSetBadge:   false,
       }),
     });
   } catch {

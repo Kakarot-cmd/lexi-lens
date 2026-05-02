@@ -39,12 +39,13 @@ const STATUS_CONFIG: Record<
   EvaluateStatus,
   { color: string; bg: string; showDots: boolean }
 > = {
-  idle:       { color: "rgba(200,200,255,0.7)", bg: "rgba(15,6,32,0.75)",  showDots: false },
-  converting: { color: "#c4b5fd",               bg: "rgba(15,6,32,0.85)",  showDots: true  },
-  evaluating: { color: "#fde68a",               bg: "rgba(20,8,50,0.9)",   showDots: true  },
-  match:      { color: "#86efac",               bg: "rgba(5,46,22,0.9)",   showDots: false },
-  "no-match": { color: "#fca5a5",               bg: "rgba(42,10,10,0.9)", showDots: false },
-  error:      { color: "#fca5a5",               bg: "rgba(30,10,10,0.85)",showDots: false },
+  idle:         { color: "rgba(200,200,255,0.7)", bg: "rgba(15,6,32,0.75)",  showDots: false },
+  converting:   { color: "#c4b5fd",               bg: "rgba(15,6,32,0.85)",  showDots: true  },
+  evaluating:   { color: "#fde68a",               bg: "rgba(20,8,50,0.9)",   showDots: true  },
+  match:        { color: "#86efac",               bg: "rgba(5,46,22,0.9)",   showDots: false },
+  "no-match":   { color: "#fca5a5",               bg: "rgba(42,10,10,0.9)", showDots: false },
+  error:        { color: "#fca5a5",               bg: "rgba(30,10,10,0.85)",showDots: false },
+  rate_limited: { color: "#fbbf24",               bg: "rgba(30,15,0,0.9)",   showDots: false },
 };
 
 function getBannerText(
@@ -64,6 +65,8 @@ function getBannerText(
       return "✦ Component found!";
     case "no-match":
       return "Not quite…";
+    case "rate_limited":
+      return "Daily limit reached…";
     case "error":
       return "Lens flickered";
   }

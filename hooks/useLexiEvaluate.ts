@@ -48,6 +48,8 @@
 
 import { useState, useCallback, useRef } from "react";
 import * as FileSystem from "expo-file-system";
+// EncodingType is not re-exported from expo-file-system 19.x namespace;
+// use the string literal "base64" which the API accepts directly.
 import { supabase } from "../lib/supabase";
 import {
   updateMastery,
@@ -183,7 +185,7 @@ class RateLimitResponseError extends Error {
 async function uriToBase64(uri: string): Promise<string | null> {
   try {
     const base64 = await FileSystem.readAsStringAsync(uri, {
-      encoding: FileSystem.EncodingType.Base64,
+      encoding: "base64",
     });
     if (base64.length > MAX_FRAME_BASE64_CHARS) {
       console.warn("[LexiEvaluate] Frame too large — sending without image");
