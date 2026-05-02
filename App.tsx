@@ -159,9 +159,14 @@ function AppNavigator() {
       </AppNav.Screen>
 
       <AppNav.Screen name="QuestGenerator">
-        {(props) => (
+        {({ navigation }) => (
           <ErrorBoundary screen="QuestGeneratorScreen">
-            <QuestGeneratorScreen {...props} />
+            {/* QuestGeneratorScreen is a modal component: always visible when
+                navigated to; onClose pops back to the previous screen. */}
+            <QuestGeneratorScreen
+              visible={true}
+              onClose={() => navigation.goBack()}
+            />
           </ErrorBoundary>
         )}
       </AppNav.Screen>
