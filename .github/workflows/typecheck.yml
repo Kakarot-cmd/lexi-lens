@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Lexi-Lens  ·  TypeScript gate
+#
+# Triggers : every PR targeting main  +  every direct push to main
+# Purpose  : `tsc --noEmit` (strict) — catches type regressions before they
+#             reach the branch.  Zero native toolchain required.
+# Bonus    : Dependency-review scans new npm packages added in a PR for
+#             known CVEs (HIGH or CRITICAL) — free on public repos.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: ✅ Typecheck
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write  # lets dependency-review annotate PR files
+
+concurrency:
+  group: typecheck-${{ github.ref }}
+  cancel-in-progress: true   # cancel redundant runs when you push again fast
+
+jobs:
+  # ── 1. TypeScript strict check ─────────────────────────────────────────────
+  typecheck:
+    name: TypeScript · strict
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Node 20 LTS  ·  npm cache is keyed automatically to package-lock.json
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # ci = respects package-lock.json exactly, faster than install
+      - name: Install dependencies
+        run: npm ci
+
+      # Print version so failures are easy to correlate to a TS release
+      - name: TypeScript version
+        run: npx tsc --version
+
+      # The real gate.
+      # expo/tsconfig.base already sets moduleResolution:bundler + noEmit:true
+      # so this is safe without emitting any JS.
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      # Emit a one-line job summary visible in the Actions tab
+      - name: Job summary
+        if: success()
+        run: |
+          echo "### ✅ TypeScript passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| TS version | $(npx tsc --version) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ref | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ── 2. Dependency vulnerability scan (PRs only) ────────────────────────────
+  dependency-review:
+    name: Dependency CVE scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Compares the npm dependency diff between base and head.
+      # Fails if any newly introduced package has a HIGH or CRITICAL CVE.
+      # Only runs on PRs, not on direct pushes — where there's no diff to scan.
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          # Allow known false positives here if needed — example:
+          # allow-ghsas: GHSA-xxxx-xxxx-xxxx
