@@ -107,8 +107,21 @@ async function cacheSet(key: string, value: unknown): Promise<void> {
   } catch { /* non-fatal */ }
 }
 
-function buildCacheKey(detectedLabel: string, questId: string): string {
-  const raw = `${detectedLabel.toLowerCase().trim()}::${questId}`;
+function buildCacheKey(
+  detectedLabel: string,
+  questId:       string,
+  pendingWords:  string[]
+): string {
+  // FIX (Boredom Behemoth chip-stuck-grey): pending property words are
+  // part of the cache key so a first-attempt cache hit never returns a
+  // response shaped for a different pending set.
+  //
+  // Without this: scan 1 evaluated [a,b,c] and cached. Later scan with
+  // pending=[b,c] would cache-hit and return [a,b,c]'s response — Claude's
+  // verdict feedback then references properties no longer in the chip
+  // strip, causing the "all 3 available but chips greyed out" mismatch.
+  const sortedWords = [...pendingWords].map((w) => w.toLowerCase().trim()).sort().join(",");
+  const raw = `${detectedLabel.toLowerCase().trim()}::${questId}::${sortedWords}`;
   return `lexi:eval:${btoa(raw).replace(/=/g, "")}`;
 }
 
@@ -374,7 +387,14 @@ serve(async (req: Request) => {
   }
 
   // ── 4. Redis cache check ──────────────────────────────────────────────────
-  const cacheKey     = buildCacheKey(detectedLabel as string, (questId as string) ?? "");
+  // Pending words from this scan are baked into the cache key — see
+  // buildCacheKey for the rationale.
+  const pendingWords = Array.isArray(requiredProperties)
+    ? (requiredProperties as Array<{ word?: unknown }>)
+        .map((p) => (typeof p?.word === "string" ? p.word : ""))
+        .filter((w) => w.length > 0)
+    : [];
+  const cacheKey     = buildCacheKey(detectedLabel as string, (questId as string) ?? "", pendingWords);
   const cachedResult = (failedAttempts as number ?? 0) === 0
     ? await cacheGet(cacheKey)
     : null;
@@ -400,6 +420,12 @@ serve(async (req: Request) => {
       failedAttempts:     failedAttempts as number | undefined,
       questName:          questName as string | undefined,
       masteryProfile:     masteryProfile as Parameters<typeof evaluateObject>[0]["masteryProfile"],
+      // FIX: alreadyFoundWords was being received but never forwarded —
+      // Claude couldn't acknowledge prior progress in feedback, which made
+      // multi-scan verdicts feel disconnected from earlier wins.
+      alreadyFoundWords:  Array.isArray(alreadyFoundWords)
+        ? (alreadyFoundWords as unknown[]).filter((w): w is string => typeof w === "string")
+        : [],
       xpRates,   // XP FIX: pass per-quest rates through to evaluateObject
     });
   } catch (err) {

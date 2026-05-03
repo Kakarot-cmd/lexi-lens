@@ -52,6 +52,7 @@ import { VerdictCard }                           from "../components/VerdictCard
 import { StatusBanner }                          from "../components/StatusBanner";
 import { VictoryFusionScreen }                   from "../components/VictoryFusionScreen";
 import { RateLimitWall, ApproachingLimitBanner } from "../components/RateLimitWall";
+import { addGameBreadcrumb }                     from "../lib/sentry";
 
 // ─── Navigation types ─────────────────────────────────────────────────────────
 
@@ -578,13 +579,30 @@ export function ScanScreen({ route, navigation }: Props) {
     if (status === "match" || status === "no-match") {
       setPhase("verdict");
 
+      // Lowercase-trim everywhere — defends against Claude returning
+      // case-different or whitespace-padded property words.
       const alreadyFound = new Set(
-        (aq.components ?? []).filter((c) => c.found).map((c) => c.propertyWord)
+        (aq.components ?? [])
+          .filter((c) => c.found)
+          .map((c) => c.propertyWord.toLowerCase().trim())
       );
 
-      const newlyPassing = (result.properties ?? []).filter(
-        (p) => p.passes && !alreadyFound.has(p.word)
+      // Build a canonical-word map from effectiveProperties so every
+      // recorded update uses the EXACT casing the components were built
+      // with — no chance of a Map lookup miss in the gameStore reducer.
+      const canonicalMap = new Map(
+        (aq.effectiveProperties ?? []).map((p) => [
+          p.word.toLowerCase().trim(),
+          p.word,
+        ])
       );
+
+      const newlyPassing = (result.properties ?? []).filter((p) => {
+        const key = p.word.toLowerCase().trim();
+        // Must have passed AND not be already found AND match a known
+        // pending property (defends against Claude inventing a word).
+        return p.passes && !alreadyFound.has(key) && canonicalMap.has(key);
+      });
 
       if (newlyPassing.length > 0) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -595,9 +613,11 @@ export function ScanScreen({ route, navigation }: Props) {
         // ATOMIC: bundle all property unlocks into one set() call so concurrent
         // updates can't race and clobber each other. See gameStore comment on
         // recordComponentsFound for full explanation of why this matters.
+        // Use the CANONICAL word from effectiveProperties — never Claude's
+        // raw word — so the reducer's component lookup always succeeds.
         recordComponentsFound(
           newlyPassing.map((p) => ({
-            propertyWord: p.word,
+            propertyWord: canonicalMap.get(p.word.toLowerCase().trim()) ?? p.word,
             objectUsed:   result.resolvedObjectName,
             xpAwarded:    xpEach,
             attemptCount: currentAttempts + 1,
@@ -606,10 +626,13 @@ export function ScanScreen({ route, navigation }: Props) {
 
         // Word Tome additions stay per-property (each row is independent in DB)
         newlyPassing.forEach((p) => {
-          const req = (aq.effectiveProperties ?? []).find((r) => r.word === p.word);
+          const canonicalWord = canonicalMap.get(p.word.toLowerCase().trim()) ?? p.word;
+          const req = (aq.effectiveProperties ?? []).find(
+            (r) => r.word.toLowerCase().trim() === canonicalWord.toLowerCase().trim()
+          );
           if (req) {
             addWordToTome({
-              word:            p.word,
+              word:            canonicalWord,
               definition:      req.definition,
               exemplar_object: result.resolvedObjectName,
               times_used:      1,
@@ -635,6 +658,56 @@ export function ScanScreen({ route, navigation }: Props) {
 
     if (status === "error") setPhase("verdict");
   }, [status, result]);
+
+  // ── Verdict-vs-state watchdog ────────────────────────────────────────────
+  // Catches a class of bug where Claude returns properties with passes:true
+  // but the chip stayed grey afterwards (typically because of word-case
+  // mismatch, a stale cache hit returning a property word that doesn't
+  // match the canonical effectiveProperties, or any future regression).
+  //
+  // If this fires, it means the verdict card is showing successes that
+  // didn't translate into store updates — exactly the "all 3 available
+  // but chips greyed out" symptom from the Boredom Behemoth report.
+  //
+  // The fix path (canonical-word resolution + case-insensitive matching)
+  // upstream of this should mean it never fires. If it does, we'll see it
+  // in Sentry breadcrumbs and know there's a new mismatch to investigate.
+  useEffect(() => {
+    if (!result || (status !== "match" && status !== "no-match")) return;
+
+    const aq = useGameStore.getState().activeQuest;
+    if (!aq) return;
+
+    const passingFromClaude = (result.properties ?? [])
+      .filter((p) => p.passes)
+      .map((p) => p.word.toLowerCase().trim());
+
+    if (passingFromClaude.length === 0) return;
+
+    const foundInStore = new Set(
+      aq.components
+        .filter((c) => c.found)
+        .map((c) => c.propertyWord.toLowerCase().trim())
+    );
+
+    const missing = passingFromClaude.filter((w) => !foundInStore.has(w));
+
+    if (missing.length > 0) {
+      addGameBreadcrumb({
+        category: "verdict",
+        message:  "verdict_state_mismatch",
+        data: {
+          questId:           aq.quest.id,
+          questName:         aq.quest.name,
+          missingProperties: missing,
+          claudeReturned:    passingFromClaude,
+          componentsFound:   Array.from(foundInStore),
+          effectiveWords:    (aq.effectiveProperties ?? []).map((p) => p.word),
+          detectedLabel:     lastLabel,
+        },
+      });
+    }
+  }, [status, result, lastLabel]);
 
   const handleContinue = useCallback(() => {
     // Read questComplete directly from store at call time to avoid

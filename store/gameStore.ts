@@ -507,8 +507,13 @@ export const useGameStore = create<GameState>()(
         set((state) => {
           if (!state.activeQuest) return state;
 
+          // FIX (Boredom Behemoth chip-stuck-grey): match case-insensitively.
+          // Claude occasionally returns property words with different casing
+          // ("Fibrous" vs canonical "fibrous"). Strict equality silently misses
+          // those, leaving chips grey even though Claude flagged passes:true.
+          const target = propertyWord.toLowerCase().trim();
           const components = state.activeQuest.components.map((c) =>
-            c.propertyWord === propertyWord
+            c.propertyWord.toLowerCase().trim() === target
               ? { ...c, found: true, objectUsed, xpEarned: xpAwarded, attemptCount }
               : c
           );
@@ -545,10 +550,15 @@ export const useGameStore = create<GameState>()(
         set((state) => {
           if (!state.activeQuest || updates.length === 0) return state;
 
-          const updateMap = new Map(updates.map((u) => [u.propertyWord, u]));
+          // FIX (Boredom Behemoth chip-stuck-grey): match case-insensitively.
+          // Map keys lowercase-trim so "Fibrous" → "fibrous" lookup succeeds
+          // when canonical components.propertyWord is "fibrous".
+          const updateMap = new Map(
+            updates.map((u) => [u.propertyWord.toLowerCase().trim(), u])
+          );
 
           const components = state.activeQuest.components.map((c) => {
-            const update = updateMap.get(c.propertyWord);
+            const update = updateMap.get(c.propertyWord.toLowerCase().trim());
             return update
               ? {
                   ...c,

@@ -66,6 +66,13 @@ interface EvaluateObjectOptions {
   questName?:         string;
   masteryProfile?:    MasteryEntry[];
   /**
+   * Words the child has already won in earlier scans this quest.
+   * Sent so Claude can acknowledge progress in feedback without
+   * re-evaluating them, AND so it doesn't claim a property "passes"
+   * for one that's no longer in the requiredProperties list.
+   */
+  alreadyFoundWords?: string[];
+  /**
    * XP FIX — per-quest XP rates from the DB (xp_reward_first_try / xp_reward_retry).
    * When supplied the Edge Function uses these instead of the hardcoded constants so
    * the value shown on the quest card matches what actually gets awarded.
@@ -248,6 +255,12 @@ RULES:
    Name every property that passed. If none passed, give one gentle observation.
 6. nudgeHint: only if failedAttempts >= 2. Guide without naming the answer.
 
+CONSISTENCY (critical — do not violate):
+- The "properties" array MUST contain one entry per word listed in the user message.
+- Use each property word with the EXACT spelling and case as listed — no capitalisation, pluralisation, or rewording.
+- Do NOT include any word that wasn't listed (especially not words from "Already won this quest").
+- childFeedback may ONLY reference property words that have passes:true in the JSON. Never claim a property passed in feedback while marking it passes:false in the JSON, or vice versa.
+
 Respond ONLY with valid JSON — no preamble, no markdown fences:
 {
   "resolvedObjectName": "corrected label",
@@ -291,22 +304,30 @@ function buildUserMessage(
           .join("\n")
       : null;
 
+  // FIX (chip-stuck-grey): include already-found words so Claude doesn't
+  // pretend they're being re-evaluated, AND so feedback can naturally
+  // celebrate cumulative progress without referencing words off the list.
+  const alreadyFoundContext =
+    opts.alreadyFoundWords && opts.alreadyFoundWords.length > 0
+      ? `\nAlready won this quest (do NOT include these in your "properties" array — they are off the table for this scan): ${opts.alreadyFoundWords.join(", ")}\n`
+      : "";
+
   const textBlock: TextBlock = {
     type: "text",
     text: `The child's camera detected: "${opts.detectedLabel}" (Vision confidence: ${(
       opts.confidence * 100
     ).toFixed(0)}%).
 
-The quest requires an object satisfying ALL of these properties:
+These are the properties to evaluate for THIS scan (one or more is enough — the quest tracks completion across multiple scans):
 ${propertyList}
-${
+${alreadyFoundContext}${
   propertyMasteryContext
     ? `\nMastery context for quest words:\n${propertyMasteryContext}\n`
     : ""
 }
 Failed attempts so far: ${opts.failedAttempts ?? 0}
 
-Evaluate whether "${opts.detectedLabel}" satisfies each property.
+Evaluate whether "${opts.detectedLabel}" satisfies each of the listed properties. Return one entry per listed property, using the exact word as written above.
 ${
   opts.failedAttempts && opts.failedAttempts >= 2
     ? "The child has struggled. Include a gentle nudgeHint that guides without naming the object."
