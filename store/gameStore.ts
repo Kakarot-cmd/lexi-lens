@@ -962,7 +962,9 @@ export const selectCurrentAttempts = (state: GameState): number =>
   state.activeQuest?.components.find((c) => !c.found)?.attemptCount ?? 0;
 
 export const selectQuestComplete = (state: GameState): boolean =>
-  !!state.activeQuest && state.activeQuest.components.every((c) => c.found);
+  !!state.activeQuest &&
+  state.activeQuest.components.length > 0 &&
+  state.activeQuest.components.every((c) => c.found);
 
 export const selectUnlockedTiers = (state: GameState): QuestTier[] => {
   const completed = new Set(state.completedQuestIds);
