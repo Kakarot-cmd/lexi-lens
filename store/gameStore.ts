@@ -119,6 +119,7 @@ export interface Quest {
   min_age_band:         string;
   xp_reward_first_try:  number;
   xp_reward_retry:      number;
+  xp_reward_third_plus: number;
   required_properties:  PropertyRequirement[];
   age_band_properties?: Record<string, PropertyRequirement[]>;
   // hard_mode_properties is always an array (empty if no hard mode)
@@ -255,6 +256,18 @@ interface GameState {
     xpAwarded:     number;
     attemptCount:  number;
   }) => void;
+  /**
+   * Atomic batch variant — accepts multiple property updates in one
+   * set() call so concurrent updates from a multi-property scan don't
+   * race and overwrite each other. Use this whenever a single Claude
+   * response confirms 2+ properties at once.
+   */
+  recordComponentsFound: (updates: Array<{
+    propertyWord:  string;
+    objectUsed:    string;
+    xpAwarded:     number;
+    attemptCount:  number;
+  }>) => void;
   recordMissedScan:      (propertyWord: string) => void;
   completeQuest:         () => void;
   abandonQuest:          () => void;
@@ -350,9 +363,21 @@ export const useGameStore = create<GameState>()(
         set({
           activeChild: child,
           ...(!isSameChild && {
+            // CRITICAL: clear all per-child state when switching children.
+            // activeQuest is now persisted (so partial progress survives
+            // app restarts within the SAME child's session) — but it must
+            // NOT bleed across children. Without this clear, switching
+            // from Child A to Child B while A had an in-progress quest
+            // would show A's quest chips on B's screen, with A's components
+            // already marked found via A's exemplar objects.
+            activeQuest:           null,
             completedQuestIds:     [],
             hardCompletedQuestIds: [],
             spellBook:             [],
+            scanHistory:           [],
+            wordTomeCache:         [],
+            achievements:          [],
+            newlyEarnedBadges:     [],
           }),
           streak:               DEFAULT_STREAK,
           dailyQuest:           DEFAULT_DAILY_QUEST,
@@ -424,13 +449,26 @@ export const useGameStore = create<GameState>()(
 
       // ── Quest lifecycle ────────────────────────────────────
       beginQuest: (quest, hardMode = false) => {
-        const { activeChild } = get();
+        const { activeChild, activeQuest: existing } = get();
         const ageBand = activeChild?.age_band ?? "7-8";
 
         const canHardMode =
           hardMode &&
           Array.isArray(quest.hard_mode_properties) &&
           quest.hard_mode_properties.length > 0;
+
+        // Idempotency guard: if we already have an active quest for the
+        // same quest id AND the same hard-mode flag, DO NOT clobber it.
+        // The user might be returning to ScanScreen mid-quest after
+        // backgrounding — wiping components.found here would re-ask
+        // Claude about already-found properties on the next scan.
+        if (
+          existing &&
+          existing.quest.id === quest.id &&
+          existing.isHardMode === canHardMode
+        ) {
+          return;
+        }
 
         const ageBandProps = quest.age_band_properties?.[ageBand];
 
@@ -475,15 +513,59 @@ export const useGameStore = create<GameState>()(
               : c
           );
 
-          const enemyHp  = calcEnemyHp(components);
-          const newXp    = (state.activeChild?.total_xp ?? 0) + xpAwarded;
-          const newLevel = Math.min(100, Math.floor(Math.sqrt(newXp / 50)) + 1);
+          const enemyHp = calcEnemyHp(components);
 
+          // FIX #2 (audit): NO optimistic XP credit to activeChild.total_xp here.
+          // The xpEarned value is recorded on the component so the verdict card
+          // can display "+X XP" and markQuestCompletion can sum at the end.
+          // But the running total_xp on the child is the AUTHORITATIVE source —
+          // updated only by markQuestCompletion → award_xp RPC → refreshChildFromDB.
+          // This eliminates the optimistic-vs-DB drift class of bug.
           return {
             activeQuest: { ...state.activeQuest, components, enemyHp },
-            activeChild: state.activeChild
-              ? { ...state.activeChild, total_xp: newXp, level: newLevel }
-              : null,
+          };
+        }),
+
+      /**
+       * Atomic batch update — applies all property unlocks in a single
+       * set() call so the second update can see the first's results.
+       *
+       * Why this exists: when a single Claude response confirms multiple
+       * properties (e.g. "smooth", "round", "hollow" all on a cup), calling
+       * recordComponentFound() in a forEach loop creates a race. Each call
+       * starts from state.activeQuest.components — Zustand may still hold
+       * the pre-update snapshot when the second/third call fires, so
+       * earlier updates get clobbered. Net result: only the LAST property
+       * stays marked found. Quest never completes. Screen never closes.
+       *
+       * The batch path computes one new components array containing every
+       * update, then commits in a single set(). All-or-nothing, no race.
+       */
+      recordComponentsFound: (updates) =>
+        set((state) => {
+          if (!state.activeQuest || updates.length === 0) return state;
+
+          const updateMap = new Map(updates.map((u) => [u.propertyWord, u]));
+
+          const components = state.activeQuest.components.map((c) => {
+            const update = updateMap.get(c.propertyWord);
+            return update
+              ? {
+                  ...c,
+                  found:        true,
+                  objectUsed:   update.objectUsed,
+                  xpEarned:     update.xpAwarded,
+                  attemptCount: update.attemptCount,
+                }
+              : c;
+          });
+
+          const enemyHp = calcEnemyHp(components);
+
+          // FIX #2 (audit): NO optimistic XP credit to activeChild.total_xp.
+          // See recordComponentFound above for the full rationale.
+          return {
+            activeQuest: { ...state.activeQuest, components, enemyHp },
           };
         }),
 
@@ -502,20 +584,12 @@ export const useGameStore = create<GameState>()(
 
       abandonQuest: () =>
         set((state) => {
-          if (!state.activeQuest || !state.activeChild) return { activeQuest: null };
-          const earnedSoFar  = state.activeQuest.components
-            .filter((c) => c.found)
-            .reduce((sum, c) => sum + c.xpEarned, 0);
-          const rolledBackXp    = Math.max(0, state.activeChild.total_xp - earnedSoFar);
-          const rolledBackLevel = Math.min(100, Math.floor(Math.sqrt(rolledBackXp / 50)) + 1);
-          return {
-            activeQuest: null,
-            activeChild: {
-              ...state.activeChild,
-              total_xp: rolledBackXp,
-              level:    rolledBackLevel,
-            },
-          };
+          // FIX #2 (audit): abandonQuest no longer rolls back XP because no XP
+          // was optimistically credited during the quest. The child's total_xp
+          // only changes via markQuestCompletion → award_xp, which only fires
+          // on successful completion. Abandoning is now a clean state reset.
+          if (!state.activeQuest) return { activeQuest: null };
+          return { activeQuest: null };
         }),
 
       syncXpFromServer: (newXp, newLevel) =>
@@ -859,6 +933,13 @@ export const useGameStore = create<GameState>()(
       storage: createJSONStorage(() => AsyncStorage),
       partialize: (state) => ({
         activeChild:           state.activeChild,
+        // activeQuest is now persisted so partial progress survives
+        // screen unmounts and app restarts. Without this, navigating
+        // away from ScanScreen mid-quest (or backgrounding the app)
+        // would wipe the components.found flags — meaning the next
+        // scan would re-ask Claude about already-found properties,
+        // award duplicate XP, and break the completion check.
+        activeQuest:           state.activeQuest,
         wordTomeCache:         state.wordTomeCache,
         completedQuestIds:     state.completedQuestIds,
         hardCompletedQuestIds: state.hardCompletedQuestIds,

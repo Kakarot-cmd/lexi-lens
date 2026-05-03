@@ -23,9 +23,8 @@
     "ios": {
       "distribution": "store",
       "autoIncrement": true,
-      "ios": {
-        "buildConfiguration": "Release"
-      }
+      "buildConfiguration": "Release"
+      
     }
   },
   "submit": {

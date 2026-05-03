@@ -35,6 +35,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+import { useFocusEffect } from "@react-navigation/native";
 import * as Haptics from "expo-haptics";
 
 import {
@@ -376,6 +377,18 @@ export function QuestMapScreen({ navigation }: Props) {
     loadCompleted();
     loadStreakData();
   }, [activeChild?.id]);
+
+  // Refresh child XP + level + completed quests whenever QuestMap regains
+  // focus (e.g. after returning from ScanScreen post-quest-completion).
+  // Without this, the level bar shows stale total_xp until the child is
+  // switched away and back. Cheap operation — single row fetch.
+  useFocusEffect(
+    useCallback(() => {
+      const refreshState = useGameStore.getState();
+      refreshState.refreshChildFromDB();
+      refreshState.loadCompletedQuests();
+    }, [])
+  );
 
   // Load daily quest once quest library is ready
   useEffect(() => {

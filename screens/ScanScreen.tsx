@@ -24,7 +24,7 @@
  * The cameraKey state and remount useEffect that followed it are kept.
  */
 
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import {
   View,
   Text,
@@ -40,6 +40,7 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { useObjectScanner } from "../hooks/useObjectScanner";
 import { useLexiEvaluate }  from "../hooks/useLexiEvaluate";
+import { computePropertyHints } from "../utils/propertyHints";
 import {
   useGameStore,
   selectCurrentComponent,
@@ -147,11 +148,15 @@ function ComponentsStrip({
   components,
   current,
   browsedWord,
+  hintedWords,
   onSelectWord,
 }: {
   components:   Array<{ propertyWord: string; found: boolean; objectUsed: string | null }>;
   current:      string | null;
   browsedWord:  string | null;
+  /** Words ML Kit's labels suggest the visible object might satisfy.
+   *  Soft glow — guidance, not a verdict. */
+  hintedWords:  Set<string>;
   onSelectWord: (word: string) => void;
 }) {
   const foundCount = components.filter((c) => c.found).length;
@@ -174,40 +179,124 @@ function ComponentsStrip({
         {components.map((c) => {
           const isActive  = c.propertyWord === current;
           const isBrowsed = c.propertyWord === browsedWord;
+          const isHinted  = !c.found && hintedWords.has(c.propertyWord);
           return (
-            <TouchableOpacity
+            <PropertyChip
               key={c.propertyWord}
-              style={[
-                styles.chip,
-                isActive  && styles.chipActive,
-                c.found   && styles.chipDone,
-              ]}
+              propertyWord={c.propertyWord}
+              objectUsed={c.objectUsed}
+              found={c.found}
+              isActive={isActive}
+              isBrowsed={isBrowsed}
+              isHinted={isHinted}
               onPress={() => { if (!c.found) onSelectWord(c.propertyWord); }}
-              disabled={c.found}
-            >
-              <Text style={{ color: c.found ? "#86efac" : P.textDim }}>
-                {c.found ? "✦" : isBrowsed ? "◉" : "○"}
-              </Text>
-              <View>
-                <Text style={[styles.chipText, c.found && styles.chipTextDone]}>
-                  {c.propertyWord}
-                </Text>
-                {c.found && c.objectUsed && (
-                  <Text style={styles.chipObject} numberOfLines={1}>
-                    via {c.objectUsed}
-                  </Text>
-                )}
-                {!c.found && (
-                  <Text style={styles.chipTapHint}>
-                    {isBrowsed ? "viewing" : "tap to view"}
-                  </Text>
-                )}
-              </View>
-            </TouchableOpacity>
+            />
           );
         })}
       </View>
     </View>
+  );
+}
+
+// ─── Property chip — gentle hint glow when ML Kit suggests this property ─────
+//
+// Animation principles:
+//   • Glow is a soft pulsing border, NOT a flashy fill colour. Children
+//     should be drawn to it but not feel like the answer was given to them.
+//   • Animation only runs while isHinted is true — clean stop when hint
+//     drops, no orphan loops.
+//   • Native driver — runs on UI thread, no JS bridge cost.
+
+function PropertyChip({
+  propertyWord,
+  objectUsed,
+  found,
+  isActive,
+  isBrowsed,
+  isHinted,
+  onPress,
+}: {
+  propertyWord: string;
+  objectUsed:   string | null;
+  found:        boolean;
+  isActive:     boolean;
+  isBrowsed:    boolean;
+  isHinted:     boolean;
+  onPress:      () => void;
+}) {
+  const glow = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (isHinted) {
+      const loop = Animated.loop(
+        Animated.sequence([
+          Animated.timing(glow, { toValue: 1, duration: 900, useNativeDriver: false }),
+          Animated.timing(glow, { toValue: 0, duration: 900, useNativeDriver: false }),
+        ])
+      );
+      loop.start();
+      return () => loop.stop();
+    } else {
+      glow.setValue(0);
+    }
+  }, [isHinted, glow]);
+
+  // Interpolated values for the gentle pulse. We can't use native driver
+  // for borderColor / backgroundColor — these are layout properties.
+  const borderColor = glow.interpolate({
+    inputRange:  [0, 1],
+    outputRange: ["transparent", "#fbbf24"], // warm amber, not aggressive gold
+  });
+  const bgTint = glow.interpolate({
+    inputRange:  [0, 1],
+    outputRange: ["rgba(0,0,0,0)", "rgba(251, 191, 36, 0.10)"],
+  });
+
+  return (
+    <Animated.View
+      style={[
+        styles.chipHintWrap,
+        isHinted && {
+          borderColor,
+          backgroundColor: bgTint,
+        },
+      ]}
+    >
+      <TouchableOpacity
+        style={[
+          styles.chip,
+          isActive && styles.chipActive,
+          found    && styles.chipDone,
+        ]}
+        onPress={onPress}
+        disabled={found}
+      >
+        <Text style={{ color: found ? "#86efac" : isHinted ? "#fbbf24" : P.textDim }}>
+          {found ? "✦" : isHinted ? "✦" : isBrowsed ? "◉" : "○"}
+        </Text>
+        <View>
+          <Text
+            style={[
+              styles.chipText,
+              found    && styles.chipTextDone,
+              isHinted && styles.chipTextHinted,
+            ]}
+          >
+            {propertyWord}
+          </Text>
+          {found && objectUsed && (
+            <Text style={styles.chipObject} numberOfLines={1}>
+              via {objectUsed}
+            </Text>
+          )}
+          {!found && (
+            <Text style={[styles.chipTapHint, isHinted && styles.chipTapHintHinted]}>
+              {isHinted ? "try this!" : isBrowsed ? "viewing" : "tap to view"}
+            </Text>
+          )}
+        </View>
+      </TouchableOpacity>
+    </Animated.View>
   );
 }
 
@@ -323,6 +412,88 @@ function QuestIntro({
   );
 }
 
+// ─── Scan button — reacts to ML Kit scanReady signal ─────────────────────────
+//
+// Three states:
+//   idle      — ML Kit hasn't found anything yet
+//   locking   — label detected but not yet stable (stableFrameCount 1-2)
+//   ready     — stable + confident enough (scanReady = true)
+//
+// The "ready" state pulses gold and names the detected object, giving the
+// child a clear "tap now" signal instead of leaving them guessing.
+
+function ScanButton({
+  onPress,
+  isHardMode,
+  scanReady,
+  liveLabel,
+  stableFrameCount,
+}: {
+  onPress:          () => void;
+  isHardMode:       boolean;
+  scanReady:        boolean;
+  liveLabel:        string | null;
+  stableFrameCount: number;
+}) {
+  const pulse = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    if (scanReady) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulse, { toValue: 1.04, duration: 520, useNativeDriver: true }),
+          Animated.timing(pulse, { toValue: 1.00, duration: 520, useNativeDriver: true }),
+        ])
+      ).start();
+    } else {
+      pulse.stopAnimation();
+      Animated.timing(pulse, { toValue: 1, duration: 150, useNativeDriver: true }).start();
+    }
+  }, [scanReady]);
+
+  // Dot indicator — fills as ML Kit locks on
+  const dotCount  = Math.min(stableFrameCount, 3);
+  const dotColors = ["#6b5fa0", "#a78bfa", "#f5c842"];
+
+  const bgColor = scanReady
+    ? "#16a34a"
+    : isHardMode
+    ? P.hardRed
+    : "#7c3aed";
+
+  const label = scanReady && liveLabel
+    ? `✦ ${liveLabel} — tap to scan!`
+    : isHardMode
+    ? "⚔ Scan this object"
+    : "✦ Scan this object";
+
+  return (
+    <Animated.View style={{ transform: [{ scale: pulse }] }}>
+      <TouchableOpacity
+        style={[styles.scanBtn, { backgroundColor: bgColor }]}
+        onPress={onPress}
+        activeOpacity={0.85}
+      >
+        <Text style={styles.scanBtnText}>{label}</Text>
+        {/* Lock-on dots — appear as ML Kit builds confidence */}
+        {stableFrameCount > 0 && !scanReady && (
+          <View style={styles.lockDots}>
+            {[0, 1, 2].map((i) => (
+              <View
+                key={i}
+                style={[
+                  styles.lockDot,
+                  { backgroundColor: i < dotCount ? dotColors[i] : "rgba(255,255,255,0.15)" },
+                ]}
+              />
+            ))}
+          </View>
+        )}
+      </TouchableOpacity>
+    </Animated.View>
+  );
+}
+
 // ─── Main screen ──────────────────────────────────────────────────────────────
 
 export function ScanScreen({ route, navigation }: Props) {
@@ -338,7 +509,8 @@ export function ScanScreen({ route, navigation }: Props) {
   const streakMultiplier = useGameStore(selectStreakMultiplier);
 
   const beginQuest           = useGameStore((s) => s.beginQuest);
-  const recordComponentFound = useGameStore((s) => s.recordComponentFound);
+  const recordComponentFound  = useGameStore((s) => s.recordComponentFound);
+  const recordComponentsFound = useGameStore((s) => s.recordComponentsFound);
   const recordMissedScan     = useGameStore((s) => s.recordMissedScan);
   const completeQuest        = useGameStore((s) => s.completeQuest);
   const abandonQuest         = useGameStore((s) => s.abandonQuest);
@@ -396,13 +568,18 @@ export function ScanScreen({ route, navigation }: Props) {
       return;
     }
 
-    if (!result || !activeQuest) return;
+    if (!result) return;
+
+    // Read activeQuest fresh from store to avoid stale-closure issues if
+    // the effect re-fires before React has committed a recent state update.
+    const aq = useGameStore.getState().activeQuest;
+    if (!aq) return;
 
     if (status === "match" || status === "no-match") {
       setPhase("verdict");
 
       const alreadyFound = new Set(
-        (activeQuest.components ?? []).filter((c) => c.found).map((c) => c.propertyWord)
+        (aq.components ?? []).filter((c) => c.found).map((c) => c.propertyWord)
       );
 
       const newlyPassing = (result.properties ?? []).filter(
@@ -415,14 +592,21 @@ export function ScanScreen({ route, navigation }: Props) {
         const totalXpThisScan = Math.round((result.xpAwarded || 20) * streakMultiplier);
         const xpEach = Math.max(10, Math.floor(totalXpThisScan / newlyPassing.length));
 
-        newlyPassing.forEach((p) => {
-          recordComponentFound({
+        // ATOMIC: bundle all property unlocks into one set() call so concurrent
+        // updates can't race and clobber each other. See gameStore comment on
+        // recordComponentsFound for full explanation of why this matters.
+        recordComponentsFound(
+          newlyPassing.map((p) => ({
             propertyWord: p.word,
             objectUsed:   result.resolvedObjectName,
             xpAwarded:    xpEach,
             attemptCount: currentAttempts + 1,
-          });
-          const req = effectiveProperties.find((r) => r.word === p.word);
+          }))
+        );
+
+        // Word Tome additions stay per-property (each row is independent in DB)
+        newlyPassing.forEach((p) => {
+          const req = (aq.effectiveProperties ?? []).find((r) => r.word === p.word);
           if (req) {
             addWordToTome({
               word:            p.word,
@@ -440,7 +624,7 @@ export function ScanScreen({ route, navigation }: Props) {
           detectedLabel: lastLabel ?? result.resolvedObjectName,
           overallMatch:  true,
           xpAwarded:     totalXpThisScan,
-          questName:     activeQuest.quest.name ?? "",
+          questName:     aq.quest.name ?? "",
           feedback:      result.childFeedback,
         });
       } else {
@@ -450,16 +634,23 @@ export function ScanScreen({ route, navigation }: Props) {
     }
 
     if (status === "error") setPhase("verdict");
-  }, [status]);
+  }, [status, result]);
 
   const handleContinue = useCallback(() => {
-    if (questComplete) {
+    // Read questComplete directly from store at call time to avoid
+    // stale-closure race — Zustand store update (recordComponentFound)
+    // and React state update (setPhase) can land in different render
+    // cycles, making the captured `questComplete` value stale by the
+    // time the user taps Continue. Hard Mode is more susceptible because
+    // its vocabulary is harder so children tap faster after each scan.
+    const isComplete = selectQuestComplete(useGameStore.getState());
+    if (isComplete) {
       setPhase("quest_victory");
     } else {
       setPhase("component_win");
       setTimeout(() => { resetEval(); setPhase("scanning"); }, 1400);
     }
-  }, [questComplete, resetEval]);
+  }, [resetEval]);
 
   const handleTryAgain = useCallback(() => {
     resetEval();
@@ -467,24 +658,34 @@ export function ScanScreen({ route, navigation }: Props) {
   }, [resetEval]);
 
   const handleVictoryDismiss = useCallback(() => {
-    if (!activeQuest || !activeChild) {
+    // Read fresh from store — avoids stale closure if the component
+    // re-rendered between the victory phase being set and the user
+    // tapping Continue on VictoryFusionScreen.
+    const { activeQuest: aq, activeChild: ac } = useGameStore.getState();
+
+    const exitToMap = () => {
       completeQuest();
-      navigation.goBack();
+      // goBack() is preferred; replace is a safety net if the
+      // navigation stack is in an unexpected state.
+      if (navigation.canGoBack()) {
+        navigation.goBack();
+      } else {
+        navigation.replace("QuestMap");
+      }
+    };
+
+    if (!aq || !ac) {
+      exitToMap();
       return;
     }
-    const totalXp = activeQuest.components.reduce((s, c) => s + c.xpEarned, 0);
-    const mode    = activeQuest.isHardMode ? "hard" : "normal";
 
-    markQuestCompletion(activeQuest.quest.id, mode, totalXp)
-      .then(() => {
-        completeQuest();
-        navigation.goBack();
-      })
-      .catch(() => {
-        completeQuest();
-        navigation.goBack();
-      });
-  }, [activeQuest, activeChild, markQuestCompletion, completeQuest, refreshChildFromDB, navigation]);
+    const totalXp = aq.components.reduce((s, c) => s + c.xpEarned, 0);
+    const mode    = aq.isHardMode ? "hard" : "normal";
+
+    markQuestCompletion(aq.quest.id, mode, totalXp)
+      .then(exitToMap)
+      .catch(exitToMap);
+  }, [completeQuest, markQuestCompletion, navigation]);
 
   // ── v3.1: ML Kit scanner ──────────────────────────────────────────────────
 
@@ -496,36 +697,68 @@ export function ScanScreen({ route, navigation }: Props) {
     triggerManualScan,
     liveLabel,
     liveConfidence,
+    scanReady,
+    stableFrameCount,
+    topLabels,
     requestPermission,
   } = useObjectScanner({
     enabled: phase === "scanning" && status === "idle",
     onDetection: async ({ primary, frameBase64 }) => {
-      if (!activeChild || !activeQuest) return;
+      // Read activeChild + activeQuest fresh from the store at call time
+      // rather than from React closure. The closure-captured versions can
+      // be stale if the user fired multiple scans without an intermediate
+      // re-render — and pendingProperties derived from a stale activeQuest
+      // would send already-found properties back to Claude on subsequent
+      // scans, causing inflated XP and chips that fail to update.
+      const { activeChild: ac, activeQuest: aq } = useGameStore.getState();
+      if (!ac || !aq) return;
+
+      // Recompute pending + already-found from THIS-MOMENT state, not closure
+      const alreadyFoundWords = aq.components
+        .filter((c) => c.found)
+        .map((c) => c.propertyWord);
+      const pendingNow = (aq.effectiveProperties ?? []).filter(
+        (p) => !alreadyFoundWords.includes(p.word)
+      );
 
       setLastLabel(primary?.label ?? "object");
       setPhase("verdict");
 
       await evaluate({
-        childId:            activeChild.id,
-        questId:            activeQuest.quest.id,
-        questName:          activeQuest.quest.name,
+        childId:            ac.id,
+        questId:            aq.quest.id,
+        questName:          aq.quest.name,
         detectedLabel:      primary?.label ?? "object",
         confidence:         primary?.confidence ?? 0.9,
         frameBase64Already: frameBase64 ?? undefined,
-        requiredProperties: pendingProperties,
-        alreadyFoundWords:  activeQuest.components
-          .filter((c) => c.found)
-          .map((c) => c.propertyWord),
-        childAge:           parseInt(activeChild.age_band.split("-")[1], 10),
+        requiredProperties: pendingNow,
+        alreadyFoundWords,
+        childAge:           parseInt(ac.age_band.split("-")[1], 10),
         failedAttempts:     currentAttempts,
-        xp_reward_first_try:  activeQuest.quest.xp_reward_first_try  ?? 40,
-        xp_reward_retry:      activeQuest.quest.xp_reward_retry      ?? 25,
-        // xp_reward_third_plus exists in DB but is not yet in the Quest TS type
-        // TODO: add xp_reward_third_plus?: number to the Quest type definition
-        xp_reward_third_plus: (activeQuest.quest as any).xp_reward_third_plus ?? 10,
+        xp_reward_first_try:  aq.quest.xp_reward_first_try  ?? 40,
+        xp_reward_retry:      aq.quest.xp_reward_retry      ?? 25,
+        xp_reward_third_plus: aq.quest.xp_reward_third_plus ?? 10,
       });
     },
   });
+
+  // ── Property hint engine (Phase A) ───────────────────────────────────────
+  // Pure client-side keyword matching. Looks at ML Kit's top labels and
+  // soft-glows the chips for properties they suggest might apply.
+  // Never spoils a quest — engine self-suppresses if it would hint
+  // more than half the pending words. Runs in microseconds.
+  const pendingPropertyWords = useMemo(
+    () => pendingProperties.map((p) => p.word),
+    [pendingProperties]
+  );
+
+  const { hintedWords } = useMemo(
+    () => computePropertyHints({
+      labels:            topLabels,
+      pendingProperties: pendingPropertyWords,
+    }),
+    [topLabels.join("|"), pendingPropertyWords.join("|")]
+  );
 
   // Force camera to remount when permission is granted after being denied
   const [cameraKey, setCameraKey] = React.useState(0);
@@ -647,20 +880,20 @@ export function ScanScreen({ route, navigation }: Props) {
               components={components}
               current={currentComponent?.propertyWord ?? null}
               browsedWord={browsedWord}
+              hintedWords={hintedWords}
               onSelectWord={(word) => {
                 setBrowsedWord(word);
                 Haptics.selectionAsync();
               }}
             />
 
-            <TouchableOpacity
-              style={[styles.scanBtn, isHardMode && styles.scanBtnHard]}
+            <ScanButton
               onPress={triggerManualScan}
-            >
-              <Text style={styles.scanBtnText}>
-                {isHardMode ? "⚔ Scan this object" : "✦ Scan this object"}
-              </Text>
-            </TouchableOpacity>
+              isHardMode={isHardMode}
+              scanReady={scanReady}
+              liveLabel={liveLabel}
+              stableFrameCount={stableFrameCount}
+            />
 
             <TouchableOpacity
               style={styles.abandonBtn}
@@ -817,6 +1050,11 @@ const styles = StyleSheet.create({
   chipObject:   { fontSize: 9, color: "#4ade80", opacity: 0.8 },
   chipTapHint:  { fontSize: 8, color: P.textDim, opacity: 0.6, marginTop: 1 },
 
+  // Property hint glow — pulsing amber border when ML Kit suggests this word
+  chipHintWrap:      { borderWidth: 1.5, borderColor: "transparent", borderRadius: 14, padding: 1 },
+  chipTextHinted:    { color: "#fef3c7" },
+  chipTapHintHinted: { fontSize: 8, color: "#fbbf24", opacity: 0.95, marginTop: 1, fontWeight: "700" as const },
+
   // Seek card
   seekCard:     { backgroundColor: "rgba(15,6,32,0.88)", borderRadius: 16, padding: 14, marginBottom: 8, borderWidth: 0.5, borderColor: P.cardBorder },
   seekCardHard: { borderColor: "#7f1d1d", backgroundColor: "rgba(26,5,5,0.88)" },
@@ -828,6 +1066,10 @@ const styles = StyleSheet.create({
   scanBtn:     { backgroundColor: "#7c3aed", borderRadius: 50, paddingVertical: 16, alignItems: "center", marginBottom: 8 },
   scanBtnHard: { backgroundColor: P.hardRed },
   scanBtnText: { color: "#fff", fontSize: 16, fontWeight: "700" },
+
+  // Lock-on dots inside the scan button
+  lockDots: { flexDirection: "row", justifyContent: "center", marginTop: 6, gap: 5 },
+  lockDot:  { width: 6, height: 6, borderRadius: 3 },
 
   abandonBtn:  { alignItems: "center", paddingVertical: 6 },
   abandonText: { fontSize: 12, color: "rgba(200,180,255,0.35)" },
