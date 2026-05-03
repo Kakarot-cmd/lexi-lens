@@ -41,7 +41,7 @@ serve(async (req: Request) => {
   try {
     const { word, definition, childAge } = await req.json();
 
-    if (!word || !definition || !childAge) {
+    if (!word || !definition ||  typeof childAge !== "number") {
       return new Response(
         JSON.stringify({ error: "Missing word, definition, or childAge" }),
         { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
