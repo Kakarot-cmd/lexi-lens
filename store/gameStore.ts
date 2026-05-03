@@ -630,7 +630,19 @@ export const useGameStore = create<GameState>()(
       },
 
       // ── Word Tome ──────────────────────────────────────────
-      addWordToTome: (entry) =>
+      // PERSISTENCE FIX: addWordToTome was previously local-only —
+      // wordTomeCache was updated, but nothing ever wrote to the
+      // public.word_tome table. Result: every child's Word Tome was
+      // empty across sessions, the PDF export was empty, and the
+      // mastery + leaderboard services queried an empty table.
+      //
+      // We now also fire-and-forget the record_word_learned RPC
+      // (defined in schema.sql, security-definer, idempotent on
+      // (child_id, word) — increments times_used on conflict).
+      // The RPC failure is logged but never breaks the local cache
+      // update, so the in-game UX is unaffected if the network is down.
+      addWordToTome: (entry) => {
+        // Local cache update — synchronous, unchanged behaviour.
         set((state) => {
           const existing = state.wordTomeCache.findIndex((w) => w.word === entry.word);
           if (existing >= 0) {
@@ -643,7 +655,30 @@ export const useGameStore = create<GameState>()(
             return { wordTomeCache: updated };
           }
           return { wordTomeCache: [entry, ...state.wordTomeCache] };
-        }),
+        });
+
+        // DB persistence — fire-and-forget. Reads activeChild fresh
+        // from the store so we don't capture a stale closure value.
+        const child = get().activeChild;
+        if (!child) return;
+
+        void (async () => {
+          try {
+            const { error } = await supabase.rpc("record_word_learned", {
+              p_child_id:        child.id,
+              p_word:            entry.word,
+              p_definition:      entry.definition,
+              p_exemplar_object: entry.exemplar_object,
+            });
+            if (error) {
+              console.warn("[addWordToTome] record_word_learned RPC failed:", error.message);
+            }
+          } catch (e) {
+            // Non-fatal — local cache already updated; UX continues.
+            console.warn("[addWordToTome] record_word_learned threw:", e);
+          }
+        })();
+      },
 
       setWordTomeCache: (entries) => set({ wordTomeCache: entries }),
 

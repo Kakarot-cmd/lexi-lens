@@ -115,46 +115,55 @@ function BadgeCell({ badge, earned, earnedAt, index, onPress }: BadgeCellProps) 
   const entryDelay = Math.min(index * 40, 600); // cap at 600ms
 
   return (
+    // FIX (Reanimated warning): the layout-entering animation drives opacity
+    // from 0→1 on this Animated.View. We can't ALSO set a static `opacity`
+    // here without Reanimated warning that one will overwrite the other.
+    // Solution: outer Animated.View owns the entering animation; inner View
+    // owns the "is this badge locked?" dim styling. Two separate nodes,
+    // two separate concerns, no warning.
     <Animated.View
       entering={FadeInDown.delay(entryDelay).springify().damping(18)}
-      style={[
-        styles.cell,
-        {
-          backgroundColor: bg,
-          borderColor:     color,
-          opacity:         earned ? 1 : 0.45,
-          width:           CELL_W,
-        },
-      ]}
+      style={{ width: CELL_W }}
     >
-      {isLegendary && <LegendaryBorderPulse />}
-
-      <TouchableOpacity
-        style={styles.cellTouchable}
-        onPress={() => {
-          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-          onPress(badge, earned, earnedAt);
-        }}
-        activeOpacity={0.75}
-        accessibilityLabel={
-          earned
-            ? `${badge.name} badge, earned. ${badge.description}`
-            : `${badge.name} badge, locked`
-        }
+      <View
+        style={[
+          styles.cell,
+          {
+            backgroundColor: bg,
+            borderColor:     color,
+            opacity:         earned ? 1 : 0.45,
+          },
+        ]}
       >
-        <Text style={[styles.cellEmoji, { opacity: earned ? 1 : 0.5 }]}>
-          {badge.emoji}
-        </Text>
-        <Text style={[styles.cellName, { color: earned ? "#f3f4f6" : "#6b7280" }]} numberOfLines={2}>
-          {earned ? badge.name : "???"}
-        </Text>
-        {earned && (
-          <View style={[styles.rarityDot, { backgroundColor: color }]} />
-        )}
-        {!earned && (
-          <Text style={styles.lockIcon}>🔒</Text>
-        )}
-      </TouchableOpacity>
+        {isLegendary && <LegendaryBorderPulse />}
+
+        <TouchableOpacity
+          style={styles.cellTouchable}
+          onPress={() => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+            onPress(badge, earned, earnedAt);
+          }}
+          activeOpacity={0.75}
+          accessibilityLabel={
+            earned
+              ? `${badge.name} badge, earned. ${badge.description}`
+              : `${badge.name} badge, locked`
+          }
+        >
+          <Text style={[styles.cellEmoji, { opacity: earned ? 1 : 0.5 }]}>
+            {badge.emoji}
+          </Text>
+          <Text style={[styles.cellName, { color: earned ? "#f3f4f6" : "#6b7280" }]} numberOfLines={2}>
+            {earned ? badge.name : "???"}
+          </Text>
+          {earned && (
+            <View style={[styles.rarityDot, { backgroundColor: color }]} />
+          )}
+          {!earned && (
+            <Text style={styles.lockIcon}>🔒</Text>
+          )}
+        </TouchableOpacity>
+      </View>
     </Animated.View>
   );
 }

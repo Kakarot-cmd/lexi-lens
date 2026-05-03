@@ -40,6 +40,7 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { useObjectScanner } from "../hooks/useObjectScanner";
 import { useLexiEvaluate }  from "../hooks/useLexiEvaluate";
+import { useAnalytics }     from "../hooks/useAnalytics";
 import { computePropertyHints } from "../utils/propertyHints";
 import {
   useGameStore,
@@ -520,6 +521,13 @@ export function ScanScreen({ route, navigation }: Props) {
   const markQuestCompletion  = useGameStore((s) => s.markQuestCompletion);
   const refreshChildFromDB   = useGameStore((s) => s.refreshChildFromDB);
 
+  // Phase 3.7 wire-up: per-quest analytics (started here, finished on victory
+  // OR on any abandonment path). logWordOutcome is called from the result
+  // effect, once per property in each Claude verdict.
+  const { startQuestSession, finishQuestSession, logWordOutcome } = useAnalytics();
+  const scanCountRef       = useRef(0);
+  const questStartedAtRef  = useRef<string | null>(null);
+
   const [phase, setPhase]                               = useState<ScreenPhase>("quest_intro");
   const [lastLabel, setLastLabel]                       = useState<string | null>(null);
   const [browsedWord, setBrowsedWord]                   = useState<string | null>(null);
@@ -531,6 +539,41 @@ export function ScanScreen({ route, navigation }: Props) {
       beginQuest(quest, routeHardMode);
     }
   }, [questId]);
+
+  // Phase 3.7: open a quest_sessions row when this quest becomes active.
+  // The activeChild guard prevents firing during a half-loaded state.
+  // Cleanup runs when the user abandons the quest (navigates away without
+  // victory) — handleVictoryDismiss clears questStartedAtRef first so the
+  // cleanup function knows not to log it as an abandon.
+  useEffect(() => {
+    const ac = activeChild;
+    const aq = activeQuest;
+    if (!ac?.id || !aq?.quest?.id) return;
+    if (questStartedAtRef.current === aq.quest.id) return;
+
+    questStartedAtRef.current = aq.quest.id;
+    scanCountRef.current      = 0;
+    startQuestSession({
+      childId:  ac.id,
+      questId:  aq.quest.id,
+      hardMode: aq.isHardMode,
+    });
+
+    return () => {
+      // If the ref is still set on cleanup, the user left without a clean
+      // victory dismissal — record it as abandoned with the scan count
+      // and partial XP earned across found components.
+      if (questStartedAtRef.current) {
+        const partialXp = aq.components.reduce((s, c) => s + c.xpEarned, 0);
+        finishQuestSession({
+          completed:  false,
+          totalScans: scanCountRef.current,
+          xpAwarded:  partialXp,
+        });
+        questStartedAtRef.current = null;
+      }
+    };
+  }, [activeChild?.id, activeQuest?.quest?.id, activeQuest?.isHardMode, startQuestSession, finishQuestSession]);
 
   useEffect(() => {
     if (currentComponent && !browsedWord) {
@@ -654,6 +697,29 @@ export function ScanScreen({ route, navigation }: Props) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
         if (currentComponent) recordMissedScan(currentComponent.propertyWord);
       }
+
+      // Phase 3.7: increment quest scan count + log one word_outcome row
+      // per property in this verdict. This is the "words failed most"
+      // data feed and is independent of the property_scores JSONB column
+      // on scan_attempts (which is written by the Edge Function). Two
+      // independent paths = cross-check integrity: the queries in
+      // round4_analysis.sql Block 7 compare them.
+      scanCountRef.current += 1;
+
+      const ac = useGameStore.getState().activeChild;
+      if (ac && result.properties && result.properties.length > 0) {
+        const attemptNum = (currentAttempts || 0) + 1;
+        for (const p of result.properties) {
+          logWordOutcome({
+            childId:   ac.id,
+            questId:   aq.quest.id,
+            word:      p.word,
+            passed:    p.passes,
+            scanLabel: result.resolvedObjectName ?? lastLabel ?? "",
+            attempt:   attemptNum,
+          });
+        }
+      }
     }
 
     if (status === "error") setPhase("verdict");
@@ -755,10 +821,22 @@ export function ScanScreen({ route, navigation }: Props) {
     const totalXp = aq.components.reduce((s, c) => s + c.xpEarned, 0);
     const mode    = aq.isHardMode ? "hard" : "normal";
 
+    // Phase 3.7: close the quest_sessions row as completed BEFORE
+    // markQuestCompletion. We clear questStartedAtRef so the unmount
+    // cleanup effect doesn't double-fire as an "abandoned" close.
+    if (questStartedAtRef.current) {
+      finishQuestSession({
+        completed:  true,
+        totalScans: scanCountRef.current,
+        xpAwarded:  totalXp,
+      });
+      questStartedAtRef.current = null;
+    }
+
     markQuestCompletion(aq.quest.id, mode, totalXp)
       .then(exitToMap)
       .catch(exitToMap);
-  }, [completeQuest, markQuestCompletion, navigation]);
+  }, [completeQuest, markQuestCompletion, navigation, finishQuestSession]);
 
   // ── v3.1: ML Kit scanner ──────────────────────────────────────────────────
 
