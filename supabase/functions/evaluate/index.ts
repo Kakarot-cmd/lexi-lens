@@ -2,6 +2,18 @@
  * supabase/functions/evaluate/index.ts
  * Lexi-Lens — Supabase Edge Function entry point.
  *
+ * v4.4 fix (this file): iOS cross-scan property bleed
+ *   • Symptom: scanning a matchstick on iOS returned a cached "gold ring"
+ *     verdict from a previous scan — instant (<200 ms), wrong identification.
+ *   • Cause: useObjectScanner.ts iOS path falls back to detectedLabel="object"
+ *     because there is no ML Kit on iOS. Cache key = (label, questId,
+ *     pendingWords) — so within any (questId, pendingWords) tuple, every
+ *     distinct physical object scanned on iOS produces the IDENTICAL cache
+ *     key. Cache hit returns whatever was last stored for that key.
+ *   • Fix: skip cache GET (Section 4) and SET (Section 7) when detectedLabel
+ *     is too generic to distinguish physical objects. Android scans (real
+ *     ML Kit labels) are unaffected.
+ *
  * Phase 3.5 additions — Rate Limiting + Abuse Prevention:
  *   • IP-level rate limit: max 20 requests/IP/minute (brute-force shield)
  *   • Daily child quota: max 50 Claude calls/child/day (get_daily_scan_count RPC)
@@ -22,7 +34,7 @@
  *   2. Parse + validate body
  *   3. IP rate limit check  (ip_rate_limits table, 20 req/min)
  *   4. Daily quota check    (get_daily_scan_count RPC, 50/day)
- *   5. Redis cache check
+ *   5. Redis cache check    (skipped for generic labels — iOS bleed fix)
  *   6. Claude evaluation
  *   7. INSERT into scan_attempts
  *   8. Return result + alert flags
@@ -38,6 +50,11 @@ const DAILY_SCAN_LIMIT    = 50;
 const ALERT_THRESHOLD_PCT = 0.80;   // 80% → warn parent
 const IP_LIMIT_PER_MINUTE = 20;
 const IP_WINDOW_MS        = 60_000;
+
+// v4.4 — labels too generic to safely identify a physical object.
+// On iOS there is no ML Kit, so detectedLabel is always one of these.
+// Caching against these labels causes cross-scan bleed — see Section 4.
+const GENERIC_LABELS = new Set(["", "object", "unknown", "thing", "item"]);
 
 // ─── Redis helpers (Upstash — Phase 3.4) ─────────────────────────────────────
 
@@ -389,15 +406,40 @@ serve(async (req: Request) => {
   // ── 4. Redis cache check ──────────────────────────────────────────────────
   // Pending words from this scan are baked into the cache key — see
   // buildCacheKey for the rationale.
+  //
+  // iOS BLEED FIX (v4.4): on iOS there is no ML Kit, so detectedLabel is
+  // always the constant fallback "object" (see useObjectScanner.ts iOS path).
+  // Within the same (questId, pendingWords) tuple, every distinct physical
+  // object scanned on iOS would otherwise produce the SAME cache key — so a
+  // cache hit returns whatever was last cached for that key, regardless of
+  // what the camera is actually pointing at.
+  //
+  // Symptom: scanning a matchstick on iOS returned a cached "gold ring"
+  // verdict from a previous scan. Truly instant (~100 ms), wrong identification,
+  // wrong property feedback, scoped to the same (questId, pendingWords) bucket.
+  //
+  // Fix: skip cache GET (and SET — see Section 7 below) entirely when
+  // detectedLabel is too generic to distinguish physical objects. Android
+  // scans (real ML Kit labels) still cache normally — they have legitimate
+  // distinguishing input.
+  const labelTrimmed   = ((detectedLabel as string) ?? "").toLowerCase().trim();
+  const isGenericLabel = GENERIC_LABELS.has(labelTrimmed);
+
   const pendingWords = Array.isArray(requiredProperties)
     ? (requiredProperties as Array<{ word?: unknown }>)
         .map((p) => (typeof p?.word === "string" ? p.word : ""))
         .filter((w) => w.length > 0)
     : [];
-  const cacheKey     = buildCacheKey(detectedLabel as string, (questId as string) ?? "", pendingWords);
-  const cachedResult = (failedAttempts as number ?? 0) === 0
-    ? await cacheGet(cacheKey)
-    : null;
+  const cacheKey         = buildCacheKey(detectedLabel as string, (questId as string) ?? "", pendingWords);
+  const shouldCheckCache = !isGenericLabel && (failedAttempts as number ?? 0) === 0;
+  const cachedResult     = shouldCheckCache ? await cacheGet(cacheKey) : null;
+
+  if (isGenericLabel) {
+    // Observable signal — bypassing cache for an iOS-pattern scan. Useful in
+    // Edge Function logs to confirm the fix is firing on the expected platform
+    // mix. Should appear once per iOS scan, never on Android.
+    console.log(`[evaluate] Skipping cache (generic label="${labelTrimmed}"): childId=${childId} questId=${questId ?? "n/a"}`);
+  }
 
   if (cachedResult) {
     
@@ -453,7 +495,12 @@ serve(async (req: Request) => {
   });
 
   // ── 7. Cache successful result ────────────────────────────────────────────
-  if ((failedAttempts as number | undefined ?? 0) === 0) {
+  // iOS BLEED FIX (v4.4): same guard as Section 4 — never write a cache entry
+  // that uses a generic label as part of its key. If we did, a future call
+  // for a DIFFERENT physical object that happens to share (questId, pendingWords)
+  // would hit this entry and get back the wrong object's verdict. Better to
+  // recompute every iOS scan than to seed permanent cache pollution.
+  if (!isGenericLabel && (failedAttempts as number | undefined ?? 0) === 0) {
     await cacheSet(cacheKey, { ...evaluationResult, _cacheHit: false });
   }
 
