@@ -1092,7 +1092,7 @@ export const selectQuestCompletionMode = (
  */
 export const selectHasHardMode = (quest: Quest): boolean =>
   Array.isArray(quest.hard_mode_properties) && quest.hard_mode_properties.length > 0;
-
+ 
 /**
  * Returns fractional XP progress toward the next level (0 – 1).
  * XP formula mirrors the server-side award_xp stored procedure:
