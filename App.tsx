@@ -271,24 +271,35 @@ function App() {
   // All writes are fire-and-forget inside useAnalytics — Supabase failures
   // never break the game loop. Quest-level writes (startQuestSession /
   // finishQuestSession / logWordOutcome) are wired separately in ScanScreen.
+  //
+  // SESSION COUNTERS FIX (v4.3 Known Gap → resolved here):
+  // The previous shape declared `questCountsRef = useRef({ started, finished, xp })`
+  // and read it back into endSession's payload, but no code path ever
+  // incremented it — every game_sessions row closed with 0/0/0. The counter
+  // state has been moved into gameStore.sessionCounters where beginQuest and
+  // markQuestCompletion can bump it at the actual event sites. We pull the
+  // live values at flush-time via useGameStore.getState().sessionCounters
+  // inside the cleanup and the AppState callback — getState() returns the
+  // current snapshot (not a stale closure capture), which is exactly what
+  // we want when closing the session row.
   const { startSession, endSession } = useAnalytics();
   const screenSequenceRef = useRef<string[]>([]);
-  const questCountsRef    = useRef({ started: 0, finished: 0, xp: 0 });
 
   useEffect(() => {
     if (!activeChild?.id) return;
 
     // Open a fresh session row for this child.
     screenSequenceRef.current = [];
-    questCountsRef.current    = { started: 0, finished: 0, xp: 0 };
+    useGameStore.getState().resetSessionCounters();
     startSession();
 
     // Cleanup runs on child switch OR sign-out — close the row.
     return () => {
+      const c = useGameStore.getState().sessionCounters;
       endSession({
-        questsStarted:  questCountsRef.current.started,
-        questsFinished: questCountsRef.current.finished,
-        xpEarned:       questCountsRef.current.xp,
+        questsStarted:  c.questsStarted,
+        questsFinished: c.questsFinished,
+        xpEarned:       c.xpEarned,
         screenSequence: screenSequenceRef.current,
       });
     };
@@ -302,15 +313,16 @@ function App() {
 
     const subscription = AppState.addEventListener("change", (nextState) => {
       if (nextState === "background" || nextState === "inactive") {
+        const c = useGameStore.getState().sessionCounters;
         endSession({
-          questsStarted:  questCountsRef.current.started,
-          questsFinished: questCountsRef.current.finished,
-          xpEarned:       questCountsRef.current.xp,
+          questsStarted:  c.questsStarted,
+          questsFinished: c.questsFinished,
+          xpEarned:       c.xpEarned,
           screenSequence: screenSequenceRef.current,
         });
       } else if (nextState === "active") {
         screenSequenceRef.current = [];
-        questCountsRef.current    = { started: 0, finished: 0, xp: 0 };
+        useGameStore.getState().resetSessionCounters();
         startSession();
       }
     });

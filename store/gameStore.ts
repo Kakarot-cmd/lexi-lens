@@ -2,6 +2,14 @@
  * gameStore.ts
  * Lexi-Lens — Zustand store for all client-side game state.
  *
+ * v4.4 additions (this file):
+ *   • sessionCounters slice — { questsStarted, questsFinished, xpEarned }
+ *     incremented by beginQuest (after idempotency guard) and
+ *     markQuestCompletion (after award_xp success). NOT persisted —
+ *     resets on every cold start. Read by App.tsx at game_sessions
+ *     close to populate quests_started / quests_finished / xp_earned.
+ *     Closes v4.3 Known Gap "App.tsx quest counters not incremented".
+ *
  * N4 additions:
  *   • AchievementRecord, Badge types (imported from achievementService)
  *   • achievements: AchievementRecord[]      — earned badges cache
@@ -245,6 +253,19 @@ interface GameState {
   checkAndAwardBadges:    () => Promise<void>;
   dismissEarnedBadge:     () => void;
 
+  // ── v4.4: Session counters (NOT persisted — per app session) ───
+  // Closing payload for game_sessions.{quests_started, quests_finished, xp_earned}.
+  // Bumped from beginQuest (started) and markQuestCompletion (finished + xp).
+  // Read by App.tsx at game_sessions close via useGameStore.getState().
+  sessionCounters: {
+    questsStarted:  number;
+    questsFinished: number;
+    xpEarned:       number;
+  };
+  resetSessionCounters:     () => void;
+  bumpSessionQuestStarted:  () => void;
+  bumpSessionQuestFinished: (xp: number) => void;
+
   // ── Actions ────────────────────────────────────────────────
   startChildSession:     (child: ChildSession) => void;
   endChildSession:       () => void;
@@ -279,7 +300,7 @@ interface GameState {
   clearScanHistory:      () => void;
   markQuestCompletion:   (questId: string, mode: "normal" | "hard", totalXp: number) => Promise<void>;
   loadCompletedQuests:   () => Promise<void>;
-  loadStreakData:         () => Promise<void>;
+  loadStreakData:        () => Promise<void>;
   loadDailyQuest:        () => Promise<void>;
   recordDailyCompletion: (questId: string) => Promise<void>;
   loadSpellBook:         () => Promise<void>;
@@ -304,7 +325,7 @@ function calcEnemyHp(components: ComponentProgress[]): number {
 }
 
 function ageBandOrder(band: string): number {
-  return { "5-6": 0, "7-8": 1, "9-10": 2, "11-12": 3, "13-14": 4 }[band] ?? 99;
+  return ({ "5-6": 0, "7-8": 1, "9-10": 2, "11-12": 3, "13-14": 4 } as Record<string, number>)[band] ?? 99;
 }
 
 function childMinAgeBandOk(childBand: string, questMinBand: string): boolean {
@@ -346,6 +367,9 @@ export const useGameStore = create<GameState>()(
       spellBook:             [],
       isLoadingSpells:       false,
 
+      // v4.4 — session counters initial state (always zeroed at cold start)
+      sessionCounters: { questsStarted: 0, questsFinished: 0, xpEarned: 0 },
+
       // ── N1: Onboarding gate ────────────────────────────────
       hasSeenOnboarding:      false,
       markOnboardingComplete: () => set({ hasSeenOnboarding: true }),
@@ -354,6 +378,32 @@ export const useGameStore = create<GameState>()(
       achievements:          [],
       newlyEarnedBadges:     [],
       isLoadingAchievements: false,
+
+      // ── v4.4: Session counter actions ──────────────────────
+      // Reset is called from App.tsx on session start (child becomes active
+      // OR app foregrounds). The two bump actions are called from inside
+      // gameStore — beginQuest after the idempotency guard, and
+      // markQuestCompletion after award_xp succeeds.
+      resetSessionCounters: () =>
+        set({ sessionCounters: { questsStarted: 0, questsFinished: 0, xpEarned: 0 } }),
+
+      bumpSessionQuestStarted: () =>
+        set((state) => ({
+          sessionCounters: {
+            ...state.sessionCounters,
+            questsStarted: state.sessionCounters.questsStarted + 1,
+          },
+        })),
+
+      bumpSessionQuestFinished: (xp: number) =>
+        set((state) => ({
+          sessionCounters: {
+            ...state.sessionCounters,
+            questsFinished: state.sessionCounters.questsFinished + 1,
+            // Guard against undefined / NaN propagating into the aggregate
+            xpEarned:       state.sessionCounters.xpEarned + (typeof xp === "number" && !isNaN(xp) ? xp : 0),
+          },
+        })),
 
       // ── Session ────────────────────────────────────────────
       startChildSession: (child) => {
@@ -469,6 +519,11 @@ export const useGameStore = create<GameState>()(
         ) {
           return;
         }
+
+        // v4.4 — bump session counter ONLY on a real new quest start.
+        // Placed AFTER the idempotency guard so a remount-after-background
+        // (which short-circuits above) cannot inflate the count.
+        get().bumpSessionQuestStarted();
 
         const ageBandProps = quest.age_band_properties?.[ageBand];
 
@@ -724,6 +779,12 @@ export const useGameStore = create<GameState>()(
             if (xpError) {
               console.error("[markQuestCompletion] award_xp RPC failed:", xpError);
             } else {
+              // v4.4 — bump session counter only after award_xp succeeded.
+              // This guarantees sum(game_sessions.xp_earned) over a session
+              // matches the actual delta to child_profiles.total_xp.
+              // Bumped BEFORE refreshChildFromDB so a slow refresh can't
+              // lose the count to a tab switch / quick child swap.
+              get().bumpSessionQuestFinished(totalXp);
               await get().refreshChildFromDB();
             }
             get().loadCompletedQuests();
@@ -993,6 +1054,9 @@ export const useGameStore = create<GameState>()(
         spellBook:             state.spellBook,
         hasSeenOnboarding:     state.hasSeenOnboarding,
         // achievements are NOT persisted — always loaded fresh from DB
+        // sessionCounters are NOT persisted — they're per-app-session,
+        //   reset on every cold start. Adding them here would carry zero
+        //   counts across restarts only to be reset on the next sign-in.
       }),
     }
   )
@@ -1092,7 +1156,7 @@ export const selectQuestCompletionMode = (
  */
 export const selectHasHardMode = (quest: Quest): boolean =>
   Array.isArray(quest.hard_mode_properties) && quest.hard_mode_properties.length > 0;
- 
+
 /**
  * Returns fractional XP progress toward the next level (0 – 1).
  * XP formula mirrors the server-side award_xp stored procedure:

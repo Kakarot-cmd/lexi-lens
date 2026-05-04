@@ -228,3 +228,82 @@ export function recordMissedScanReducer(
   );
   return { activeQuest: { ...state.activeQuest, components } };
 }
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 16. sessionCounters — fix for v4.3 Known Gap "App.tsx quest counters not incremented"
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Pure-reducer mirrors of the three new gameStore actions. We test the
+// counter math against an in-memory shape rather than spinning up the full
+// Zustand store, matching the existing pattern of *Reducer extractions in
+// gameStoreLogic.ts (recordComponentFoundReducer, recordMissedScanReducer, etc.).
+//
+// PASTE THIS BLOCK AT THE END OF test/gameStoreLogic.test.ts.
+
+describe("sessionCounters", () => {
+  type Counters = { questsStarted: number; questsFinished: number; xpEarned: number };
+  const ZERO: Counters = { questsStarted: 0, questsFinished: 0, xpEarned: 0 };
+
+  // Pure reducer mirrors of gameStore's three new action callbacks.
+  const reset = (): Counters => ({ ...ZERO });
+
+  const bumpStarted = (c: Counters): Counters => ({
+    ...c,
+    questsStarted: c.questsStarted + 1,
+  });
+
+  const bumpFinished = (c: Counters, xp: number): Counters => ({
+    ...c,
+    questsFinished: c.questsFinished + 1,
+    xpEarned:       c.xpEarned + (typeof xp === "number" && !isNaN(xp) ? xp : 0),
+  });
+
+  test("reset returns the zero state", () => {
+    expect(reset()).toEqual(ZERO);
+  });
+
+  test("starting two quests increments started by 2 only", () => {
+    let c = reset();
+    c = bumpStarted(c);
+    c = bumpStarted(c);
+    expect(c).toEqual({ questsStarted: 2, questsFinished: 0, xpEarned: 0 });
+  });
+
+  test("finishing accumulates xp across multiple completions", () => {
+    let c = reset();
+    c = bumpStarted(c);
+    c = bumpFinished(c, 80);
+    c = bumpStarted(c);
+    c = bumpFinished(c, 120);
+    expect(c).toEqual({ questsStarted: 2, questsFinished: 2, xpEarned: 200 });
+  });
+
+  test("finishing without starting still bumps (defensive — events can race)", () => {
+    let c = reset();
+    c = bumpFinished(c, 60);
+    expect(c).toEqual({ questsStarted: 0, questsFinished: 1, xpEarned: 60 });
+  });
+
+  test("xp parameter null/undefined is treated as 0 (no NaN propagation)", () => {
+    let c = reset();
+    // @ts-expect-error — exercise the runtime guard
+    c = bumpFinished(c, undefined);
+    expect(c.xpEarned).toBe(0);
+    expect(Number.isNaN(c.xpEarned)).toBe(false);
+    // @ts-expect-error — exercise the runtime guard
+    c = bumpFinished(c, null);
+    expect(c.xpEarned).toBe(0);
+  });
+
+  test("reset wipes accumulated counts (per-app-session semantics)", () => {
+    let c = reset();
+    c = bumpStarted(c);
+    c = bumpFinished(c, 100);
+    expect(c.xpEarned).toBe(100);
+    c = reset();
+    expect(c).toEqual(ZERO);
+  });
+});
+
