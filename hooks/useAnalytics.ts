@@ -2,6 +2,20 @@
  * hooks/useAnalytics.ts
  * Lexi-Lens — Phase 3.7: Custom Analytics
  *
+ * v4.4.1 fix (this file): quest_sessions.game_session_id was always NULL.
+ *   Root cause: useAnalytics() is called in BOTH App.tsx and ScanScreen.tsx.
+ *   Each call returns a separate hook instance with its own gameSessionRef.
+ *   App.tsx's instance owned startSession() and populated its OWN ref. When
+ *   ScanScreen's instance ran startQuestSession(), the fallback
+ *   `payload.gameSessionId ?? gameSessionRef.current` saw ScanScreen's
+ *   never-touched local ref (null) → game_session_id stored as NULL.
+ *
+ *   Fix: hoist gameSessionId into useGameStore. Both hook instances now
+ *   read/write the same value via useGameStore.getState() — startSession
+ *   writes it, endSession reads + clears it, startQuestSession reads it
+ *   as the fallback. The questSessionRef stays hook-local because the
+ *   start/finish pair always lives in the same hook instance (ScanScreen).
+ *
  * Lightweight hook that writes session and word outcome data to Supabase.
  * Works alongside Sentry — Sentry catches crashes, this hook tracks behaviour.
  *
@@ -43,7 +57,11 @@ interface QuestSessionPayload {
 
 export function useAnalytics() {
   const activeChild     = useGameStore((s) => s.activeChild);
-  const gameSessionRef  = useRef<string | null>(null);   // current game_sessions.id
+
+  // v4.4.1 — gameSessionRef removed. Replaced with useGameStore.getState().gameSessionId
+  // so any instance of this hook reads the same value. See file header for full
+  // rationale. questSessionRef stays hook-local — start/finish always pair within
+  // the same instance (ScanScreen) so cross-instance sharing isn't needed there.
   const questSessionRef = useRef<string | null>(null);   // current quest_sessions.id
 
   // ── App session lifecycle ──────────────────────────────────────────────────
@@ -59,7 +77,10 @@ export function useAnalytics() {
         .single();
 
       if (error) throw error;
-      gameSessionRef.current = data.id;
+
+      // v4.4.1 — write to store instead of hook-local ref so ScanScreen's
+      // hook instance can read the same value.
+      useGameStore.getState().setGameSessionId(data.id);
 
       addGameBreadcrumb({
         category: "navigation",
@@ -78,7 +99,8 @@ export function useAnalytics() {
     xpEarned:       number;
     screenSequence: string[];
   }) => {
-    const sid = gameSessionRef.current;
+    // v4.4.1 — read live from store at flush time. No closure capture risk.
+    const sid = useGameStore.getState().gameSessionId;
     if (!sid) return;
     try {
       await supabase
@@ -100,7 +122,10 @@ export function useAnalytics() {
     } catch {
       // Non-fatal.
     } finally {
-      gameSessionRef.current = null;
+      // v4.4.1 — clear in store so subsequent startQuestSession calls without
+      // an open game_sessions row get NULL (correct behaviour) rather than
+      // a stale id pointing at the just-closed row.
+      useGameStore.getState().setGameSessionId(null);
     }
   }, []);
 
@@ -109,12 +134,17 @@ export function useAnalytics() {
   /** Call when ScanScreen mounts for a given quest. */
   const startQuestSession = useCallback(async (payload: QuestSessionPayload) => {
     try {
+      // v4.4.1 — fallback now reads from store so ScanScreen's hook instance
+      // sees the value App.tsx's hook instance wrote on session start.
+      const gameSessionIdToUse =
+        payload.gameSessionId ?? useGameStore.getState().gameSessionId ?? null;
+
       const { data, error } = await supabase
         .from("quest_sessions")
         .insert({
           child_id:        payload.childId,
           quest_id:        payload.questId,
-          game_session_id: payload.gameSessionId ?? gameSessionRef.current,
+          game_session_id: gameSessionIdToUse,
           hard_mode:       payload.hardMode,
         })
         .select("id")
@@ -126,7 +156,11 @@ export function useAnalytics() {
       addGameBreadcrumb({
         category: "quest",
         message:  `Quest started${payload.hardMode ? " (Hard Mode)" : ""}`,
-        data:     { questId: payload.questId, questSessionId: data.id },
+        data:     {
+          questId:         payload.questId,
+          questSessionId:  data.id,
+          gameSessionId:   gameSessionIdToUse,
+        },
       });
     } catch {
       // Non-fatal.
@@ -176,11 +210,11 @@ export function useAnalytics() {
   const logWordOutcome = useCallback(async (payload: WordOutcomePayload) => {
     try {
       await supabase.from("word_outcomes").insert({
-        child_id:   payload.childId,
-        quest_id:   payload.questId ?? null,
-        word:       payload.word,
-        passed:     payload.passed,
-        scan_label: payload.scanLabel,
+        child_id:    payload.childId,
+        quest_id:    payload.questId ?? null,
+        word:        payload.word,
+        passed:      payload.passed,
+        scan_label:  payload.scanLabel,
         attempt_num: payload.attempt,
       });
     } catch {
@@ -194,8 +228,12 @@ export function useAnalytics() {
     startQuestSession,
     finishQuestSession,
     logWordOutcome,
-    /** Expose session IDs so callers can pass them to startQuestSession. */
-    gameSessionId:  gameSessionRef.current,
+    /**
+     * v4.4.1 — these reflect the live store/ref values, exposed for callers
+     * that want to pass them explicitly into startQuestSession (rare — the
+     * store-fallback inside startQuestSession handles 99% of cases).
+     */
+    gameSessionId:  useGameStore.getState().gameSessionId,
     questSessionId: questSessionRef.current,
   };
 }

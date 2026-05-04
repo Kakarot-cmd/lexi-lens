@@ -2,7 +2,21 @@
  * gameStore.ts
  * Lexi-Lens — Zustand store for all client-side game state.
  *
- * v4.4 additions (this file):
+ * v4.4.1 additions (this file):
+ *   • gameSessionId: string | null  — hoisted from useAnalytics hook-local ref
+ *     so any instance of useAnalytics (currently called in BOTH App.tsx and
+ *     ScanScreen.tsx) reads the same value via useGameStore.getState(). Fixes
+ *     v4.4 Known Bug A: quest_sessions.game_session_id was always NULL because
+ *     ScanScreen's hook instance had its own ref that startSession() never
+ *     touched (App.tsx's instance owned the start). NOT persisted — per-app-
+ *     session value, resets on cold start.
+ *   • addWordToTome findIndex now case-insensitive — "Soft" and "soft" no
+ *     longer create duplicate cache entries. The DB upsert (record_word_learned
+ *     RPC) was already idempotent server-side; this fix prevents the local
+ *     cache from showing duplicates until next setWordTomeCache from DB.
+ *     Same fix shape as the v4.3 reducer case-insensitivity fix.
+ *
+ * v4.4 additions:
  *   • sessionCounters slice — { questsStarted, questsFinished, xpEarned }
  *     incremented by beginQuest (after idempotency guard) and
  *     markQuestCompletion (after award_xp success). NOT persisted —
@@ -266,6 +280,14 @@ interface GameState {
   bumpSessionQuestStarted:  () => void;
   bumpSessionQuestFinished: (xp: number) => void;
 
+  // ── v4.4.1: Game session id (NOT persisted — per app session) ──
+  // Hoisted from useAnalytics hook-local ref so all hook instances
+  // (App.tsx + ScanScreen.tsx) read the same value. Without this,
+  // ScanScreen's startQuestSession() couldn't link the row to the
+  // currently-open game_sessions row → game_session_id always NULL.
+  gameSessionId:    string | null;
+  setGameSessionId: (id: string | null) => void;
+
   // ── Actions ────────────────────────────────────────────────
   startChildSession:     (child: ChildSession) => void;
   endChildSession:       () => void;
@@ -369,6 +391,10 @@ export const useGameStore = create<GameState>()(
 
       // v4.4 — session counters initial state (always zeroed at cold start)
       sessionCounters: { questsStarted: 0, questsFinished: 0, xpEarned: 0 },
+
+      // v4.4.1 — game session id initial state (always null at cold start)
+      gameSessionId:    null,
+      setGameSessionId: (id) => set({ gameSessionId: id }),
 
       // ── N1: Onboarding gate ────────────────────────────────
       hasSeenOnboarding:      false,
@@ -685,7 +711,7 @@ export const useGameStore = create<GameState>()(
       },
 
       // ── Word Tome ──────────────────────────────────────────
-      // PERSISTENCE FIX: addWordToTome was previously local-only —
+      // PERSISTENCE FIX (v4.3): addWordToTome was previously local-only —
       // wordTomeCache was updated, but nothing ever wrote to the
       // public.word_tome table. Result: every child's Word Tome was
       // empty across sessions, the PDF export was empty, and the
@@ -696,10 +722,20 @@ export const useGameStore = create<GameState>()(
       // (child_id, word) — increments times_used on conflict).
       // The RPC failure is logged but never breaks the local cache
       // update, so the in-game UX is unaffected if the network is down.
+      //
+      // v4.4.1 — local cache findIndex is now case-insensitive AND
+      // trim-aware, mirroring the server-side record_word_learned RPC's
+      // case folding. Without this, "Soft" and "soft" produced two
+      // distinct local cache entries until the next setWordTomeCache()
+      // from DB rewrote the slice. Same fix shape as the v4.3 reducer
+      // case-insensitivity fix.
       addWordToTome: (entry) => {
         // Local cache update — synchronous, unchanged behaviour.
         set((state) => {
-          const existing = state.wordTomeCache.findIndex((w) => w.word === entry.word);
+          const incomingKey = entry.word.toLowerCase().trim();
+          const existing = state.wordTomeCache.findIndex(
+            (w) => w.word.toLowerCase().trim() === incomingKey
+          );
           if (existing >= 0) {
             const updated = [...state.wordTomeCache];
             updated[existing] = {
@@ -1057,6 +1093,9 @@ export const useGameStore = create<GameState>()(
         // sessionCounters are NOT persisted — they're per-app-session,
         //   reset on every cold start. Adding them here would carry zero
         //   counts across restarts only to be reset on the next sign-in.
+        // gameSessionId is NOT persisted — same per-app-session reasoning.
+        //   A persisted UUID from a previous run would point to a
+        //   long-closed game_sessions row.
       }),
     }
   )
