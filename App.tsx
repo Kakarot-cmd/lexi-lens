@@ -272,7 +272,7 @@ function App() {
   // never break the game loop. Quest-level writes (startQuestSession /
   // finishQuestSession / logWordOutcome) are wired separately in ScanScreen.
   //
-  // SESSION COUNTERS FIX (v4.3 Known Gap → resolved here):
+  // SESSION COUNTERS FIX (v4.4 — Known Gap "App.tsx quest counters not incremented"):
   // The previous shape declared `questCountsRef = useRef({ started, finished, xp })`
   // and read it back into endSession's payload, but no code path ever
   // incremented it — every game_sessions row closed with 0/0/0. The counter
@@ -282,6 +282,18 @@ function App() {
   // inside the cleanup and the AppState callback — getState() returns the
   // current snapshot (not a stale closure capture), which is exactly what
   // we want when closing the session row.
+  //
+  // SCREEN_SEQUENCE FIRST-ENTRY FIX (v4.4.2 — Bug E):
+  // Before this fix, the first game_sessions row per child opened with an
+  // empty screen_sequence and stayed empty until a fresh navigation event
+  // fired AFTER session start. Cause: NavigationContainer's onStateChange
+  // fires when navigation commits, which can happen BEFORE this activeChild
+  // useEffect runs (React batches state from ChildSwitcher — setActiveChild
+  // and navigate("QuestMap") both queue, navigation onStateChange fires
+  // during commit, then this useEffect runs after commit and resets the ref
+  // — wiping "QuestMap"). Fix: after resetting, capture the current route
+  // via navigationRef and seed the sequence with it. Guarantees every closed
+  // session has at least one screen recorded.
   const { startSession, endSession } = useAnalytics();
   const screenSequenceRef = useRef<string[]>([]);
 
@@ -291,6 +303,14 @@ function App() {
     // Open a fresh session row for this child.
     screenSequenceRef.current = [];
     useGameStore.getState().resetSessionCounters();
+
+    // v4.4.2 — seed with the current route so the first nav event for this
+    // session isn't lost. See SCREEN_SEQUENCE FIRST-ENTRY FIX comment above.
+    const initialRoute = navigationRef.getCurrentRoute();
+    if (initialRoute?.name) {
+      screenSequenceRef.current.push(initialRoute.name);
+    }
+
     startSession();
 
     // Cleanup runs on child switch OR sign-out — close the row.
@@ -323,6 +343,17 @@ function App() {
       } else if (nextState === "active") {
         screenSequenceRef.current = [];
         useGameStore.getState().resetSessionCounters();
+
+        // v4.4.2 — same fix as the activeChild effect above. When the user
+        // foregrounds the app the navigation state hasn't changed (they're
+        // returning to whatever screen they left), so onStateChange won't
+        // fire — without seeding here, the session row would close with
+        // zero screens recorded.
+        const route = navigationRef.getCurrentRoute();
+        if (route?.name) {
+          screenSequenceRef.current.push(route.name);
+        }
+
         startSession();
       }
     });
@@ -344,7 +375,10 @@ function App() {
 
       // Phase 3.7: accumulate the screen sequence for the closing
       // game_sessions.screen_sequence column. Dedup consecutive
-      // duplicates so re-renders don't pollute the trail.
+      // duplicates so re-renders don't pollute the trail. The seed-with-
+      // initial-route logic in the activeChild useEffect above also relies
+      // on this dedup — if the initial route fires a redundant nav event
+      // (some platforms do this on mount), we don't double-push it.
       const seq = screenSequenceRef.current;
       if (seq[seq.length - 1] !== route.name) {
         seq.push(route.name);
