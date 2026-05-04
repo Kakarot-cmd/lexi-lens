@@ -306,9 +306,11 @@ function App() {
 
     // v4.4.2 — seed with the current route so the first nav event for this
     // session isn't lost. See SCREEN_SEQUENCE FIRST-ENTRY FIX comment above.
-    const initialRoute = navigationRef.getCurrentRoute();
-    if (initialRoute?.name) {
-      screenSequenceRef.current.push(initialRoute.name);
+    if (navigationRef.isReady()) {
+      const initialRoute = navigationRef.getCurrentRoute();
+      if (initialRoute?.name) {
+        screenSequenceRef.current.push(initialRoute.name);
+      }
     }
 
     startSession();
@@ -349,10 +351,12 @@ function App() {
         // returning to whatever screen they left), so onStateChange won't
         // fire — without seeding here, the session row would close with
         // zero screens recorded.
-        const route = navigationRef.getCurrentRoute();
-        if (route?.name) {
-          screenSequenceRef.current.push(route.name);
-        }
+       if (navigationRef.isReady()) {
+      const initialRoute = navigationRef.getCurrentRoute();
+      if (initialRoute?.name) {
+        screenSequenceRef.current.push(initialRoute.name);
+      }
+    }
 
         startSession();
       }

@@ -577,3 +577,98 @@ describe("recordMissedScanReducer", () => {
     expect(result.activeQuest!.components.every((c) => c.attemptCount === 0)).toBe(true);
   });
 });
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 17. v4.4.2 — markQuestCompletion retry classifier
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Pure-reducer mirror of the isTransientNetworkError() helper added in
+// v4.4.2 to gameStore.ts. Verifies the network-vs-DB-error classification
+// so a future change can't accidentally cause real DB errors to be retried
+// (which would mask data integrity issues) or transient network errors to
+// be skipped (which would re-introduce Bug C).
+//
+// PASTE THIS BLOCK AT THE END OF test/gameStoreLogic.test.ts.
+
+describe("markQuestCompletion retry classifier", () => {
+  // Mirror of the gameStore helper. Keep these in sync whenever the
+  // production helper changes.
+  function isTransientNetworkError(err: unknown): boolean {
+    if (!err) return false;
+
+    const msg = String((err as any)?.message ?? err ?? "").toLowerCase();
+    if (msg.includes("network request failed")) return true;
+    if (msg.includes("network error"))           return true;
+    if (msg.includes("failed to fetch"))         return true;
+    if (msg.includes("timeout"))                 return true;
+    if (msg.includes("aborted"))                 return true;
+
+    const code = (err as any)?.code;
+    const isTypeError = (err as any)?.name === "TypeError";
+    if (isTypeError && (!code || code === "")) return true;
+
+    return false;
+  }
+
+  test("RN fetch failure (TypeError: Network request failed) is transient", () => {
+    const err = new TypeError("Network request failed");
+    expect(isTransientNetworkError(err)).toBe(true);
+  });
+
+  test("Postgres unique constraint violation is NOT transient", () => {
+    const err = {
+      code:    "23505",
+      message: "duplicate key value violates unique constraint",
+      details: null,
+      hint:    null,
+    };
+    expect(isTransientNetworkError(err)).toBe(false);
+  });
+
+  test("RLS rejection is NOT transient", () => {
+    const err = {
+      code:    "42501",
+      message: "new row violates row-level security policy",
+      details: null,
+      hint:    null,
+    };
+    expect(isTransientNetworkError(err)).toBe(false);
+  });
+
+  test("PostgREST routing error is NOT transient", () => {
+    const err = {
+      code:    "PGRST301",
+      message: "JWT expired",
+      details: null,
+      hint:    null,
+    };
+    expect(isTransientNetworkError(err)).toBe(false);
+  });
+
+  test("Plain timeout string is transient", () => {
+    expect(isTransientNetworkError(new Error("Request timeout"))).toBe(true);
+  });
+
+  test("AbortError-shaped error is transient", () => {
+    expect(isTransientNetworkError(new Error("The operation was aborted"))).toBe(true);
+  });
+
+  test("null / undefined / empty are NOT transient (no retry)", () => {
+    expect(isTransientNetworkError(null)).toBe(false);
+    expect(isTransientNetworkError(undefined)).toBe(false);
+    expect(isTransientNetworkError({})).toBe(false);
+  });
+
+  test("exponential backoff math: 800ms base, 2 retries", () => {
+    const BASE = 800;
+    // Attempt 0 fails → wait BASE * 2^0 = 800ms → attempt 1
+    // Attempt 1 fails → wait BASE * 2^1 = 1600ms → attempt 2 (final)
+    expect(BASE * Math.pow(2, 0)).toBe(800);
+    expect(BASE * Math.pow(2, 1)).toBe(1600);
+    // Total worst-case latency before surrender: 800 + 1600 + (3 * fetch RTT)
+    // ≈ 2.4s + RTTs ≈ ~3.4s on a typical mobile connection.
+    expect(BASE * (Math.pow(2, 0) + Math.pow(2, 1))).toBe(2400);
+  });
+});

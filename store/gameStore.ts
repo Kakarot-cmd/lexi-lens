@@ -2,19 +2,34 @@
  * gameStore.ts
  * Lexi-Lens — Zustand store for all client-side game state.
  *
- * v4.4.1 additions (this file):
- *   • gameSessionId: string | null  — hoisted from useAnalytics hook-local ref
- *     so any instance of useAnalytics (currently called in BOTH App.tsx and
- *     ScanScreen.tsx) reads the same value via useGameStore.getState(). Fixes
- *     v4.4 Known Bug A: quest_sessions.game_session_id was always NULL because
- *     ScanScreen's hook instance had its own ref that startSession() never
- *     touched (App.tsx's instance owned the start). NOT persisted — per-app-
- *     session value, resets on cold start.
+ * v4.4.2 additions (this file):
+ *   • markQuestCompletion now retries on transient network errors —
+ *     fixes Bug C ("[markQuestCompletion] Upsert failed: TypeError:
+ *     Network request failed" silently dropping completions).
+ *
+ *     Retry policy mirrors useLexiEvaluate's existing constants for
+ *     consistency: MAX_RETRIES=2, BASE_DELAY=800ms, exponential backoff
+ *     (800ms → 1600ms). Total worst-case latency: ~3.4 seconds before
+ *     surrender. Both the quest_completions upsert AND the award_xp RPC
+ *     are wrapped — failure of either silently dropped XP before this fix.
+ *
+ *     Only NETWORK errors retry. Real DB errors (UNIQUE constraint
+ *     violations, RLS rejections, missing columns) skip retry — they
+ *     won't resolve themselves and retrying just delays the surfacing.
+ *
+ *     A Sentry breadcrumb fires on every retry attempt and on final
+ *     surrender, giving a clean retry trail in the dashboard. Local
+ *     completedQuestIds set still updates optimistically (UI feels fast)
+ *     but rolls back if all retries fail — so a transient blip leaves
+ *     the user with the correct DB-backed state on next reload.
+ *
+ * v4.4.1 additions:
+ *   • gameSessionId: string | null  — hoisted from useAnalytics hook-local
+ *     ref so any instance of useAnalytics (currently called in BOTH App.tsx
+ *     and ScanScreen.tsx) reads the same value via useGameStore.getState().
+ *     Fixes Bug A: quest_sessions.game_session_id was always NULL.
  *   • addWordToTome findIndex now case-insensitive — "Soft" and "soft" no
- *     longer create duplicate cache entries. The DB upsert (record_word_learned
- *     RPC) was already idempotent server-side; this fix prevents the local
- *     cache from showing duplicates until next setWordTomeCache from DB.
- *     Same fix shape as the v4.3 reducer case-insensitivity fix.
+ *     longer create duplicate cache entries.
  *
  * v4.4 additions:
  *   • sessionCounters slice — { questsStarted, questsFinished, xpEarned }
@@ -22,7 +37,6 @@
  *     markQuestCompletion (after award_xp success). NOT persisted —
  *     resets on every cold start. Read by App.tsx at game_sessions
  *     close to populate quests_started / quests_finished / xp_earned.
- *     Closes v4.3 Known Gap "App.tsx quest counters not incremented".
  *
  * N4 additions:
  *   • AchievementRecord, Badge types (imported from achievementService)
@@ -32,35 +46,19 @@
  *   • loadAchievements()                      — called on session start
  *   • checkAndAwardBadges()                   — called after scan + quest complete
  *   • dismissEarnedBadge()                    — pops front of toast queue
- *   • startChildSession now kicks loadAchievements
- *   • markQuestCompletion now calls checkAndAwardBadges
  *
  * N1 additions:
  *   • hasSeenOnboarding: boolean  — persisted; gates first-session walkthrough
  *   • markOnboardingComplete()    — flips flag, persists to AsyncStorage
  *
- * v2.4 additions (Phase 2.4 — Spell Book):
- *   • SpellUnlock type + spellBook + isLoadingSpells + loadSpellBook()
- *   • markQuestCompletion() auto-calls loadSpellBook()
- *
- * v2.3 additions (Phase 2.3 — Daily Quest + 7-day Streak):
- *   • StreakData + DailyQuestState types
- *   • streak, dailyQuest, isDailyQuestComplete
- *   • loadStreakData(), loadDailyQuest(), recordDailyCompletion()
- *
- * v2.1 additions (Phase 2.1 — Quest Tier System):
- *   • QuestTier union type + TIER_ORDER + TIER_META
- *   • selectUnlockedTiers(), selectQuestsGroupedByTier(), selectTierCleared()
- *
- * v1.4 additions:
- *   • hard mode support + quest completion tracking
- *   • markQuestCompletion(), loadCompletedQuests()
+ * v2.4 / v2.3 / v2.1 / v1.4 — see prior history in repo.
  */
 
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { supabase } from "../lib/supabase";
+import { addGameBreadcrumb } from "../lib/sentry";
 
 // N4 — Achievement service imports
 import {
@@ -83,6 +81,49 @@ function todayDate(): string {
 
 function daysSinceEpoch(): number {
   return Math.floor(Date.now() / 86_400_000);
+}
+
+// ─── v4.4.2 — Retry helpers for markQuestCompletion ──────────────────────────
+//
+// Mirrors useLexiEvaluate.ts constants for consistency (DRY would put these in
+// lib/retry.ts, deferred — keeping them inline so this fix is one-file).
+
+const MQC_MAX_RETRIES         = 2;
+const MQC_BASE_RETRY_DELAY_MS = 800;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Heuristic — does this Supabase error look like a transient network failure?
+ *
+ * On RN, fetch failures arrive as `TypeError: Network request failed` (with
+ * no .code, no .status). On real DB errors, Supabase returns a structured
+ * { code, message, details, hint } shape with a populated .code. We retry
+ * the first class only — retrying real DB errors just delays surfacing.
+ *
+ * Also catches AbortError / timeout-shaped errors that some RN polyfills
+ * raise during connectivity flaps.
+ */
+function isTransientNetworkError(err: unknown): boolean {
+  if (!err) return false;
+
+  const msg = String((err as any)?.message ?? err ?? "").toLowerCase();
+  if (msg.includes("network request failed")) return true;
+  if (msg.includes("network error"))           return true;
+  if (msg.includes("failed to fetch"))         return true;
+  if (msg.includes("timeout"))                 return true;
+  if (msg.includes("aborted"))                 return true;
+
+  // TypeError with no Postgres .code field is the classic RN fetch-failure shape.
+  // Real Postgres errors carry a non-empty code like "23505" (unique violation),
+  // "42501" (RLS), "PGRST..." (PostgREST routing), etc. — all are deterministic
+  // server-side rejections that won't change between retries.
+  const code = (err as any)?.code;
+  const isTypeError = (err as any)?.name === "TypeError";
+  if (isTypeError && (!code || code === "")) return true;
+
+  return false;
 }
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
@@ -129,7 +170,7 @@ export const TIER_META: Record<
 export interface PropertyRequirement {
   word:             string;
   definition:       string;
-  evaluationHints?: string;   // single hint string — matches useLexiEvaluate EvaluatePayload
+  evaluationHints?: string;
 }
 
 export interface Quest {
@@ -144,16 +185,14 @@ export interface Quest {
   xp_reward_third_plus: number;
   required_properties:  PropertyRequirement[];
   age_band_properties?: Record<string, PropertyRequirement[]>;
-  // hard_mode_properties is always an array (empty if no hard mode)
   hard_mode_properties: PropertyRequirement[];
   is_active:            boolean;
-  // tier is required — all quests must have one (defaulted in loadQuests)
   tier:                 QuestTier;
   sort_order?:          number;
   spell_name?:          string;
   weapon_emoji?:        string;
   spell_description?:   string;
-  created_by?:          string;   // AI-generated quests carry the parent's user id
+  created_by?:          string;
 }
 
 export interface ComponentProgress {
@@ -255,11 +294,9 @@ interface GameState {
   questError:            string | null;
   isLoadingCompletions:  boolean;
 
-  // ── N1 ─────────────────────────────────────────────────────
   hasSeenOnboarding:      boolean;
   markOnboardingComplete: () => void;
 
-  // ── N4: Achievement Badge System ───────────────────────────
   achievements:           AchievementRecord[];
   newlyEarnedBadges:      Badge[];
   isLoadingAchievements:  boolean;
@@ -267,10 +304,6 @@ interface GameState {
   checkAndAwardBadges:    () => Promise<void>;
   dismissEarnedBadge:     () => void;
 
-  // ── v4.4: Session counters (NOT persisted — per app session) ───
-  // Closing payload for game_sessions.{quests_started, quests_finished, xp_earned}.
-  // Bumped from beginQuest (started) and markQuestCompletion (finished + xp).
-  // Read by App.tsx at game_sessions close via useGameStore.getState().
   sessionCounters: {
     questsStarted:  number;
     questsFinished: number;
@@ -280,15 +313,9 @@ interface GameState {
   bumpSessionQuestStarted:  () => void;
   bumpSessionQuestFinished: (xp: number) => void;
 
-  // ── v4.4.1: Game session id (NOT persisted — per app session) ──
-  // Hoisted from useAnalytics hook-local ref so all hook instances
-  // (App.tsx + ScanScreen.tsx) read the same value. Without this,
-  // ScanScreen's startQuestSession() couldn't link the row to the
-  // currently-open game_sessions row → game_session_id always NULL.
   gameSessionId:    string | null;
   setGameSessionId: (id: string | null) => void;
 
-  // ── Actions ────────────────────────────────────────────────
   startChildSession:     (child: ChildSession) => void;
   endChildSession:       () => void;
   loadQuests:            () => Promise<void>;
@@ -299,12 +326,6 @@ interface GameState {
     xpAwarded:     number;
     attemptCount:  number;
   }) => void;
-  /**
-   * Atomic batch variant — accepts multiple property updates in one
-   * set() call so concurrent updates from a multi-property scan don't
-   * race and overwrite each other. Use this whenever a single Claude
-   * response confirms 2+ properties at once.
-   */
   recordComponentsFound: (updates: Array<{
     propertyWord:  string;
     objectUsed:    string;
@@ -389,27 +410,18 @@ export const useGameStore = create<GameState>()(
       spellBook:             [],
       isLoadingSpells:       false,
 
-      // v4.4 — session counters initial state (always zeroed at cold start)
       sessionCounters: { questsStarted: 0, questsFinished: 0, xpEarned: 0 },
 
-      // v4.4.1 — game session id initial state (always null at cold start)
       gameSessionId:    null,
       setGameSessionId: (id) => set({ gameSessionId: id }),
 
-      // ── N1: Onboarding gate ────────────────────────────────
       hasSeenOnboarding:      false,
       markOnboardingComplete: () => set({ hasSeenOnboarding: true }),
 
-      // ── N4: Achievement initial state ──────────────────────
       achievements:          [],
       newlyEarnedBadges:     [],
       isLoadingAchievements: false,
 
-      // ── v4.4: Session counter actions ──────────────────────
-      // Reset is called from App.tsx on session start (child becomes active
-      // OR app foregrounds). The two bump actions are called from inside
-      // gameStore — beginQuest after the idempotency guard, and
-      // markQuestCompletion after award_xp succeeds.
       resetSessionCounters: () =>
         set({ sessionCounters: { questsStarted: 0, questsFinished: 0, xpEarned: 0 } }),
 
@@ -426,7 +438,6 @@ export const useGameStore = create<GameState>()(
           sessionCounters: {
             ...state.sessionCounters,
             questsFinished: state.sessionCounters.questsFinished + 1,
-            // Guard against undefined / NaN propagating into the aggregate
             xpEarned:       state.sessionCounters.xpEarned + (typeof xp === "number" && !isNaN(xp) ? xp : 0),
           },
         })),
@@ -439,13 +450,6 @@ export const useGameStore = create<GameState>()(
         set({
           activeChild: child,
           ...(!isSameChild && {
-            // CRITICAL: clear all per-child state when switching children.
-            // activeQuest is now persisted (so partial progress survives
-            // app restarts within the SAME child's session) — but it must
-            // NOT bleed across children. Without this clear, switching
-            // from Child A to Child B while A had an in-progress quest
-            // would show A's quest chips on B's screen, with A's components
-            // already marked found via A's exemplar objects.
             activeQuest:           null,
             completedQuestIds:     [],
             hardCompletedQuestIds: [],
@@ -462,7 +466,6 @@ export const useGameStore = create<GameState>()(
 
         get().loadStreakData();
         get().loadSpellBook();
-        // N4 — load earned badges on session start (fire & forget)
         setTimeout(() => { get().loadAchievements(); }, 0);
       },
 
@@ -502,9 +505,7 @@ export const useGameStore = create<GameState>()(
             )
             .map((q: any): Quest => ({
               ...q,
-              // Guarantee tier is always a valid QuestTier (never undefined)
               tier:                 (q.tier as QuestTier) ?? "apprentice",
-              // Guarantee hard_mode_properties is always an array
               hard_mode_properties: Array.isArray(q.hard_mode_properties)
                 ? q.hard_mode_properties
                 : [],
@@ -533,11 +534,6 @@ export const useGameStore = create<GameState>()(
           Array.isArray(quest.hard_mode_properties) &&
           quest.hard_mode_properties.length > 0;
 
-        // Idempotency guard: if we already have an active quest for the
-        // same quest id AND the same hard-mode flag, DO NOT clobber it.
-        // The user might be returning to ScanScreen mid-quest after
-        // backgrounding — wiping components.found here would re-ask
-        // Claude about already-found properties on the next scan.
         if (
           existing &&
           existing.quest.id === quest.id &&
@@ -546,9 +542,6 @@ export const useGameStore = create<GameState>()(
           return;
         }
 
-        // v4.4 — bump session counter ONLY on a real new quest start.
-        // Placed AFTER the idempotency guard so a remount-after-background
-        // (which short-circuits above) cannot inflate the count.
         get().bumpSessionQuestStarted();
 
         const ageBandProps = quest.age_band_properties?.[ageBand];
@@ -588,10 +581,6 @@ export const useGameStore = create<GameState>()(
         set((state) => {
           if (!state.activeQuest) return state;
 
-          // FIX (Boredom Behemoth chip-stuck-grey): match case-insensitively.
-          // Claude occasionally returns property words with different casing
-          // ("Fibrous" vs canonical "fibrous"). Strict equality silently misses
-          // those, leaving chips grey even though Claude flagged passes:true.
           const target = propertyWord.toLowerCase().trim();
           const components = state.activeQuest.components.map((c) =>
             c.propertyWord.toLowerCase().trim() === target
@@ -601,39 +590,15 @@ export const useGameStore = create<GameState>()(
 
           const enemyHp = calcEnemyHp(components);
 
-          // FIX #2 (audit): NO optimistic XP credit to activeChild.total_xp here.
-          // The xpEarned value is recorded on the component so the verdict card
-          // can display "+X XP" and markQuestCompletion can sum at the end.
-          // But the running total_xp on the child is the AUTHORITATIVE source —
-          // updated only by markQuestCompletion → award_xp RPC → refreshChildFromDB.
-          // This eliminates the optimistic-vs-DB drift class of bug.
           return {
             activeQuest: { ...state.activeQuest, components, enemyHp },
           };
         }),
 
-      /**
-       * Atomic batch update — applies all property unlocks in a single
-       * set() call so the second update can see the first's results.
-       *
-       * Why this exists: when a single Claude response confirms multiple
-       * properties (e.g. "smooth", "round", "hollow" all on a cup), calling
-       * recordComponentFound() in a forEach loop creates a race. Each call
-       * starts from state.activeQuest.components — Zustand may still hold
-       * the pre-update snapshot when the second/third call fires, so
-       * earlier updates get clobbered. Net result: only the LAST property
-       * stays marked found. Quest never completes. Screen never closes.
-       *
-       * The batch path computes one new components array containing every
-       * update, then commits in a single set(). All-or-nothing, no race.
-       */
       recordComponentsFound: (updates) =>
         set((state) => {
           if (!state.activeQuest || updates.length === 0) return state;
 
-          // FIX (Boredom Behemoth chip-stuck-grey): match case-insensitively.
-          // Map keys lowercase-trim so "Fibrous" → "fibrous" lookup succeeds
-          // when canonical components.propertyWord is "fibrous".
           const updateMap = new Map(
             updates.map((u) => [u.propertyWord.toLowerCase().trim(), u])
           );
@@ -653,8 +618,6 @@ export const useGameStore = create<GameState>()(
 
           const enemyHp = calcEnemyHp(components);
 
-          // FIX #2 (audit): NO optimistic XP credit to activeChild.total_xp.
-          // See recordComponentFound above for the full rationale.
           return {
             activeQuest: { ...state.activeQuest, components, enemyHp },
           };
@@ -675,10 +638,6 @@ export const useGameStore = create<GameState>()(
 
       abandonQuest: () =>
         set((state) => {
-          // FIX #2 (audit): abandonQuest no longer rolls back XP because no XP
-          // was optimistically credited during the quest. The child's total_xp
-          // only changes via markQuestCompletion → award_xp, which only fires
-          // on successful completion. Abandoning is now a clean state reset.
           if (!state.activeQuest) return { activeQuest: null };
           return { activeQuest: null };
         }),
@@ -711,26 +670,7 @@ export const useGameStore = create<GameState>()(
       },
 
       // ── Word Tome ──────────────────────────────────────────
-      // PERSISTENCE FIX (v4.3): addWordToTome was previously local-only —
-      // wordTomeCache was updated, but nothing ever wrote to the
-      // public.word_tome table. Result: every child's Word Tome was
-      // empty across sessions, the PDF export was empty, and the
-      // mastery + leaderboard services queried an empty table.
-      //
-      // We now also fire-and-forget the record_word_learned RPC
-      // (defined in schema.sql, security-definer, idempotent on
-      // (child_id, word) — increments times_used on conflict).
-      // The RPC failure is logged but never breaks the local cache
-      // update, so the in-game UX is unaffected if the network is down.
-      //
-      // v4.4.1 — local cache findIndex is now case-insensitive AND
-      // trim-aware, mirroring the server-side record_word_learned RPC's
-      // case folding. Without this, "Soft" and "soft" produced two
-      // distinct local cache entries until the next setWordTomeCache()
-      // from DB rewrote the slice. Same fix shape as the v4.3 reducer
-      // case-insensitivity fix.
       addWordToTome: (entry) => {
-        // Local cache update — synchronous, unchanged behaviour.
         set((state) => {
           const incomingKey = entry.word.toLowerCase().trim();
           const existing = state.wordTomeCache.findIndex(
@@ -748,8 +688,6 @@ export const useGameStore = create<GameState>()(
           return { wordTomeCache: [entry, ...state.wordTomeCache] };
         });
 
-        // DB persistence — fire-and-forget. Reads activeChild fresh
-        // from the store so we don't capture a stale closure value.
         const child = get().activeChild;
         if (!child) return;
 
@@ -765,7 +703,6 @@ export const useGameStore = create<GameState>()(
               console.warn("[addWordToTome] record_word_learned RPC failed:", error.message);
             }
           } catch (e) {
-            // Non-fatal — local cache already updated; UX continues.
             console.warn("[addWordToTome] record_word_learned threw:", e);
           }
         })();
@@ -781,18 +718,110 @@ export const useGameStore = create<GameState>()(
       clearScanHistory: () => set({ scanHistory: [] }),
 
       // ── v1.4: Quest completion ─────────────────────────────
+      //
+      // v4.4.2 — Bug C fix: retry-with-backoff on transient network errors.
+      //
+      // The previous shape (try { upsert; if (!err) award_xp; } catch {}) silently
+      // dropped completions whenever a single fetch hit a network glitch — a real
+      // problem on iOS dev mode (TypeError: Network request failed) and a latent
+      // problem in production (carrier handoff, lift cellular, brief WiFi drop).
+      //
+      // Strategy:
+      //   • Each Supabase call wrapped in retryOnNetworkError() with 2 retries.
+      //   • Total worst-case latency ~3.4s before surrender.
+      //   • Real DB errors (UNIQUE violation, RLS, missing column) skip retry.
+      //   • Local completedQuestIds set still updates optimistically — UI feels
+      //     fast — but rolls back if all retries fail. So a transient blip leaves
+      //     the user with the correct DB-backed state on next reload.
+      //   • Sentry breadcrumbs on every retry attempt + final surrender for
+      //     observability.
       markQuestCompletion: async (questId, mode, totalXp) => {
         const { activeChild, completedQuestIds, hardCompletedQuestIds } = get();
         if (!activeChild) return;
 
-        if (mode === "normal" && !completedQuestIds.includes(questId)) {
+        // ── Optimistic local update ────────────────────────────────────────
+        // Set the local flag so the UI updates immediately. If both retries
+        // fail, we roll this back below so DB stays the source of truth.
+        const wasInNormal = completedQuestIds.includes(questId);
+        const wasInHard   = hardCompletedQuestIds.includes(questId);
+        if (mode === "normal" && !wasInNormal) {
           set({ completedQuestIds: [...completedQuestIds, questId] });
-        } else if (mode === "hard" && !hardCompletedQuestIds.includes(questId)) {
+        } else if (mode === "hard" && !wasInHard) {
           set({ hardCompletedQuestIds: [...hardCompletedQuestIds, questId] });
         }
 
-        try {
-          const { error: upsertError } = await supabase
+        // ── Generic retry helper for the two RPC calls below ───────────────
+        // Returns: { ok: true } on success (within retry budget),
+        //          { ok: false, error } on real DB error (skip retry),
+        //          { ok: false, error } on network error after retries exhausted.
+        const retryOnNetworkError = async (
+          label: string,
+          fn:    () => PromiseLike<{ error: any | null }>
+        ): Promise<{ ok: true } | { ok: false; error: any }> => {
+          for (let attempt = 0; attempt <= MQC_MAX_RETRIES; attempt++) {
+            try {
+              const { error } = await fn();
+              if (!error) {
+                if (attempt > 0) {
+                  addGameBreadcrumb({
+                    category: "quest",
+                    message:  `[markQuestCompletion] ${label} succeeded on retry ${attempt}`,
+                    data:     { questId, mode, totalXp, attempt },
+                  });
+                }
+                return { ok: true };
+              }
+
+              // We got an error object back — is it transient or a real DB error?
+              if (!isTransientNetworkError(error)) {
+                console.error(`[markQuestCompletion] ${label} failed (non-transient, skipping retry):`, error);
+                return { ok: false, error };
+              }
+
+              // Transient — retry if we have budget left
+              if (attempt < MQC_MAX_RETRIES) {
+                const delay = MQC_BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
+                addGameBreadcrumb({
+                  category: "quest",
+                  message:  `[markQuestCompletion] ${label} network error, retry ${attempt + 1} in ${delay}ms`,
+                  data:     { questId, mode, totalXp, attempt: attempt + 1, errorMsg: String((error as any)?.message ?? error) },
+                });
+                await sleep(delay);
+                continue;
+              }
+
+              // Out of retries
+              console.error(`[markQuestCompletion] ${label} failed after ${MQC_MAX_RETRIES} retries:`, error);
+              return { ok: false, error };
+            } catch (thrown) {
+              // Supabase errors usually arrive as { error } in the destructured
+              // response, but a thrown TypeError from the RN fetch polyfill can
+              // bypass that and land here. Same retry logic.
+              if (!isTransientNetworkError(thrown)) {
+                console.error(`[markQuestCompletion] ${label} threw (non-transient, skipping retry):`, thrown);
+                return { ok: false, error: thrown };
+              }
+              if (attempt < MQC_MAX_RETRIES) {
+                const delay = MQC_BASE_RETRY_DELAY_MS * Math.pow(2, attempt);
+                addGameBreadcrumb({
+                  category: "quest",
+                  message:  `[markQuestCompletion] ${label} threw network error, retry ${attempt + 1} in ${delay}ms`,
+                  data:     { questId, mode, totalXp, attempt: attempt + 1, errorMsg: String((thrown as any)?.message ?? thrown) },
+                });
+                await sleep(delay);
+                continue;
+              }
+              console.error(`[markQuestCompletion] ${label} threw after ${MQC_MAX_RETRIES} retries:`, thrown);
+              return { ok: false, error: thrown };
+            }
+          }
+          // Unreachable but TS wants a return path
+          return { ok: false, error: new Error("retry loop exited unexpectedly") };
+        };
+
+        // ── Step 1: upsert quest_completions row ───────────────────────────
+        const upsertOutcome = await retryOnNetworkError("Upsert", () =>
+          supabase
             .from("quest_completions")
             .upsert(
               {
@@ -803,35 +832,83 @@ export const useGameStore = create<GameState>()(
                 completed_at: new Date().toISOString(),
               },
               { onConflict: "child_id,quest_id,mode" }
-            );
+            )
+            .then((res) => ({ error: res.error }))
+        );
 
-          if (upsertError) {
-            console.error("[markQuestCompletion] Upsert failed:", upsertError);
-          } else {
-            const { error: xpError } = await supabase.rpc("award_xp", {
+        if (!upsertOutcome.ok) {
+          // Roll back the optimistic local update so DB stays source of truth.
+          // On next loadCompletedQuests() the DB-side absence will reassert.
+          if (mode === "normal" && !wasInNormal) {
+            set((s) => ({
+              completedQuestIds: s.completedQuestIds.filter((id) => id !== questId),
+            }));
+          } else if (mode === "hard" && !wasInHard) {
+            set((s) => ({
+              hardCompletedQuestIds: s.hardCompletedQuestIds.filter((id) => id !== questId),
+            }));
+          }
+
+          addGameBreadcrumb({
+            category: "quest",
+            message:  "[markQuestCompletion] Final surrender — local state rolled back",
+            data:     {
+              questId,
+              mode,
+              totalXp,
+              stage:    "upsert",
+              errorMsg: String((upsertOutcome.error as any)?.message ?? upsertOutcome.error),
+            },
+          });
+          return;
+        }
+
+        // ── Step 2: award_xp RPC ───────────────────────────────────────────
+        const xpOutcome = await retryOnNetworkError("award_xp", () =>
+          supabase
+            .rpc("award_xp", {
               p_child_id: activeChild.id,
               p_xp:       totalXp,
-            });
-            if (xpError) {
-              console.error("[markQuestCompletion] award_xp RPC failed:", xpError);
-            } else {
-              // v4.4 — bump session counter only after award_xp succeeded.
-              // This guarantees sum(game_sessions.xp_earned) over a session
-              // matches the actual delta to child_profiles.total_xp.
-              // Bumped BEFORE refreshChildFromDB so a slow refresh can't
-              // lose the count to a tab switch / quick child swap.
-              get().bumpSessionQuestFinished(totalXp);
-              await get().refreshChildFromDB();
-            }
-            get().loadCompletedQuests();
-          }
-        } catch (e) {
-          console.error("[markQuestCompletion] Unexpected error:", e);
+            })
+            .then((res) => ({ error: res.error }))
+        );
+
+        if (!xpOutcome.ok) {
+          // The completion row IS in the DB at this point — leave it. Rolling
+          // back the local set would mean the user's quest "uncompletes" on
+          // reload but the DB shows it complete. Keep the local set as-is.
+          // The XP itself is missing, but loadCompletedQuests() on next start
+          // will at least keep the quest looking complete.
+          //
+          // We still need to call refreshChildFromDB to reconcile total_xp
+          // from the server — if the RPC partially succeeded (which can
+          // happen with network blips on the response side), the child's
+          // total_xp may already be updated server-side.
+          addGameBreadcrumb({
+            category: "quest",
+            message:  "[markQuestCompletion] award_xp surrendered — completion saved but XP unconfirmed",
+            data:     {
+              questId,
+              mode,
+              totalXp,
+              stage:    "award_xp",
+              errorMsg: String((xpOutcome.error as any)?.message ?? xpOutcome.error),
+            },
+          });
+          await get().refreshChildFromDB();
+          get().loadCompletedQuests();
+          return;
         }
+
+        // ── Both calls succeeded — bump session counter and refresh ────────
+        // Bumped BEFORE refreshChildFromDB so a slow refresh can't lose the
+        // count to a tab switch / quick child swap.
+        get().bumpSessionQuestFinished(totalXp);
+        await get().refreshChildFromDB();
+        get().loadCompletedQuests();
 
         get().recordDailyCompletion(questId);
         get().loadSpellBook();
-        // N4 — check for newly earned badges after quest complete
         get().checkAndAwardBadges();
       },
 
@@ -1028,7 +1105,6 @@ export const useGameStore = create<GameState>()(
         } = get();
         if (!activeChild) return;
 
-        // Always load fresh from DB — prevents double-awarding across sessions
         const currentEarned = await loadEarnedAchievements(activeChild.id);
 
         const ctx: BadgeCheckContext = {
@@ -1048,13 +1124,11 @@ export const useGameStore = create<GameState>()(
         const nowStr     = new Date().toISOString();
         const newRecords = newBadges.map((b) => ({ badge_id: b.id, earned_at: nowStr }));
 
-        // Update cache + push to toast queue
         set((state) => ({
           achievements:      [...state.achievements, ...newRecords],
           newlyEarnedBadges: [...state.newlyEarnedBadges, ...newBadges],
         }));
 
-        // Fire push notification per badge (stagger 1.5s apart)
         newBadges.forEach((badge, i) => {
           setTimeout(async () => {
             try {
@@ -1075,12 +1149,6 @@ export const useGameStore = create<GameState>()(
       storage: createJSONStorage(() => AsyncStorage),
       partialize: (state) => ({
         activeChild:           state.activeChild,
-        // activeQuest is now persisted so partial progress survives
-        // screen unmounts and app restarts. Without this, navigating
-        // away from ScanScreen mid-quest (or backgrounding the app)
-        // would wipe the components.found flags — meaning the next
-        // scan would re-ask Claude about already-found properties,
-        // award duplicate XP, and break the completion check.
         activeQuest:           state.activeQuest,
         wordTomeCache:         state.wordTomeCache,
         completedQuestIds:     state.completedQuestIds,
@@ -1089,13 +1157,6 @@ export const useGameStore = create<GameState>()(
         isDailyQuestComplete:  state.isDailyQuestComplete,
         spellBook:             state.spellBook,
         hasSeenOnboarding:     state.hasSeenOnboarding,
-        // achievements are NOT persisted — always loaded fresh from DB
-        // sessionCounters are NOT persisted — they're per-app-session,
-        //   reset on every cold start. Adding them here would carry zero
-        //   counts across restarts only to be reset on the next sign-in.
-        // gameSessionId is NOT persisted — same per-app-session reasoning.
-        //   A persisted UUID from a previous run would point to a
-        //   long-closed game_sessions row.
       }),
     }
   )
@@ -1172,13 +1233,6 @@ export const selectSpellsByTier = (
 ): SpellUnlock[] =>
   state.spellBook.filter((s) => s.tier === tier);
 
-// ── Missing selectors (QuestMapScreen) ────────────────────────────────────────
-
-/**
- * Per-quest completion mode — takes (state, questId).
- * Called as: useGameStore((s) => selectQuestCompletionMode(s, quest.id))
- * Returns the highest mode the child has completed this quest in, or null.
- */
 export const selectQuestCompletionMode = (
   state:   GameState,
   questId: string
@@ -1188,20 +1242,9 @@ export const selectQuestCompletionMode = (
   return null;
 };
 
-/**
- * Pure function — takes a Quest object, NOT the store state.
- * Called as: selectHasHardMode(quest)
- * Returns true when the quest has hard-mode properties defined.
- */
 export const selectHasHardMode = (quest: Quest): boolean =>
   Array.isArray(quest.hard_mode_properties) && quest.hard_mode_properties.length > 0;
 
-/**
- * Returns fractional XP progress toward the next level (0 – 1).
- * XP formula mirrors the server-side award_xp stored procedure:
- *   level = floor(sqrt(total_xp / 50)) + 1
- *   threshold_for_level_n = (n-1)^2 * 50
- */
 export const selectLevelProgress = (state: GameState): number => {
   const xp    = state.activeChild?.total_xp ?? 0;
   const level = Math.max(1, state.activeChild?.level ?? 1);
@@ -1212,7 +1255,6 @@ export const selectLevelProgress = (state: GameState): number => {
   return Math.min(1, Math.max(0, (xp - lo) / range));
 };
 
-// ── Age-band property helper ───────────────────────────────────────────────────
 export function getDisplayProperties(
   quest: Quest,
   ageBand: string
