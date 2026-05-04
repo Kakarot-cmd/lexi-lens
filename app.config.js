@@ -60,6 +60,14 @@ export default {
 
     plugins: [
       "react-native-vision-camera",
+	  [
+        "expo-build-properties",  
+        {
+          ios: {
+            deploymentTarget: "16.0",
+          },
+        },
+      ],
       [
         "@sentry/react-native/expo",
         {

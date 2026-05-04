@@ -73,6 +73,7 @@ jobs:
     name: EAS Android production AAB
     runs-on: ubuntu-latest
     needs: typecheck
+    if: ${{ !endsWith(github.ref_name, '-ios') }}
     timeout-minutes: 15
 
     steps:
@@ -110,6 +111,7 @@ jobs:
     name: EAS iOS production IPA
     runs-on: ubuntu-latest
     needs: typecheck
+    if: ${{ !endsWith(github.ref_name, '-android') }}
     timeout-minutes: 15
 
     steps:
