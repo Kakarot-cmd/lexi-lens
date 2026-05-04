@@ -1,27 +1,19 @@
 /**
  * ScanScreen.tsx — Lexi-Lens main gameplay screen
  *
+ * v3.3 iOS patch (on top of v3.7):
+ *   • scanErrorMsg state + onScanError wired to useObjectScanner
+ *   • Camera gets photo={true} video={true} (required for VisionCamera v4
+ *     platform-aware capture — takePhoto on iOS, takeSnapshot on Android)
+ *   • Error toast rendered above ScanButton
+ *
  * v3.5 additions (Rate Limiting + Abuse Prevention):
- *   • Destructures rateLimitCode, scansToday, dailyLimit, approachingLimit,
- *     resetsAt from useLexiEvaluate
- *   • status === "rate_limited" → setPhase("verdict")
- *   • RateLimitWall rendered as absoluteFillObject overlay when rate_limited
- *   • ApproachingLimitBanner shown non-blocking in scanning phase at 80% quota
- *   • limitBannerDismissed local state so child can clear the warning
+ *   • rateLimitCode, scansToday, dailyLimit, approachingLimit, resetsAt
+ *   • RateLimitWall + ApproachingLimitBanner
  *
  * v3.1 additions:
- *   • LiveLabelChip — floating chip on camera showing what ML Kit currently sees
- *   • liveLabel + liveConfidence destructured from useObjectScanner
- *   • StatusBanner receives liveLabel + liveConfidence for idle state text
- *
- * v1.4 changes:
- *   • effectiveProperties for hard mode
- *   • markQuestCompletion on victory dismiss
- *
- * FIX (Metro bundler): removed duplicate `useObjectScanner` call at the
- * bottom of the component body — it re-declared hasPermission, device and
- * requestPermission which were already declared by the full call above it.
- * The cameraKey state and remount useEffect that followed it are kept.
+ *   • LiveLabelChip — floating chip showing ML Kit live label (Android only)
+ *   • liveLabel + liveConfidence from useObjectScanner
  */
 
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
@@ -54,8 +46,6 @@ import { StatusBanner }                          from "../components/StatusBanne
 import { VictoryFusionScreen }                   from "../components/VictoryFusionScreen";
 import { RateLimitWall, ApproachingLimitBanner } from "../components/RateLimitWall";
 import { addGameBreadcrumb }                     from "../lib/sentry";
-
-// ─── Navigation types ─────────────────────────────────────────────────────────
 
 import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "Scan">;
@@ -94,7 +84,7 @@ function CameraOverlay() {
   );
 }
 
-// ─── v3.1: Live ML Kit label chip ────────────────────────────────────────────
+// ─── Live ML Kit label chip (Android only — ML Kit not available on iOS) ──────
 
 function LiveLabelChip({
   label,
@@ -156,8 +146,6 @@ function ComponentsStrip({
   components:   Array<{ propertyWord: string; found: boolean; objectUsed: string | null }>;
   current:      string | null;
   browsedWord:  string | null;
-  /** Words ML Kit's labels suggest the visible object might satisfy.
-   *  Soft glow — guidance, not a verdict. */
   hintedWords:  Set<string>;
   onSelectWord: (word: string) => void;
 }) {
@@ -176,129 +164,57 @@ function ComponentsStrip({
       <Text style={styles.progressLabel}>
         {foundCount} of {total} word{total !== 1 ? "s" : ""} found
       </Text>
-
       <View style={styles.chipsRow}>
-        {components.map((c) => {
-          const isActive  = c.propertyWord === current;
-          const isBrowsed = c.propertyWord === browsedWord;
-          const isHinted  = !c.found && hintedWords.has(c.propertyWord);
+        {components.map((comp) => {
+          const isActive  = comp.propertyWord === current;
+          const isBrowsed = comp.propertyWord === browsedWord;
+          const isHinted  = hintedWords.has(comp.propertyWord);
+
           return (
-            <PropertyChip
-              key={c.propertyWord}
-              propertyWord={c.propertyWord}
-              objectUsed={c.objectUsed}
-              found={c.found}
-              isActive={isActive}
-              isBrowsed={isBrowsed}
-              isHinted={isHinted}
-              onPress={() => { if (!c.found) onSelectWord(c.propertyWord); }}
-            />
+            <Animated.View
+              key={comp.propertyWord}
+              style={[
+                styles.chipHintWrap,
+                isHinted && { borderColor: "#f59e0b" },
+              ]}
+            >
+              <TouchableOpacity
+                style={[
+                  styles.chip,
+                  isActive  && styles.chipActive,
+                  comp.found && styles.chipDone,
+                ]}
+                onPress={() => !comp.found && onSelectWord(comp.propertyWord)}
+                activeOpacity={comp.found ? 1 : 0.7}
+              >
+                {comp.found && (
+                  <Text style={{ fontSize: 10, marginRight: 4 }}>✓</Text>
+                )}
+                <View>
+                  <Text style={[
+                    styles.chipText,
+                    comp.found && styles.chipTextDone,
+                    isHinted  && styles.chipTextHinted,
+                  ]}>
+                    {comp.propertyWord}
+                  </Text>
+                  {comp.found && comp.objectUsed ? (
+                    <Text style={styles.chipObject}>{comp.objectUsed}</Text>
+                  ) : (
+                    <Text style={[
+                      styles.chipTapHint,
+                      isHinted && styles.chipTapHintHinted,
+                    ]}>
+                      {isHinted ? "✦ try this!" : isBrowsed ? "viewing" : "tap to view"}
+                    </Text>
+                  )}
+                </View>
+              </TouchableOpacity>
+            </Animated.View>
           );
         })}
       </View>
     </View>
-  );
-}
-
-// ─── Property chip — gentle hint glow when ML Kit suggests this property ─────
-//
-// Animation principles:
-//   • Glow is a soft pulsing border, NOT a flashy fill colour. Children
-//     should be drawn to it but not feel like the answer was given to them.
-//   • Animation only runs while isHinted is true — clean stop when hint
-//     drops, no orphan loops.
-//   • Native driver — runs on UI thread, no JS bridge cost.
-
-function PropertyChip({
-  propertyWord,
-  objectUsed,
-  found,
-  isActive,
-  isBrowsed,
-  isHinted,
-  onPress,
-}: {
-  propertyWord: string;
-  objectUsed:   string | null;
-  found:        boolean;
-  isActive:     boolean;
-  isBrowsed:    boolean;
-  isHinted:     boolean;
-  onPress:      () => void;
-}) {
-  const glow = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    if (isHinted) {
-      const loop = Animated.loop(
-        Animated.sequence([
-          Animated.timing(glow, { toValue: 1, duration: 900, useNativeDriver: false }),
-          Animated.timing(glow, { toValue: 0, duration: 900, useNativeDriver: false }),
-        ])
-      );
-      loop.start();
-      return () => loop.stop();
-    } else {
-      glow.setValue(0);
-    }
-  }, [isHinted, glow]);
-
-  // Interpolated values for the gentle pulse. We can't use native driver
-  // for borderColor / backgroundColor — these are layout properties.
-  const borderColor = glow.interpolate({
-    inputRange:  [0, 1],
-    outputRange: ["transparent", "#fbbf24"], // warm amber, not aggressive gold
-  });
-  const bgTint = glow.interpolate({
-    inputRange:  [0, 1],
-    outputRange: ["rgba(0,0,0,0)", "rgba(251, 191, 36, 0.10)"],
-  });
-
-  return (
-    <Animated.View
-      style={[
-        styles.chipHintWrap,
-        isHinted && {
-          borderColor,
-          backgroundColor: bgTint,
-        },
-      ]}
-    >
-      <TouchableOpacity
-        style={[
-          styles.chip,
-          isActive && styles.chipActive,
-          found    && styles.chipDone,
-        ]}
-        onPress={onPress}
-        disabled={found}
-      >
-        <Text style={{ color: found ? "#86efac" : isHinted ? "#fbbf24" : P.textDim }}>
-          {found ? "✦" : isHinted ? "✦" : isBrowsed ? "◉" : "○"}
-        </Text>
-        <View>
-          <Text
-            style={[
-              styles.chipText,
-              found    && styles.chipTextDone,
-              isHinted && styles.chipTextHinted,
-            ]}
-          >
-            {propertyWord}
-          </Text>
-          {found && objectUsed && (
-            <Text style={styles.chipObject} numberOfLines={1}>
-              via {objectUsed}
-            </Text>
-          )}
-          {!found && (
-            <Text style={[styles.chipTapHint, isHinted && styles.chipTapHintHinted]}>
-              {isHinted ? "try this!" : isBrowsed ? "viewing" : "tap to view"}
-            </Text>
-          )}
-        </View>
-      </TouchableOpacity>
-    </Animated.View>
   );
 }
 
@@ -414,15 +330,7 @@ function QuestIntro({
   );
 }
 
-// ─── Scan button — reacts to ML Kit scanReady signal ─────────────────────────
-//
-// Three states:
-//   idle      — ML Kit hasn't found anything yet
-//   locking   — label detected but not yet stable (stableFrameCount 1-2)
-//   ready     — stable + confident enough (scanReady = true)
-//
-// The "ready" state pulses gold and names the detected object, giving the
-// child a clear "tap now" signal instead of leaving them guessing.
+// ─── Scan button ──────────────────────────────────────────────────────────────
 
 function ScanButton({
   onPress,
@@ -453,7 +361,6 @@ function ScanButton({
     }
   }, [scanReady]);
 
-  // Dot indicator — fills as ML Kit locks on
   const dotCount  = Math.min(stableFrameCount, 3);
   const dotColors = ["#6b5fa0", "#a78bfa", "#f5c842"];
 
@@ -477,7 +384,6 @@ function ScanButton({
         activeOpacity={0.85}
       >
         <Text style={styles.scanBtnText}>{label}</Text>
-        {/* Lock-on dots — appear as ML Kit builds confidence */}
         {stableFrameCount > 0 && !scanReady && (
           <View style={styles.lockDots}>
             {[0, 1, 2].map((i) => (
@@ -510,29 +416,27 @@ export function ScanScreen({ route, navigation }: Props) {
   const questComplete    = useGameStore(selectQuestComplete);
   const streakMultiplier = useGameStore(selectStreakMultiplier);
 
-  const beginQuest           = useGameStore((s) => s.beginQuest);
-  const recordComponentFound  = useGameStore((s) => s.recordComponentFound);
+  const beginQuest            = useGameStore((s) => s.beginQuest);
   const recordComponentsFound = useGameStore((s) => s.recordComponentsFound);
-  const recordMissedScan     = useGameStore((s) => s.recordMissedScan);
-  const completeQuest        = useGameStore((s) => s.completeQuest);
-  const abandonQuest         = useGameStore((s) => s.abandonQuest);
-  const addWordToTome        = useGameStore((s) => s.addWordToTome);
-  const addScanHistory       = useGameStore((s) => s.addScanHistory);
-  const markQuestCompletion  = useGameStore((s) => s.markQuestCompletion);
-  const refreshChildFromDB   = useGameStore((s) => s.refreshChildFromDB);
+  const recordMissedScan      = useGameStore((s) => s.recordMissedScan);
+  const completeQuest         = useGameStore((s) => s.completeQuest);
+  const abandonQuest          = useGameStore((s) => s.abandonQuest);
+  const addWordToTome         = useGameStore((s) => s.addWordToTome);
+  const addScanHistory        = useGameStore((s) => s.addScanHistory);
+  const markQuestCompletion   = useGameStore((s) => s.markQuestCompletion);
 
-  // Phase 3.7 wire-up: per-quest analytics (started here, finished on victory
-  // OR on any abandonment path). logWordOutcome is called from the result
-  // effect, once per property in each Claude verdict.
   const { startQuestSession, finishQuestSession, logWordOutcome } = useAnalytics();
-  const scanCountRef       = useRef(0);
-  const questStartedAtRef  = useRef<string | null>(null);
+  const scanCountRef      = useRef(0);
+  const questStartedAtRef = useRef<string | null>(null);
 
-  const [phase, setPhase]                               = useState<ScreenPhase>("quest_intro");
-  const [lastLabel, setLastLabel]                       = useState<string | null>(null);
-  const [browsedWord, setBrowsedWord]                   = useState<string | null>(null);
+  const [phase,               setPhase]               = useState<ScreenPhase>("quest_intro");
+  const [lastLabel,           setLastLabel]           = useState<string | null>(null);
+  const [browsedWord,         setBrowsedWord]         = useState<string | null>(null);
   const [limitBannerDismissed, setLimitBannerDismissed] = useState(false);
+  // v3.3 iOS patch — surface capture errors as an in-UI toast
+  const [scanErrorMsg,        setScanErrorMsg]        = useState<string | null>(null);
 
+  // ── Begin quest on mount ──────────────────────────────────────────────────
   useEffect(() => {
     const quest = questLibrary.find((q) => q.id === questId);
     if (quest && (!activeQuest || activeQuest.quest.id !== questId)) {
@@ -540,11 +444,7 @@ export function ScanScreen({ route, navigation }: Props) {
     }
   }, [questId]);
 
-  // Phase 3.7: open a quest_sessions row when this quest becomes active.
-  // The activeChild guard prevents firing during a half-loaded state.
-  // Cleanup runs when the user abandons the quest (navigates away without
-  // victory) — handleVictoryDismiss clears questStartedAtRef first so the
-  // cleanup function knows not to log it as an abandon.
+  // ── Quest session lifecycle (Phase 3.7) ──────────────────────────────────
   useEffect(() => {
     const ac = activeChild;
     const aq = activeQuest;
@@ -553,28 +453,18 @@ export function ScanScreen({ route, navigation }: Props) {
 
     questStartedAtRef.current = aq.quest.id;
     scanCountRef.current      = 0;
-    startQuestSession({
-      childId:  ac.id,
-      questId:  aq.quest.id,
-      hardMode: aq.isHardMode,
-    });
+    startQuestSession({ childId: ac.id, questId: aq.quest.id, hardMode: aq.isHardMode });
 
     return () => {
-      // If the ref is still set on cleanup, the user left without a clean
-      // victory dismissal — record it as abandoned with the scan count
-      // and partial XP earned across found components.
       if (questStartedAtRef.current) {
         const partialXp = aq.components.reduce((s, c) => s + c.xpEarned, 0);
-        finishQuestSession({
-          completed:  false,
-          totalScans: scanCountRef.current,
-          xpAwarded:  partialXp,
-        });
+        finishQuestSession({ completed: false, totalScans: scanCountRef.current, xpAwarded: partialXp });
         questStartedAtRef.current = null;
       }
     };
   }, [activeChild?.id, activeQuest?.quest?.id, activeQuest?.isHardMode, startQuestSession, finishQuestSession]);
 
+  // ── Sync browsedWord to currentComponent ─────────────────────────────────
   useEffect(() => {
     if (currentComponent && !browsedWord) {
       setBrowsedWord(currentComponent.propertyWord);
@@ -583,12 +473,11 @@ export function ScanScreen({ route, navigation }: Props) {
 
   const isHardMode          = activeQuest?.isHardMode ?? false;
   const effectiveProperties = activeQuest?.effectiveProperties ?? [];
-
-  const pendingProperties = effectiveProperties.filter(
+  const pendingProperties   = effectiveProperties.filter(
     (p) => !activeQuest?.components.find((c) => c.propertyWord === p.word && c.found)
   );
 
-  // v3.5: expanded destructure
+  // ── useLexiEvaluate ───────────────────────────────────────────────────────
   const {
     status,
     result,
@@ -604,60 +493,33 @@ export function ScanScreen({ route, navigation }: Props) {
     resetsAt,
   } = useLexiEvaluate();
 
-  // ── Core mechanic: save any newly passing property ────────────────────────
-
+  // ── Result effect ─────────────────────────────────────────────────────────
   useEffect(() => {
-    if (status === "rate_limited") {
-      setPhase("verdict");
-      return;
-    }
-
+    if (status === "rate_limited") { setPhase("verdict"); return; }
     if (!result) return;
 
-    // Read activeQuest fresh from store to avoid stale-closure issues if
-    // the effect re-fires before React has committed a recent state update.
     const aq = useGameStore.getState().activeQuest;
     if (!aq) return;
 
     if (status === "match" || status === "no-match") {
       setPhase("verdict");
 
-      // Lowercase-trim everywhere — defends against Claude returning
-      // case-different or whitespace-padded property words.
       const alreadyFound = new Set(
-        (aq.components ?? [])
-          .filter((c) => c.found)
-          .map((c) => c.propertyWord.toLowerCase().trim())
+        (aq.components ?? []).filter((c) => c.found).map((c) => c.propertyWord.toLowerCase().trim())
       );
-
-      // Build a canonical-word map from effectiveProperties so every
-      // recorded update uses the EXACT casing the components were built
-      // with — no chance of a Map lookup miss in the gameStore reducer.
       const canonicalMap = new Map(
-        (aq.effectiveProperties ?? []).map((p) => [
-          p.word.toLowerCase().trim(),
-          p.word,
-        ])
+        (aq.effectiveProperties ?? []).map((p) => [p.word.toLowerCase().trim(), p.word])
       );
-
       const newlyPassing = (result.properties ?? []).filter((p) => {
         const key = p.word.toLowerCase().trim();
-        // Must have passed AND not be already found AND match a known
-        // pending property (defends against Claude inventing a word).
         return p.passes && !alreadyFound.has(key) && canonicalMap.has(key);
       });
 
       if (newlyPassing.length > 0) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-
         const totalXpThisScan = Math.round((result.xpAwarded || 20) * streakMultiplier);
         const xpEach = Math.max(10, Math.floor(totalXpThisScan / newlyPassing.length));
 
-        // ATOMIC: bundle all property unlocks into one set() call so concurrent
-        // updates can't race and clobber each other. See gameStore comment on
-        // recordComponentsFound for full explanation of why this matters.
-        // Use the CANONICAL word from effectiveProperties — never Claude's
-        // raw word — so the reducer's component lookup always succeeds.
         recordComponentsFound(
           newlyPassing.map((p) => ({
             propertyWord: canonicalMap.get(p.word.toLowerCase().trim()) ?? p.word,
@@ -667,7 +529,6 @@ export function ScanScreen({ route, navigation }: Props) {
           }))
         );
 
-        // Word Tome additions stay per-property (each row is independent in DB)
         newlyPassing.forEach((p) => {
           const canonicalWord = canonicalMap.get(p.word.toLowerCase().trim()) ?? p.word;
           const req = (aq.effectiveProperties ?? []).find(
@@ -698,14 +559,7 @@ export function ScanScreen({ route, navigation }: Props) {
         if (currentComponent) recordMissedScan(currentComponent.propertyWord);
       }
 
-      // Phase 3.7: increment quest scan count + log one word_outcome row
-      // per property in this verdict. This is the "words failed most"
-      // data feed and is independent of the property_scores JSONB column
-      // on scan_attempts (which is written by the Edge Function). Two
-      // independent paths = cross-check integrity: the queries in
-      // round4_analysis.sql Block 7 compare them.
       scanCountRef.current += 1;
-
       const ac = useGameStore.getState().activeChild;
       if (ac && result.properties && result.properties.length > 0) {
         const attemptNum = (currentAttempts || 0) + 1;
@@ -725,63 +579,38 @@ export function ScanScreen({ route, navigation }: Props) {
     if (status === "error") setPhase("verdict");
   }, [status, result]);
 
-  // ── Verdict-vs-state watchdog ────────────────────────────────────────────
-  // Catches a class of bug where Claude returns properties with passes:true
-  // but the chip stayed grey afterwards (typically because of word-case
-  // mismatch, a stale cache hit returning a property word that doesn't
-  // match the canonical effectiveProperties, or any future regression).
-  //
-  // If this fires, it means the verdict card is showing successes that
-  // didn't translate into store updates — exactly the "all 3 available
-  // but chips greyed out" symptom from the Boredom Behemoth report.
-  //
-  // The fix path (canonical-word resolution + case-insensitive matching)
-  // upstream of this should mean it never fires. If it does, we'll see it
-  // in Sentry breadcrumbs and know there's a new mismatch to investigate.
+  // ── Verdict-vs-state watchdog ─────────────────────────────────────────────
   useEffect(() => {
     if (!result || (status !== "match" && status !== "no-match")) return;
-
     const aq = useGameStore.getState().activeQuest;
     if (!aq) return;
 
     const passingFromClaude = (result.properties ?? [])
       .filter((p) => p.passes)
       .map((p) => p.word.toLowerCase().trim());
-
     if (passingFromClaude.length === 0) return;
 
     const foundInStore = new Set(
-      aq.components
-        .filter((c) => c.found)
-        .map((c) => c.propertyWord.toLowerCase().trim())
+      aq.components.filter((c) => c.found).map((c) => c.propertyWord.toLowerCase().trim())
     );
-
     const missing = passingFromClaude.filter((w) => !foundInStore.has(w));
-
     if (missing.length > 0) {
       addGameBreadcrumb({
         category: "verdict",
         message:  "verdict_state_mismatch",
         data: {
           questId:           aq.quest.id,
-          questName:         aq.quest.name,
           missingProperties: missing,
           claudeReturned:    passingFromClaude,
           componentsFound:   Array.from(foundInStore),
-          effectiveWords:    (aq.effectiveProperties ?? []).map((p) => p.word),
           detectedLabel:     lastLabel,
         },
       });
     }
   }, [status, result, lastLabel]);
 
+  // ── Handlers ──────────────────────────────────────────────────────────────
   const handleContinue = useCallback(() => {
-    // Read questComplete directly from store at call time to avoid
-    // stale-closure race — Zustand store update (recordComponentFound)
-    // and React state update (setPhase) can land in different render
-    // cycles, making the captured `questComplete` value stale by the
-    // time the user taps Continue. Hard Mode is more susceptible because
-    // its vocabulary is harder so children tap faster after each scan.
     const isComplete = selectQuestComplete(useGameStore.getState());
     if (isComplete) {
       setPhase("quest_victory");
@@ -797,15 +626,9 @@ export function ScanScreen({ route, navigation }: Props) {
   }, [resetEval]);
 
   const handleVictoryDismiss = useCallback(() => {
-    // Read fresh from store — avoids stale closure if the component
-    // re-rendered between the victory phase being set and the user
-    // tapping Continue on VictoryFusionScreen.
     const { activeQuest: aq, activeChild: ac } = useGameStore.getState();
-
     const exitToMap = () => {
       completeQuest();
-      // goBack() is preferred; replace is a safety net if the
-      // navigation stack is in an unexpected state.
       if (navigation.canGoBack()) {
         navigation.goBack();
       } else {
@@ -813,33 +636,20 @@ export function ScanScreen({ route, navigation }: Props) {
       }
     };
 
-    if (!aq || !ac) {
-      exitToMap();
-      return;
-    }
+    if (!aq || !ac) { exitToMap(); return; }
 
     const totalXp = aq.components.reduce((s, c) => s + c.xpEarned, 0);
     const mode    = aq.isHardMode ? "hard" : "normal";
 
-    // Phase 3.7: close the quest_sessions row as completed BEFORE
-    // markQuestCompletion. We clear questStartedAtRef so the unmount
-    // cleanup effect doesn't double-fire as an "abandoned" close.
     if (questStartedAtRef.current) {
-      finishQuestSession({
-        completed:  true,
-        totalScans: scanCountRef.current,
-        xpAwarded:  totalXp,
-      });
+      finishQuestSession({ completed: true, totalScans: scanCountRef.current, xpAwarded: totalXp });
       questStartedAtRef.current = null;
     }
 
-    markQuestCompletion(aq.quest.id, mode, totalXp)
-      .then(exitToMap)
-      .catch(exitToMap);
+    markQuestCompletion(aq.quest.id, mode, totalXp).then(exitToMap).catch(exitToMap);
   }, [completeQuest, markQuestCompletion, navigation, finishQuestSession]);
 
-  // ── v3.1: ML Kit scanner ──────────────────────────────────────────────────
-
+  // ── ML Kit scanner ────────────────────────────────────────────────────────
   const {
     cameraRef,
     device,
@@ -854,20 +664,16 @@ export function ScanScreen({ route, navigation }: Props) {
     requestPermission,
   } = useObjectScanner({
     enabled: phase === "scanning" && status === "idle",
+    // v3.3 iOS patch: surface capture errors as a dismissing toast
+    onScanError: (msg) => {
+      setScanErrorMsg(msg);
+      setTimeout(() => setScanErrorMsg(null), 3000);
+    },
     onDetection: async ({ primary, frameBase64 }) => {
-      // Read activeChild + activeQuest fresh from the store at call time
-      // rather than from React closure. The closure-captured versions can
-      // be stale if the user fired multiple scans without an intermediate
-      // re-render — and pendingProperties derived from a stale activeQuest
-      // would send already-found properties back to Claude on subsequent
-      // scans, causing inflated XP and chips that fail to update.
       const { activeChild: ac, activeQuest: aq } = useGameStore.getState();
       if (!ac || !aq) return;
 
-      // Recompute pending + already-found from THIS-MOMENT state, not closure
-      const alreadyFoundWords = aq.components
-        .filter((c) => c.found)
-        .map((c) => c.propertyWord);
+      const alreadyFoundWords = aq.components.filter((c) => c.found).map((c) => c.propertyWord);
       const pendingNow = (aq.effectiveProperties ?? []).filter(
         (p) => !alreadyFoundWords.includes(p.word)
       );
@@ -891,41 +697,25 @@ export function ScanScreen({ route, navigation }: Props) {
         xp_reward_third_plus: aq.quest.xp_reward_third_plus ?? 10,
       });
     },
-	onScanError: (msg) => {          // ← ADD THIS
-       setScanErrorMsg(msg);          // ← ADD THIS
-        setTimeout(() => setScanErrorMsg(null), 3000); // auto-dismiss
-      },
   });
 
-  // ── Property hint engine (Phase A) ───────────────────────────────────────
-  // Pure client-side keyword matching. Looks at ML Kit's top labels and
-  // soft-glows the chips for properties they suggest might apply.
-  // Never spoils a quest — engine self-suppresses if it would hint
-  // more than half the pending words. Runs in microseconds.
+  // ── Property hint engine ──────────────────────────────────────────────────
   const pendingPropertyWords = useMemo(
     () => pendingProperties.map((p) => p.word),
     [pendingProperties]
   );
-
   const { hintedWords } = useMemo(
-    () => computePropertyHints({
-      labels:            topLabels,
-      pendingProperties: pendingPropertyWords,
-    }),
+    () => computePropertyHints({ labels: topLabels, pendingProperties: pendingPropertyWords }),
     [topLabels.join("|"), pendingPropertyWords.join("|")]
   );
 
-  // Force camera to remount when permission is granted after being denied
+  // Force camera remount when permission is granted
   const [cameraKey, setCameraKey] = React.useState(0);
-
   React.useEffect(() => {
-    if (hasPermission && device) {
-      setCameraKey(k => k + 1);
-    }
+    if (hasPermission && device) setCameraKey((k) => k + 1);
   }, [hasPermission, device]);
 
   // ── Guards ────────────────────────────────────────────────────────────────
-
   if (!hasPermission) {
     return (
       <View style={[styles.center, { paddingTop: insets.top, padding: 32 }]}>
@@ -971,18 +761,20 @@ export function ScanScreen({ route, navigation }: Props) {
   const totalXp    = components.reduce((s, c) => s + c.xpEarned, 0);
 
   // ── Render ────────────────────────────────────────────────────────────────
-
   return (
     <View style={styles.root}>
-          <Camera
-      key={cameraKey}
-      ref={cameraRef}
-      style={StyleSheet.absoluteFill}
-      device={device}
-      isActive={phase === "scanning"}
-      photo={true}
-      video={true}
-    />
+      {/* v3.3: photo={true} enables takePhoto() for iOS path in useObjectScanner
+               video={true} enables takeSnapshot() for Android path */}
+      <Camera
+        key={cameraKey}
+        ref={cameraRef}
+        style={StyleSheet.absoluteFill}
+        device={device}
+        isActive={phase === "scanning"}
+        frameProcessor={frameProcessor}
+        photo={true}
+        video={true}
+      />
 
       {(phase === "scanning" || phase === "component_win") && (
         <>
@@ -1041,18 +833,14 @@ export function ScanScreen({ route, navigation }: Props) {
                 Haptics.selectionAsync();
               }}
             />
-			{scanErrorMsg && (
-    <View style={{
-       backgroundColor: "#7f1d1d",
-        borderRadius: 10,
-        padding: 10,
-        marginBottom: 8,
-      }}>
-       <Text style={{ color: "#fca5a5", fontSize: 13, textAlign: "center" }}>
-         ⚠ {scanErrorMsg}
-       </Text>
-    </View>
-   )}
+
+            {/* v3.3 iOS patch — capture error toast */}
+            {scanErrorMsg !== null && (
+              <View style={styles.scanErrorBanner}>
+                <Text style={styles.scanErrorText}>⚠ {scanErrorMsg}</Text>
+              </View>
+            )}
+
             <ScanButton
               onPress={triggerManualScan}
               isHardMode={isHardMode}
@@ -1154,29 +942,15 @@ const styles = StyleSheet.create({
 
   // Camera viewfinder corners
   corner: { position: "absolute", width: 22, height: 22, borderColor: "#67e8f9", borderWidth: 0 },
-  tl: { top: 80,    left: 20,   borderTopWidth: 2.5,    borderLeftWidth: 2.5,   borderTopLeftRadius: 4 },
-  tr: { top: 80,    right: 20,  borderTopWidth: 2.5,    borderRightWidth: 2.5,  borderTopRightRadius: 4 },
+  tl: { top: 80,     left: 20,  borderTopWidth: 2.5,    borderLeftWidth: 2.5,   borderTopLeftRadius: 4 },
+  tr: { top: 80,     right: 20, borderTopWidth: 2.5,    borderRightWidth: 2.5,  borderTopRightRadius: 4 },
   bl: { bottom: 290, left: 20,  borderBottomWidth: 2.5, borderLeftWidth: 2.5,   borderBottomLeftRadius: 4 },
   br: { bottom: 290, right: 20, borderBottomWidth: 2.5, borderRightWidth: 2.5,  borderBottomRightRadius: 4 },
 
   // Live label chip
-  liveChipWrap: {
-    position:   "absolute",
-    top:        "38%",
-    left:       0,
-    right:      0,
-    alignItems: "center",
-    zIndex:     50,
-  },
-  liveChip: {
-    flexDirection:     "row",
-    alignItems:        "center",
-    paddingHorizontal: 14,
-    paddingVertical:   7,
-    borderRadius:      30,
-    borderWidth:       1,
-    borderColor:       "rgba(103,232,249,0.3)",
-  },
+  liveChipWrap: { position: "absolute", top: "38%", left: 0, right: 0, alignItems: "center", zIndex: 50 },
+  liveChip:     { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingVertical: 7,
+                  borderRadius: 30, borderWidth: 1, borderColor: "rgba(103,232,249,0.3)" },
   liveDot:      { width: 7, height: 7, borderRadius: 3.5, marginRight: 6 },
   liveChipText: { fontSize: 14, fontWeight: "600" },
   liveChipConf: { fontSize: 12, fontWeight: "500", opacity: 0.7, marginLeft: 4 },
@@ -1207,16 +981,14 @@ const styles = StyleSheet.create({
   progressLabel: { fontSize: 11, color: P.textDim, marginBottom: 8 },
 
   // Word chips
-  chipsRow:     { flexDirection: "row", flexWrap: "wrap", marginBottom: 8 },
-  chip:         { flexDirection: "row", alignItems: "center", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20, backgroundColor: "rgba(30,16,64,0.85)", borderWidth: 0.5, borderColor: P.cardBorder, marginRight: 6, marginBottom: 6 },
-  chipActive:   { borderColor: P.gold, backgroundColor: "rgba(40,24,80,0.9)" },
-  chipDone:     { borderColor: "#166534", backgroundColor: "rgba(5,46,22,0.85)" },
-  chipText:     { fontSize: 12, color: P.textMuted, marginLeft: 5 },
-  chipTextDone: { color: "#86efac" },
-  chipObject:   { fontSize: 9, color: "#4ade80", opacity: 0.8 },
-  chipTapHint:  { fontSize: 8, color: P.textDim, opacity: 0.6, marginTop: 1 },
-
-  // Property hint glow — pulsing amber border when ML Kit suggests this word
+  chipsRow:          { flexDirection: "row", flexWrap: "wrap", marginBottom: 8 },
+  chip:              { flexDirection: "row", alignItems: "center", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20, backgroundColor: "rgba(30,16,64,0.85)", borderWidth: 0.5, borderColor: P.cardBorder, marginRight: 6, marginBottom: 6 },
+  chipActive:        { borderColor: P.gold, backgroundColor: "rgba(40,24,80,0.9)" },
+  chipDone:          { borderColor: "#166534", backgroundColor: "rgba(5,46,22,0.85)" },
+  chipText:          { fontSize: 12, color: P.textMuted, marginLeft: 5 },
+  chipTextDone:      { color: "#86efac" },
+  chipObject:        { fontSize: 9, color: "#4ade80", opacity: 0.8 },
+  chipTapHint:       { fontSize: 8, color: P.textDim, opacity: 0.6, marginTop: 1 },
   chipHintWrap:      { borderWidth: 1.5, borderColor: "transparent", borderRadius: 14, padding: 1 },
   chipTextHinted:    { color: "#fef3c7" },
   chipTapHintHinted: { fontSize: 8, color: "#fbbf24", opacity: 0.95, marginTop: 1, fontWeight: "700" as const },
@@ -1228,12 +1000,16 @@ const styles = StyleSheet.create({
   seekWord:     { fontSize: 22, fontWeight: "700", color: P.gold, marginBottom: 4 },
   seekDef:      { fontSize: 13, color: P.textMuted, lineHeight: 18 },
 
+  // v3.3 iOS scan error toast
+  scanErrorBanner: { backgroundColor: "#7f1d1d", borderRadius: 10, padding: 10, marginBottom: 8 },
+  scanErrorText:   { color: "#fca5a5", fontSize: 13, textAlign: "center" },
+
   // Scan button
   scanBtn:     { backgroundColor: "#7c3aed", borderRadius: 50, paddingVertical: 16, alignItems: "center", marginBottom: 8 },
   scanBtnHard: { backgroundColor: P.hardRed },
   scanBtnText: { color: "#fff", fontSize: 16, fontWeight: "700" },
 
-  // Lock-on dots inside the scan button
+  // Lock-on dots
   lockDots: { flexDirection: "row", justifyContent: "center", marginTop: 6, gap: 5 },
   lockDot:  { width: 6, height: 6, borderRadius: 3 },
 
@@ -1246,19 +1022,19 @@ const styles = StyleSheet.create({
   winText:     { fontSize: 36, fontWeight: "800", color: "#86efac" },
 
   // Quest intro
-  introWrap:          { alignItems: "center" },
-  introHardBadge:     { backgroundColor: P.hardRed, borderRadius: 16, paddingHorizontal: 16, paddingVertical: 6, marginBottom: 14 },
-  introHardBadgeText: { fontSize: 13, color: "#fff", fontWeight: "800", letterSpacing: 0.8 },
-  introName:          { fontSize: 26, fontWeight: "800", color: P.textPrimary, textAlign: "center" },
-  introRoom:          { fontSize: 13, color: P.textMuted, marginTop: 4, marginBottom: 16 },
-  introDivider:       { height: 0.5, backgroundColor: P.cardBorder, width: "100%", marginBottom: 16 },
-  introHeading:       { fontSize: 14, color: P.textDim, fontWeight: "600", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 },
-  introHint:          { fontSize: 12, color: P.textDim, textAlign: "center", marginBottom: 16, lineHeight: 18 },
-  introPropRow:       { flexDirection: "row", marginBottom: 12, alignItems: "flex-start", width: "100%" },
-  introPropWord:      { fontSize: 16, fontWeight: "700", color: P.gold, marginRight: 10, minWidth: 30 },
-  introPropDef:       { fontSize: 13, color: P.textMuted, marginTop: 2, lineHeight: 18 },
-  introPropDefMissing:{ fontSize: 13, color: P.textDim,   marginTop: 2, lineHeight: 18, fontStyle: "italic" },
-  beginBtn:           { marginTop: 24, backgroundColor: "#7c3aed", borderRadius: 16, paddingVertical: 16, paddingHorizontal: 48, alignItems: "center" },
-  beginBtnHard:       { backgroundColor: P.hardRed },
-  beginBtnText:       { fontSize: 17, fontWeight: "700", color: "#fff" },
+  introWrap:           { alignItems: "center" },
+  introHardBadge:      { backgroundColor: P.hardRed, borderRadius: 16, paddingHorizontal: 16, paddingVertical: 6, marginBottom: 14 },
+  introHardBadgeText:  { fontSize: 13, color: "#fff", fontWeight: "800", letterSpacing: 0.8 },
+  introName:           { fontSize: 26, fontWeight: "800", color: P.textPrimary, textAlign: "center" },
+  introRoom:           { fontSize: 13, color: P.textMuted, marginTop: 4, marginBottom: 16 },
+  introDivider:        { height: 0.5, backgroundColor: P.cardBorder, width: "100%", marginBottom: 16 },
+  introHeading:        { fontSize: 14, color: P.textDim, fontWeight: "600", marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 },
+  introHint:           { fontSize: 12, color: P.textDim, textAlign: "center", marginBottom: 16, lineHeight: 18 },
+  introPropRow:        { flexDirection: "row", marginBottom: 12, alignItems: "flex-start", width: "100%" },
+  introPropWord:       { fontSize: 16, fontWeight: "700", color: P.gold, marginRight: 10, minWidth: 30 },
+  introPropDef:        { fontSize: 13, color: P.textMuted, marginTop: 2, lineHeight: 18 },
+  introPropDefMissing: { fontSize: 13, color: P.textDim,   marginTop: 2, lineHeight: 18, fontStyle: "italic" },
+  beginBtn:            { marginTop: 24, backgroundColor: "#7c3aed", borderRadius: 16, paddingVertical: 16, paddingHorizontal: 48, alignItems: "center" },
+  beginBtnHard:        { backgroundColor: P.hardRed },
+  beginBtnText:        { fontSize: 17, fontWeight: "700", color: "#fff" },
 });
