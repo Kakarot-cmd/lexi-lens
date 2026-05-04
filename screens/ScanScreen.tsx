@@ -891,6 +891,10 @@ export function ScanScreen({ route, navigation }: Props) {
         xp_reward_third_plus: aq.quest.xp_reward_third_plus ?? 10,
       });
     },
+	onScanError: (msg) => {          // ← ADD THIS
+       setScanErrorMsg(msg);          // ← ADD THIS
+        setTimeout(() => setScanErrorMsg(null), 3000); // auto-dismiss
+      },
   });
 
   // ── Property hint engine (Phase A) ───────────────────────────────────────
@@ -970,15 +974,15 @@ export function ScanScreen({ route, navigation }: Props) {
 
   return (
     <View style={styles.root}>
-      <Camera
-        key={cameraKey}
-        ref={cameraRef}
-        style={StyleSheet.absoluteFill}
-        device={device}
-        isActive={phase === "scanning"}
-        frameProcessor={frameProcessor}
-        photo
-      />
+          <Camera
+      key={cameraKey}
+      ref={cameraRef}
+      style={StyleSheet.absoluteFill}
+      device={device}
+      isActive={phase === "scanning"}
+      photo={true}
+      video={true}
+    />
 
       {(phase === "scanning" || phase === "component_win") && (
         <>
@@ -1037,7 +1041,18 @@ export function ScanScreen({ route, navigation }: Props) {
                 Haptics.selectionAsync();
               }}
             />
-
+			{scanErrorMsg && (
+    <View style={{
+       backgroundColor: "#7f1d1d",
+        borderRadius: 10,
+        padding: 10,
+        marginBottom: 8,
+      }}>
+       <Text style={{ color: "#fca5a5", fontSize: 13, textAlign: "center" }}>
+         ⚠ {scanErrorMsg}
+       </Text>
+    </View>
+   )}
             <ScanButton
               onPress={triggerManualScan}
               isHardMode={isHardMode}

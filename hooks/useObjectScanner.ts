@@ -1,47 +1,39 @@
 /**
- * useObjectScanner.ts  —  Lexi-Lens Smart Viewfinder  v3.2
+ * useObjectScanner.ts  —  Lexi-Lens Smart Viewfinder  v3.3
  *
- * What changed from v3.1:
+ * What changed from v3.2 → v3.3:
  *
- *  ACCURACY
- *  ────────
- *  • Confidence threshold 0.55 → 0.65
- *    At 55% ML Kit is guessing. 65% keeps only real detections.
+ *  iOS COMPATIBILITY  (the reason for this patch)
+ *  ──────────────────────────────────────────────
+ *  • ML Kit is Google-only (Android).  On iOS loadMLKit() is skipped
+ *    entirely — mlKitAvailable stays false, periodic tick is a no-op,
+ *    and the live chip never appears.  That was already true in v3.2 but
+ *    nothing surfaced the failure, so children just got a frozen screen.
  *
- *  • Live snapshot quality 30 → 55
- *    30% JPEG artefacts actively hurt a CNN. 55% costs ~40ms extra
- *    but cuts misidentifications noticeably.
+ *  • takeSnapshot() on iOS requires the Camera to have video={true}.
+ *    Without it VisionCamera v4 throws "No video data output configured"
+ *    on the first tap. The error was silently swallowed → "nothing happens".
  *
- *  • Interval 1500 → 750 ms
- *    Children move the camera fast. 1.5 s lag makes the chip feel broken.
+ *    FIX: Platform.OS === "ios"
+ *      → takePhoto({ qualityPrioritization: "speed", flash: "off" })
+ *         (works without video={true}, uses the photo output pipeline)
+ *      Android → takeSnapshot() unchanged (faster, same quality for ML Kit)
  *
- *  • SKIP_LABELS expanded 12 → 55 entries
- *    Colours, geometry, raw materials, environment terms, abstraction labels
- *    were slipping through and showing as object names. Blocked.
+ *  • onScanError callback added.  ScanScreen now shows a toast / alert when
+ *    the snap itself fails rather than silently swallowing the error.
+ *    This surfaces real hardware failures (permission race, AVSession reset)
+ *    instead of leaving the child staring at a frozen button.
  *
- *  • Label stability gate (new)
- *    liveLabel only updates when the same top label appears in two
- *    consecutive frames. Kills the "Book → Technology → Book" flicker
- *    that made the chip untrustworthy.
+ *  • iOS live-label fallback: since ML Kit never runs on iOS the live chip
+ *    is hidden, but the manual scan still works — it sends the raw photo
+ *    to Claude with label="object" and lets Claude do the identification.
+ *    This is actually the same quality as Android's first-tap fallback.
  *
- *  FEEL — the "scan ready" signal (new)
- *  ────────────────────────────────────
- *  scanReady = true  when:  stable label exists  AND  confidence ≥ READY_THRESHOLD
- *  stableFrameCount  = 0 / 1 / 2 / 3+  (how locked-on ML Kit is)
- *
- *  These are exported so ScanScreen can change the button state:
- *  "Scan this object" → "✦ Cup — tap to scan!" with a pulse animation.
- *  Children now have a clear "go" signal instead of guessing when to press.
- *
- *  FIXES carried forward from v3.1
- *  ────────────────────────────────
- *  • normalizeLabels() — Shape A / Shape B ML Kit response shapes
- *  • isScanningRef mutex — no concurrent snapshot calls
- *  • AppState listener — re-requests permission on foreground return
- *  • liveConfidence via ref in triggerManualScan dep array
+ *  Everything else (stability gate, skip list, property-hint labels,
+ *  isScanningRef mutex, AppState listener) is unchanged from v3.2.
  */
 
-import { AppState, AppStateStatus } from "react-native";
+import { AppState, AppStateStatus, Platform } from "react-native";
 import { useEffect, useRef, useCallback, useState } from "react";
 import {
   useCameraDevice,
@@ -50,12 +42,20 @@ import {
 } from "react-native-vision-camera";
 import { readAsStringAsync } from "expo-file-system/legacy";
 
-// ─── ML Kit lazy load ─────────────────────────────────────────────────────────
+// ─── ML Kit lazy load (Android only) ─────────────────────────────────────────
+//
+// @react-native-ml-kit/image-labeling ships Google ML Kit binaries.
+// Google ML Kit has no iOS runtime — importing it on iOS throws immediately.
+// We guard the entire import with a Platform check so the module is never
+// even attempted on iOS.  mlKitAvailable stays false; the periodic tick
+// becomes a cheap no-op and we fall through to Claude for identification.
 
 let mlKitAvailable = false;
 let ImageLabeling: any = null;
 
 async function loadMLKit(): Promise<boolean> {
+  // Hard guard — never attempt on iOS
+  if (Platform.OS !== "android") return false;
   if (ImageLabeling) return true;
   try {
     const mod     = await import("@react-native-ml-kit/image-labeling");
@@ -112,9 +112,6 @@ const LIVE_SCAN_QUALITY = 55;
 const MANUAL_SCAN_QUALITY = 85;
 
 // ─── Skip list ────────────────────────────────────────────────────────────────
-//
-// Rule: block ATTRIBUTE / CATEGORY / COLOUR / ENVIRONMENT / GEOMETRY labels.
-// Keep only labels that name a concrete, graspable object.
 
 const SKIP_LABELS = new Set([
   // Too generic
@@ -129,7 +126,7 @@ const SKIP_LABELS = new Set([
   "rectangle", "circle", "line", "square", "triangle", "shape",
   "font", "symbol", "icon", "logo", "sign",
 
-  // Colour (ML Kit labels colour a lot)
+  // Colour
   "black", "white", "grey", "gray", "red", "blue", "green",
   "yellow", "brown", "orange", "pink", "purple", "colour", "color",
   "monochrome",
@@ -181,31 +178,68 @@ export interface ScanResult {
 }
 
 interface UseObjectScannerOptions {
-  onDetection: (result: ScanResult) => void;
-  enabled?:    boolean;
+  onDetection:  (result: ScanResult) => void;
+  /** Called when the hardware capture itself fails (not an ML Kit miss). */
+  onScanError?: (message: string) => void;
+  enabled?:     boolean;
+}
+
+interface UseObjectScannerReturn {
+  cameraRef:         React.RefObject<Camera>;
+  device:            ReturnType<typeof useCameraDevice>;
+  hasPermission:     boolean;
+  frameProcessor:    undefined;
+  triggerManualScan: () => Promise<void>;
+  liveLabel:         string | null;
+  liveConfidence:    number;
+  stableFrameCount:  number;
+  scanReady:         boolean;
+  topLabels:         string[];
+  mlKitReady:        boolean;
+  requestPermission: () => Promise<boolean>;
+}
+
+// ─── Platform-aware capture ───────────────────────────────────────────────────
+//
+// Android  →  takeSnapshot()  (fast, grabs the preview buffer)
+// iOS      →  takePhoto()     (uses AVCapturePhotoOutput, works without video={true})
+//
+// Note: the Camera component in ScanScreen still needs  video={true}
+// on Android for takeSnapshot to work.  On iOS photo={true} is sufficient.
+
+async function captureFrame(
+  camera: Camera,
+  quality: number
+): Promise<{ path: string }> {
+  if (Platform.OS === "ios") {
+    // takePhoto returns a PhotoFile; path is always absolute without "file://"
+    const photo = await camera.takePhoto({
+      qualityPrioritization: "speed",
+      flash:                 "off",
+    });
+    return { path: photo.path };
+  } else {
+    // takeSnapshot returns a SnapshotData; path may or may not have "file://"
+    return camera.takeSnapshot({ quality });
+  }
 }
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useObjectScanner({
   onDetection,
+  onScanError,
   enabled = true,
-}: UseObjectScannerOptions) {
+}: UseObjectScannerOptions): UseObjectScannerReturn {
   const { hasPermission, requestPermission } = useCameraPermission();
   const device    = useCameraDevice("back");
   const cameraRef = useRef<Camera>(null);
 
-  const [liveLabel,       setLiveLabel]       = useState<string | null>(null);
-  const [liveConfidence,  setLiveConfidence]  = useState<number>(0);
+  const [liveLabel,        setLiveLabel]        = useState<string | null>(null);
+  const [liveConfidence,   setLiveConfidence]   = useState<number>(0);
   const [stableFrameCount, setStableFrameCount] = useState<number>(0);
-  const [scanReady,       setScanReady]       = useState<boolean>(false);
-
-  /**
-   * Top 3 ML Kit labels (text only, lowercased) for the property-hint engine.
-   * Updated on every successful periodic tick. Empty when ML Kit found
-   * nothing this frame. Pure data — no UI behaviour attached at this layer.
-   */
-  const [topLabels,       setTopLabels]       = useState<string[]>([]);
+  const [scanReady,        setScanReady]        = useState<boolean>(false);
+  const [topLabels,        setTopLabels]        = useState<string[]>([]);
 
   // Mutex: prevent concurrent snapshots
   const isScanningRef = useRef(false);
@@ -217,8 +251,8 @@ export function useObjectScanner({
   liveConfRef.current  = liveConfidence;
 
   // Stability tracking across frames
-  const prevCandidateRef   = useRef<string | null>(null);
-  const stableCountRef     = useRef<number>(0);
+  const prevCandidateRef = useRef<string | null>(null);
+  const stableCountRef   = useRef<number>(0);
 
   // ── Permissions ───────────────────────────────────────────────────────────
   useEffect(() => {
@@ -235,13 +269,12 @@ export function useObjectScanner({
     return () => sub.remove();
   }, [hasPermission, requestPermission]);
 
-  // ── ML Kit load ───────────────────────────────────────────────────────────
+  // ── ML Kit load (Android only) ────────────────────────────────────────────
   useEffect(() => { loadMLKit(); }, []);
 
-  // ── Periodic smart viewfinder ─────────────────────────────────────────────
+  // ── Periodic smart viewfinder (Android + ML Kit only) ────────────────────
   useEffect(() => {
     if (!enabled) {
-      // Clean slate when scanning stops
       setLiveLabel(null);
       setLiveConfidence(0);
       setStableFrameCount(0);
@@ -252,37 +285,32 @@ export function useObjectScanner({
       return;
     }
 
+    // iOS has no ML Kit → skip the whole interval, nothing to poll
+    if (Platform.OS !== "android") return;
+
     const tick = setInterval(async () => {
       if (!cameraRef.current || isScanningRef.current || !mlKitAvailable) return;
 
       isScanningRef.current = true;
       try {
-        const photo = await cameraRef.current.takeSnapshot({
-          quality: LIVE_SCAN_QUALITY,
-        });
+        const photo = await captureFrame(cameraRef.current, LIVE_SCAN_QUALITY);
 
         const uri = photo.path.startsWith("file://")
           ? photo.path
           : `file://${photo.path}`;
 
-        const raw      = await ImageLabeling.label(uri);
-        const sorted   = filterAndSort(raw);
-        const best     = sorted[0];
+        const raw    = await ImageLabeling.label(uri);
+        const sorted = filterAndSort(raw);
+        const best   = sorted[0];
 
-        // Publish top labels for the property-hint engine.
-        // Done eagerly (every frame, no stability gate) so hint glow tracks
-        // what's in front of the camera right now — children get a faster
-        // reaction than the chip name commit.
         setTopLabels(sorted.slice(0, 3).map((l) => l.text.toLowerCase()));
 
         if (best) {
           const candidate = capitalise(best.text);
 
           if (candidate === prevCandidateRef.current) {
-            // Same label again — increment streak
             stableCountRef.current = Math.min(stableCountRef.current + 1, 5);
           } else {
-            // New candidate — reset streak, don't commit yet
             stableCountRef.current   = 1;
             prevCandidateRef.current = candidate;
           }
@@ -290,7 +318,6 @@ export function useObjectScanner({
           const count = stableCountRef.current;
 
           if (count >= STABILITY_FRAMES_REQUIRED) {
-            // Commit label once it's proven stable
             setLiveLabel(candidate);
             setLiveConfidence(best.confidence);
             setStableFrameCount(count);
@@ -300,7 +327,6 @@ export function useObjectScanner({
             );
           }
         } else {
-          // Nothing detected this frame
           stableCountRef.current   = 0;
           prevCandidateRef.current = null;
           setLiveLabel(null);
@@ -324,24 +350,43 @@ export function useObjectScanner({
 
     isScanningRef.current = true;
     try {
-      const photo = await cameraRef.current.takeSnapshot({
-        quality: MANUAL_SCAN_QUALITY,
-      });
+      // ── Step 1: Capture frame (platform-aware) ──────────────────────────
+      let photo: { path: string };
+      try {
+        photo = await captureFrame(cameraRef.current, MANUAL_SCAN_QUALITY);
+      } catch (captureErr) {
+        // Surface capture failures — these are real device/permission errors
+        const msg = captureErr instanceof Error
+          ? captureErr.message
+          : "Camera capture failed";
+        console.warn("[useObjectScanner] captureFrame failed:", captureErr);
+        onScanError?.(msg);
+        return; // finally still runs and resets mutex
+      }
 
+      // ── Step 2: Read as base64 ──────────────────────────────────────────
       const uri = photo.path.startsWith("file://")
         ? photo.path
         : `file://${photo.path}`;
 
-      const base64 = await readAsStringAsync(uri, {
-        encoding: "base64" as any,
-      });
+      let base64: string;
+      try {
+        base64 = await readAsStringAsync(uri, { encoding: "base64" as any });
+      } catch (readErr) {
+        console.warn("[useObjectScanner] readAsStringAsync failed:", readErr);
+        onScanError?.("Could not read camera frame. Please try again.");
+        return;
+      }
 
-      // Start with the stable live label (via refs — no stale closure)
+      // ── Step 3: Determine label ─────────────────────────────────────────
+      // Start with the stable live label (stale-closure-free via refs).
+      // On iOS this is always null (no ML Kit) → falls back to "object",
+      // which is fine — Claude identifies from the image itself.
       let finalLabel = liveLabelRef.current ?? "object";
       let finalConf  = liveLabelRef.current ? liveConfRef.current : 0.5;
 
-      // Fresh ML Kit pass on the higher-quality manual frame when available
-      if (mlKitAvailable && ImageLabeling) {
+      // Fresh ML Kit pass on the higher-quality frame (Android only)
+      if (Platform.OS === "android" && mlKitAvailable && ImageLabeling) {
         try {
           const freshSorted = filterAndSort(await ImageLabeling.label(uri));
           if (freshSorted.length > 0) {
@@ -353,6 +398,7 @@ export function useObjectScanner({
         }
       }
 
+      // ── Step 4: Dispatch ────────────────────────────────────────────────
       onDetection({
         primary: {
           label:      finalLabel,
@@ -362,12 +408,11 @@ export function useObjectScanner({
         all:         [],
         frameBase64: base64,
       });
-    } catch (e) {
-      console.warn("[useObjectScanner] triggerManualScan failed:", e);
     } finally {
+      // Always reset mutex, even if an inner return fired early
       isScanningRef.current = false;
     }
-  }, [enabled, onDetection]);
+  }, [enabled, onDetection, onScanError]);
 
   return {
     cameraRef,
@@ -377,14 +422,8 @@ export function useObjectScanner({
     triggerManualScan,
     liveLabel,
     liveConfidence,
-    /** 0–5: how many consecutive frames agreed on liveLabel.
-     *  Use to drive a "locking on" progress arc or similar. */
     stableFrameCount,
-    /** true when ML Kit is confident + stable — a clear "tap now" signal
-     *  for the scan button animation in ScanScreen. */
     scanReady,
-    /** Top 3 ML Kit labels (lowercased) currently in frame. Empty when
-     *  ML Kit found nothing this tick. Feeds the property-hint engine. */
     topLabels,
     mlKitReady:       mlKitAvailable,
     requestPermission,
