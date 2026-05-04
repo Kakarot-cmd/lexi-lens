@@ -461,17 +461,10 @@ export function ParentDashboard({ navigation }: Props) {
       </View>
 
       {/* Quest Generator modal */}
-      <Modal
+     <QuestGeneratorScreen
         visible={showGenerator}
-        animationType="slide"
-        presentationStyle="pageSheet"
-        onRequestClose={() => setShowGenerator(false)}
-      >
-        <QuestGeneratorScreen
-          visible={showGenerator}
-          onClose={() => setShowGenerator(false)}
-        />
-      </Modal>
+        onClose={() => setShowGenerator(false)}
+      />
 
       {/* Privacy Policy modal */}
       <Modal
