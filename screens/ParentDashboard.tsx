@@ -16,6 +16,11 @@
  * N3 — Mastery Radar chart
  * N2 — Sibling Leaderboard
  * 2.6 — Word Tome PDF export
+ *
+ * Lumi additions (this file):
+ *   • Lumi Settings section — toggles for Lumi sound + haptics
+ *   • Sound toggle hidden if expo-audio isn't installed (isLumiAudioAvailable)
+ *   • LumiHUD — uses guide state on parent dashboard (low-key brand presence)
  */
 
 import React, { useState, useEffect, useCallback } from "react";
@@ -45,6 +50,15 @@ import { usePdfExport }            from "../hooks/usePdfExport";
 import SiblingLeaderboard          from "../components/SiblingLeaderboard";
 // N4 — Achievement badge grid
 import { AchievementBadgeGrid }    from "../components/AchievementBadgeGrid";
+// Lumi — settings + ambient mascot
+import {
+  LumiHUD,
+  isLumiSoundEnabled,
+  isLumiHapticsEnabled,
+  setLumiSoundEnabled,
+  setLumiHapticsEnabled,
+  isLumiAudioAvailable,
+} from "../components/Lumi";
 
 import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "ParentDashboard">;
@@ -230,6 +244,100 @@ function QuestCard({ completion }: { completion: QuestCompletion }) {
         <Text style={styles.questMeta}>{efficiency} · {formatDate(completion.completed_at)}</Text>
       </View>
       <Text style={styles.questXp}>+{completion.total_xp} XP</Text>
+    </View>
+  );
+}
+
+// ─── LumiSettingsCard ─────────────────────────────────────────────────────────
+// Mounted between AchievementBadgeGrid and Word Tome. Sound row only renders
+// if expo-audio is actually installed (isLumiAudioAvailable returns true).
+
+function LumiSettingsCard() {
+  const [soundOn,    setSoundOn]    = useState(false);
+  const [hapticsOn,  setHapticsOn]  = useState(true);
+  const audioAvailable = isLumiAudioAvailable();
+
+  // Hydrate from AsyncStorage on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [s, h] = await Promise.all([
+          isLumiSoundEnabled(),
+          isLumiHapticsEnabled(),
+        ]);
+        if (!cancelled) {
+          setSoundOn(s);
+          setHapticsOn(h);
+        }
+      } catch {
+        // Use defaults
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const onToggleSound = async (val: boolean) => {
+    setSoundOn(val);
+    try { await setLumiSoundEnabled(val); } catch { /* non-fatal */ }
+  };
+
+  const onToggleHaptics = async (val: boolean) => {
+    setHapticsOn(val);
+    try { await setLumiHapticsEnabled(val); } catch { /* non-fatal */ }
+    if (val) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Lumi (Mascot)</Text>
+      <Text style={styles.sectionDesc}>
+        Lumi is the spark guide who lives inside the lens. Tune her sound and feel here.
+      </Text>
+
+      <View style={styles.lumiCard}>
+        {/* Haptics row — always visible (expo-haptics ships with Expo) */}
+        <View style={styles.lumiRow}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.lumiRowLabel}>Lumi haptics</Text>
+            <Text style={styles.lumiRowSub}>
+              Tiny buzz on success — no buzz on idle or fail
+            </Text>
+          </View>
+          <Switch
+            value={hapticsOn}
+            onValueChange={onToggleHaptics}
+            trackColor={{ false: P.warmBorder, true: P.amberAccent }}
+            thumbColor={hapticsOn ? P.inkBrown : P.parchment}
+            ios_backgroundColor={P.warmBorder}
+          />
+        </View>
+
+        {/* Sound row — only if expo-audio available */}
+        {audioAvailable && (
+          <View style={[styles.lumiRow, styles.lumiRowDivider]}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.lumiRowLabel}>Lumi sound</Text>
+              <Text style={styles.lumiRowSub}>
+                Soft chimes on greeting, success, and victory
+              </Text>
+            </View>
+            <Switch
+              value={soundOn}
+              onValueChange={onToggleSound}
+              trackColor={{ false: P.warmBorder, true: P.amberAccent }}
+              thumbColor={soundOn ? P.inkBrown : P.parchment}
+              ios_backgroundColor={P.warmBorder}
+            />
+          </View>
+        )}
+
+        {!audioAvailable && (
+          <Text style={styles.lumiNote}>
+            Sound effects ship in a future update. Haptics work today.
+          </Text>
+        )}
+      </View>
     </View>
   );
 }
@@ -558,6 +666,9 @@ export function ParentDashboard({ navigation }: Props) {
             <AchievementBadgeGrid childId={selectedId} />
           )}
 
+          {/* ── Lumi (Mascot) settings ───────────────────── */}
+          <LumiSettingsCard />
+
           {/* ── Word Tome ────────────────────────────────── */}
           <View style={styles.section}>
             <View style={styles.sectionHeader}>
@@ -729,6 +840,9 @@ export function ParentDashboard({ navigation }: Props) {
 
         </ScrollView>
       ) : null}
+
+      {/* ── Lumi mascot — quiet brand presence on parent screen ────────── */}
+      <LumiHUD screen="quest-map" />
     </View>
   );
 }
@@ -939,6 +1053,36 @@ const styles = StyleSheet.create({
   questName:  { fontSize: 14, fontWeight: "600", color: P.inkBrown },
   questMeta:  { fontSize: 12, color: P.inkLight, marginTop: 2 },
   questXp:    { fontSize: 13, fontWeight: "700", color: P.amberAccent },
+
+  // Lumi settings card (cream/parchment palette to match ParentDashboard)
+  lumiCard: {
+    backgroundColor: P.parchment,
+    borderRadius:    14,
+    padding:         14,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+  },
+  lumiRow: {
+    flexDirection: "row",
+    alignItems:    "center",
+    gap:           12,
+    paddingVertical: 8,
+  },
+  lumiRowDivider: {
+    borderTopWidth: 1,
+    borderTopColor: P.warmBorder,
+    marginTop:      4,
+    paddingTop:     12,
+  },
+  lumiRowLabel: { fontSize: 14, fontWeight: "600", color: P.inkBrown },
+  lumiRowSub:   { fontSize: 12, color: P.inkLight, marginTop: 2, lineHeight: 17 },
+  lumiNote: {
+    fontSize:   11,
+    color:      P.inkFaint,
+    fontStyle:  "italic",
+    marginTop:  8,
+    textAlign:  "center",
+  },
 
   notifSection: { backgroundColor: P.parchment, borderRadius: 14, padding: 16, borderWidth: 1, borderColor: P.warmBorder },
   notifRow:     { flexDirection: "row", alignItems: "center", gap: 12 },

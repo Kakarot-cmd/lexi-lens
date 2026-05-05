@@ -16,6 +16,11 @@
  *   • No scary red error screens — purple/amber RPG palette
  *   • Parent alert is dismissible and non-blocking
  *   • Countdown ticks in real-time via setInterval
+ *
+ * Lumi addition (this file):
+ *   • LumiHUD overlays the screen in the sleeping/out-of-juice state
+ *   • She replaces the dead-air feel of "you've hit the limit" with a daily
+ *     ritual hook — kids come back tomorrow specifically to see her wake up
  */
 
 import React, { useEffect, useState, useCallback } from "react";
@@ -27,6 +32,8 @@ import {
   Animated,
 } from "react-native";
 import type { RateLimitCode } from "../hooks/useLexiEvaluate";
+
+import { LumiHUD } from "./Lumi";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -203,7 +210,8 @@ export function RateLimitWall({
       {isDailyQuota && (
         <View style={styles.parentNote}>
           <Text style={styles.parentNoteText}>
-            👨‍👩‍👧 Parents: daily scan limits keep the adventure balanced. You can review your child's scan history in the Parent Dashboard.
+            👨‍👩‍👧 Parents: daily scan limits keep the adventure balanced.
+            You can review your child's scan history in the Parent Dashboard.
           </Text>
         </View>
       )}
@@ -212,6 +220,9 @@ export function RateLimitWall({
       <TouchableOpacity style={styles.backBtn} onPress={onBack}>
         <Text style={styles.backBtnText}>← Back to Quest Map</Text>
       </TouchableOpacity>
+
+      {/* ── Lumi mascot — sleeps in the corner while spells recharge ───── */}
+      <LumiHUD screen="rate-limit" />
     </View>
   );
 }

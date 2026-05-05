@@ -14,6 +14,10 @@
  * v3.1 additions:
  *   • LiveLabelChip — floating chip showing ML Kit live label (Android only)
  *   • liveLabel + liveConfidence from useObjectScanner
+ *
+ * Lumi addition (this file):
+ *   • LumiHUD overlays the screen — auto-derives state from evaluation status,
+ *     daily limit, hard-mode flag, failure streak, and hides during quest victory
  */
 
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
@@ -45,6 +49,7 @@ import { VerdictCard }                           from "../components/VerdictCard
 import { StatusBanner }                          from "../components/StatusBanner";
 import { VictoryFusionScreen }                   from "../components/VictoryFusionScreen";
 import { RateLimitWall, ApproachingLimitBanner } from "../components/RateLimitWall";
+import { LumiHUD }                               from "../components/Lumi";
 import { addGameBreadcrumb }                     from "../lib/sentry";
 
 import type { RootStackParamList } from "../types/navigation";
@@ -929,6 +934,23 @@ export function ScanScreen({ route, navigation }: Props) {
           onContinue={handleVictoryDismiss}
         />
       )}
+
+      {/* ── Lumi mascot ─────────────────────────────────────────────────────
+          Auto-derives state from props:
+            • status              → scanning / success / fail
+            • status="rate_limited" → out-of-juice
+            • currentAttempts ≥ 3 → boss-help hint mode
+            • hardMode            → red/crown variant
+            • hidden during quest_victory (VictoryFusionScreen has its own Lumi)
+       */}
+      <LumiHUD
+        screen="scan"
+        evaluationStatus={status}
+        hardMode={isHardMode}
+        dailyLimitReached={status === "rate_limited"}
+        failureStreak={currentAttempts}
+        hidden={phase === "quest_victory"}
+      />
     </View>
   );
 }

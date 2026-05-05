@@ -18,6 +18,10 @@
  *     Changed to conditional render: {weaponTriggered && <LottieView autoPlay />}
  *     so the component mounts—and starts playing—only when the weapon drops.
  *
+ * Lumi addition (this file):
+ *   • LumiHUD overlays the screen in cheering state
+ *   • The fusion animation stays the hero — Lumi is the sidekick celebrating
+ *
  * Dependencies (already in project):
  *   npx expo install react-native-reanimated lottie-react-native expo-haptics
  */
@@ -46,6 +50,8 @@ import Animated, {
 } from "react-native-reanimated";
 import * as Haptics from "expo-haptics";
 import LottieView from "lottie-react-native";
+
+import { LumiHUD } from "./Lumi";
 
 const { width: W, height: H } = Dimensions.get("window");
 
@@ -499,6 +505,13 @@ export function VictoryFusionScreen({
         isHardMode={isHardMode}
         onContinue={onContinue}
         visible={showContent}
+      />
+
+      {/* ── Lumi cheers — appears after the burst, alongside content ── */}
+      <LumiHUD
+        screen="victory"
+        hardMode={isHardMode}
+        hidden={!showContent}
       />
     </View>
   );

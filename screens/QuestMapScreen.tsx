@@ -21,6 +21,9 @@
  *   • Completed   — green badge + "↩ Replay" + "⚔ Hard Mode"
  *   • Hard Beaten — red crown badge
  *   • Daily       — orange 📅 Daily badge overlay
+ *
+ * Lumi addition (this file):
+ *   • LumiHUD overlays the screen — ambient brand presence, bottom-right
  */
 
 import React, { useEffect, useCallback, useMemo } from "react";
@@ -54,6 +57,7 @@ import {
 
 import { DailyQuestBanner } from "../components/DailyQuestBanner";
 import { StreakBar }         from "../components/StreakBar";
+import { LumiHUD }           from "../components/Lumi";
 
 import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "QuestMap">;
@@ -291,7 +295,7 @@ function QuestCard({
         </View>
       )}
 
-      {/* ── XP rewards (XP FIX: shows real formula total, not raw per-prop base) ── */}
+      {/* ── XP rewards (XP FIX: shows real formula total) ── */}
       <View style={styles.xpRow}>
         <View>
           <Text style={styles.xpText}>
@@ -380,8 +384,6 @@ export function QuestMapScreen({ navigation }: Props) {
 
   // Refresh child XP + level + completed quests whenever QuestMap regains
   // focus (e.g. after returning from ScanScreen post-quest-completion).
-  // Without this, the level bar shows stale total_xp until the child is
-  // switched away and back. Cheap operation — single row fetch.
   useFocusEffect(
     useCallback(() => {
       const refreshState = useGameStore.getState();
@@ -544,6 +546,9 @@ export function QuestMapScreen({ navigation }: Props) {
           showsVerticalScrollIndicator={false}
         />
       )}
+
+      {/* ── Lumi mascot — ambient brand presence, bottom-right ─────────── */}
+      <LumiHUD screen="quest-map" />
     </View>
   );
 }

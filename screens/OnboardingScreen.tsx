@@ -28,10 +28,9 @@
  *   • markOnboardingComplete() writes flag to Zustand + AsyncStorage
  *   • navigation.replace("QuestMap") — replace so back-press can't return here
  *
- * ─── Placement ────────────────────────────────────────────────────────────────
- *   Drop in /screens/OnboardingScreen.tsx.
- *   Register in App.tsx AppNavigator (see _patches/App.additions.ts).
- *   Trigger from ChildSwitcherScreen.handleSelect (see _patches/ChildSwitcherScreen.diff.ts).
+ * ─── Lumi addition (this file) ────────────────────────────────────────────────
+ *   • LumiHUD overlays the screen with a per-step message
+ *   • She's Lexi-Lens's spokesperson for the user's first 30 seconds
  */
 
 import React, {
@@ -64,11 +63,13 @@ import * as Haptics from "expo-haptics";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { useGameStore } from "../store/gameStore";
 
+import { LumiHUD } from "../components/Lumi";
+
 // ─── Navigation typing ────────────────────────────────────────────────────────
 // Must stay consistent with the RootStackParamList in App.tsx after you add
-// "Onboarding: undefined" there (see _patches/App.additions.ts).
+// "Onboarding: undefined" there.
 
- import type { RootStackParamList } from "../types/navigation";
+import type { RootStackParamList } from "../types/navigation";
 
 type Props = NativeStackScreenProps<RootStackParamList, "Onboarding">;
 
@@ -105,6 +106,13 @@ const STEPS = [
     body:  "Every word you discover lives in your Word Tome forever. Master words to unlock new spells and level up your adventurer!",
     cta:   "Let's go! 🚀",
   },
+] as const;
+
+// Lumi messages keyed to each step
+const LUMI_STEP_MESSAGES = [
+  "Hi! I'm Lumi, your spark guide ✨",
+  "Pick the next quest you want to try!",
+  "Words you find live in your Tome ✨",
 ] as const;
 
 // ─── Helper: corner bracket ───────────────────────────────────────────────────
@@ -299,7 +307,8 @@ function QuestMapIllustration({ isActive }: { isActive: boolean }) {
 }
 
 // ─── Step 2 illustration: Word Tome open book ─────────────────────────────────
-// An open two-page book with word rows. XP badge pops in after 400 ms.
+// An open two-page book with word rows.
+// XP badge pops in after 400 ms.
 
 function WordTomeIllustration({ isActive }: { isActive: boolean }) {
   const scale   = useSharedValue(0.5);
@@ -569,6 +578,12 @@ export function OnboardingScreen({ navigation }: Props) {
       {step === 0 && (
         <Text style={styles.swipeHint}>swipe to explore</Text>
       )}
+
+      {/* ── Lumi mascot ───────────────────────────────────────────── */}
+      <LumiHUD
+        screen="onboarding"
+        message={LUMI_STEP_MESSAGES[step]}
+      />
     </View>
   );
 }

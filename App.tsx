@@ -61,6 +61,19 @@ import { useGameStore } from "./store/gameStore";
 // Wire-up missing since launch; persistence patch ships these tables for real.
 import { useAnalytics } from "./hooks/useAnalytics";
 
+// ─── Lumi mascot — sound bootstrap + daily greeting ──────────────────────────
+// Lumi is rendered per-screen via <LumiHUD/>. App.tsx only needs to:
+//   1. Initialize the sound + haptic dispatcher once at startup.
+//   2. Mark today's greeting as shown after the first auth+child resolves
+//      (so the next cold start fires it). The actual greeting visual is
+//      part of LumiHUD on whichever screen the user lands on first.
+import {
+  initLumiSounds,
+  shouldGreetToday,
+  markGreetedToday,
+  playLumiGreeting,
+} from "./components/Lumi";
+
 // ─── Web placeholder (camera not available in browser) ───────────────────────
 
 function ScanPlaceholder() {
@@ -176,6 +189,11 @@ function App() {
 
   const navigationRef = useNavigationContainerRef();
 
+  // ── Lumi sound bootstrap (once at app start) ──────────────────────────────
+  useEffect(() => {
+    initLumiSounds();
+  }, []);
+
   // ── Auth listener ──────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -206,22 +224,24 @@ function App() {
       try {
         const parsed = new URL(url);
 
+        // PKCE code exchange — Supabase JS v2 default
         const code = parsed.searchParams.get("code");
         if (code) {
           const { error } = await supabase.auth.exchangeCodeForSession(code);
           if (error) {
             addGameBreadcrumb({
               category: "auth",
-              message:  "Email confirm code exchange failed",
-              data:     { error: error.message },
+              message: "Email confirm code exchange failed",
+              data: { error: error.message },
             });
           }
           return;
         }
 
+        // Legacy implicit-flow fragment: #access_token=…&refresh_token=…
         const fragment = parsed.hash.replace(/^#/, "");
         if (fragment) {
-          const params        = new URLSearchParams(fragment);
+          const params = new URLSearchParams(fragment);
           const access_token  = params.get("access_token");
           const refresh_token = params.get("refresh_token");
           if (access_token && refresh_token) {
@@ -233,7 +253,9 @@ function App() {
       }
     };
 
+    // Cold-start: app launched directly via the confirmation link
     Linking.getInitialURL().then((url) => handleDeepLink({ url }));
+    // Warm-start: app was already running when the link was tapped
     const linkingSub = Linking.addEventListener("url", handleDeepLink);
 
     return () => {
@@ -242,58 +264,48 @@ function App() {
     };
   }, []);
 
-  // ── Sentry user context ────────────────────────────────────────────────────
-
+  // ── Sentry user context — sync whenever active child changes ──────────────
   useEffect(() => {
     if (activeChild && session?.user) {
       setUserContext({
-        childId:  activeChild.id,
+        childId: activeChild.id,
         parentId: session.user.id,
         childAge: parseInt(activeChild.age_band?.split("-")[1] ?? "8", 10),
       });
       addGameBreadcrumb({
         category: "auth",
-        message:  "Active child set",
-        data:     { childId: activeChild.id },
+        message: "Active child set",
+        data: { childId: activeChild.id },
       });
     }
   }, [activeChild?.id, session?.user?.id]);
 
-  // ── Analytics: game_sessions lifecycle ─────────────────────────────────────
-  // PERSISTENCE FIX (Phase 3.7 wire-up):
-  // Until now, useAnalytics existed but was never imported anywhere outside
-  // its own test file — so game_sessions / quest_sessions / word_outcomes
-  // had zero rows DB-wide despite ~99 scans across 6 children. Wiring it
-  // here means: whenever a child profile becomes active we open a session
-  // row; whenever the child switches OR the app moves to the background
-  // we close that row with the screen sequence and quest counts.
+  // ── Lumi daily greeting — fires once per local calendar day ────────────────
+  useEffect(() => {
+    if (!session || !activeChild?.id) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const greet = await shouldGreetToday();
+        if (cancelled || !greet) return;
+        playLumiGreeting();
+        await markGreetedToday();
+      } catch {
+        // Non-fatal — skip greeting on any error
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [session?.user?.id, activeChild?.id]);
+
+  // ── Game-session lifecycle — Phase 3.7 ─────────────────────────────────────
+  // SESSION COUNTERS FIX (v4.4): counters live in gameStore.sessionCounters,
+  // bumped from beginQuest and markQuestCompletion. Read live at flush-time
+  // via useGameStore.getState() — getState() returns the current snapshot,
+  // not a stale closure capture.
   //
-  // All writes are fire-and-forget inside useAnalytics — Supabase failures
-  // never break the game loop. Quest-level writes (startQuestSession /
-  // finishQuestSession / logWordOutcome) are wired separately in ScanScreen.
-  //
-  // SESSION COUNTERS FIX (v4.4 — Known Gap "App.tsx quest counters not incremented"):
-  // The previous shape declared `questCountsRef = useRef({ started, finished, xp })`
-  // and read it back into endSession's payload, but no code path ever
-  // incremented it — every game_sessions row closed with 0/0/0. The counter
-  // state has been moved into gameStore.sessionCounters where beginQuest and
-  // markQuestCompletion can bump it at the actual event sites. We pull the
-  // live values at flush-time via useGameStore.getState().sessionCounters
-  // inside the cleanup and the AppState callback — getState() returns the
-  // current snapshot (not a stale closure capture), which is exactly what
-  // we want when closing the session row.
-  //
-  // SCREEN_SEQUENCE FIRST-ENTRY FIX (v4.4.2 — Bug E):
-  // Before this fix, the first game_sessions row per child opened with an
-  // empty screen_sequence and stayed empty until a fresh navigation event
-  // fired AFTER session start. Cause: NavigationContainer's onStateChange
-  // fires when navigation commits, which can happen BEFORE this activeChild
-  // useEffect runs (React batches state from ChildSwitcher — setActiveChild
-  // and navigate("QuestMap") both queue, navigation onStateChange fires
-  // during commit, then this useEffect runs after commit and resets the ref
-  // — wiping "QuestMap"). Fix: after resetting, capture the current route
-  // via navigationRef and seed the sequence with it. Guarantees every closed
-  // session has at least one screen recorded.
+  // SCREEN_SEQUENCE FIRST-ENTRY FIX (v4.4.2): seed with the current route so
+  // the first nav event for a session isn't lost when NavigationContainer's
+  // onStateChange fires before the activeChild useEffect runs.
   const { startSession, endSession } = useAnalytics();
   const screenSequenceRef = useRef<string[]>([]);
 
@@ -305,12 +317,14 @@ function App() {
     useGameStore.getState().resetSessionCounters();
 
     // v4.4.2 — seed with the current route so the first nav event for this
-    // session isn't lost. See SCREEN_SEQUENCE FIRST-ENTRY FIX comment above.
-    if (navigationRef.isReady()) {
-      const initialRoute = navigationRef.getCurrentRoute();
-      if (initialRoute?.name) {
-        screenSequenceRef.current.push(initialRoute.name);
-      }
+    // session isn't lost. isReady() guard prevents "navigation hasn't been
+    // initialized" error on cold start when this effect can fire before the
+    // NavigationContainer finishes mounting.
+    const initialRoute = navigationRef.isReady()
+      ? navigationRef.getCurrentRoute()
+      : null;
+    if (initialRoute?.name) {
+      screenSequenceRef.current.push(initialRoute.name);
     }
 
     startSession();
@@ -328,8 +342,6 @@ function App() {
   }, [activeChild?.id, startSession, endSession]);
 
   // Close the session when the app moves to background, reopen on foreground.
-  // This avoids a single "session" stretching across multiple days when the
-  // user backgrounds the app overnight.
   useEffect(() => {
     if (!activeChild?.id) return;
 
@@ -346,17 +358,13 @@ function App() {
         screenSequenceRef.current = [];
         useGameStore.getState().resetSessionCounters();
 
-        // v4.4.2 — same fix as the activeChild effect above. When the user
-        // foregrounds the app the navigation state hasn't changed (they're
-        // returning to whatever screen they left), so onStateChange won't
-        // fire — without seeding here, the session row would close with
-        // zero screens recorded.
-       if (navigationRef.isReady()) {
-      const initialRoute = navigationRef.getCurrentRoute();
-      if (initialRoute?.name) {
-        screenSequenceRef.current.push(initialRoute.name);
-      }
-    }
+        // v4.4.2 — seed when foregrounding too. isReady() guard for safety.
+        const route = navigationRef.isReady()
+          ? navigationRef.getCurrentRoute()
+          : null;
+        if (route?.name) {
+          screenSequenceRef.current.push(route.name);
+        }
 
         startSession();
       }
@@ -368,6 +376,7 @@ function App() {
   // ── Screen-change breadcrumb ───────────────────────────────────────────────
 
   const handleNavigationStateChange = useCallback(() => {
+    if (!navigationRef.isReady()) return;
     const route = navigationRef.getCurrentRoute();
     if (route) {
       addGameBreadcrumb({
@@ -378,11 +387,7 @@ function App() {
       Sentry.setTag("active_screen", route.name);
 
       // Phase 3.7: accumulate the screen sequence for the closing
-      // game_sessions.screen_sequence column. Dedup consecutive
-      // duplicates so re-renders don't pollute the trail. The seed-with-
-      // initial-route logic in the activeChild useEffect above also relies
-      // on this dedup — if the initial route fires a redundant nav event
-      // (some platforms do this on mount), we don't double-push it.
+      // game_sessions.screen_sequence column. Dedup consecutive duplicates.
       const seq = screenSequenceRef.current;
       if (seq[seq.length - 1] !== route.name) {
         seq.push(route.name);
