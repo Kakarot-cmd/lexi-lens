@@ -1,22 +1,23 @@
 /**
- * components/Lumi/LumiHUD.tsx
+ * components/Lumi/LumiHUD.tsx — v2
  *
- * High-level Lumi wrapper used by every screen.
+ * High-level Lumi wrapper used by every screen. Auto-derives state, position,
+ * size, AND now movement + rainbow from per-screen presets.
+ *
+ * v2 additions:
+ *   • `movement` prop — 'anchor' | 'wander' | 'drift'. Per-screen defaults.
+ *   • `rainbow`  prop — boolean. Per-screen defaults.
  *
  * ─── KILL SWITCH ──────────────────────────────────────────────────────────────
- * Flip LUMI_ENABLED to false to disable Lumi globally without removing any
- * <LumiHUD /> JSX from screens. Use this to isolate whether Lumi is the cause
- * of any crash:
+ * Flip LUMI_ENABLED to false to disable Lumi globally without touching screens.
  *   • LUMI_ENABLED = false → app behaves as if Lumi was never installed.
- *   • LUMI_ENABLED = true  → safe Lumi (no animated SVG) renders.
- *
- * Once you've confirmed the app is stable with the safe rewrite, you can leave
- * this true permanently or wire it to a feature flag.
+ *   • LUMI_ENABLED = true  → safe Lumi v2 renders.
  */
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { LumiMascot } from './LumiMascot';
 import type {
+  LumiMovementMode,
   LumiPosition,
   LumiState,
 } from './lumiTypes';
@@ -38,20 +39,37 @@ export type LumiScreen =
   | 'child-switcher';
 
 interface ScreenPreset {
-  defaultState: LumiState;
-  position:     LumiPosition;
-  size:         number;
+  defaultState:    LumiState;
+  position:        LumiPosition;
+  size:            number;
+  movement:        LumiMovementMode;
+  rainbow:         boolean;
 }
 
+// Preset table — picks per-screen defaults that balance playfulness with
+// not-blocking-content. Every preset can be overridden per-call.
 const SCREEN_PRESETS: Record<LumiScreen, ScreenPreset> = {
-  scan:               { defaultState: 'idle',          position: 'top-right',   size: 56 },
-  'rate-limit':       { defaultState: 'out-of-juice',  position: 'top-center',  size: 96 },
-  onboarding:         { defaultState: 'guide',         position: 'top-center',  size: 80 },
-  victory:            { defaultState: 'cheering',      position: 'top-center',  size: 72 },
-  'quest-map':        { defaultState: 'idle',          position: 'bottom-right',size: 48 },
-  'spell-book':       { defaultState: 'idle',          position: 'bottom-right',size: 48 },
-  'parent-dashboard': { defaultState: 'idle',          position: 'top-right',   size: 44 },
-  'child-switcher':   { defaultState: 'idle',          position: 'top-right',   size: 56 },
+  // Scan: anchored at top-right so she never blocks the camera viewfinder.
+  scan:               { defaultState: 'idle',          position: 'top-right',    size: 56, movement: 'anchor', rainbow: false },
+
+  // Rate-limit: anchored centre, sleeping sparkle.
+  'rate-limit':       { defaultState: 'out-of-juice',  position: 'top-center',   size: 96, movement: 'anchor', rainbow: false },
+
+  // Onboarding: gentle horizontal drift to feel companionable while explaining.
+  onboarding:         { defaultState: 'guide',         position: 'top-center',   size: 80, movement: 'drift',  rainbow: false },
+
+  // Victory: anchored centre — VictoryFusionScreen has its own celebration burst,
+  // so Lumi just hovers and cheers without travelling.
+  victory:            { defaultState: 'cheering',      position: 'top-center',   size: 72, movement: 'anchor', rainbow: true  },
+
+  // Quest map: full wander figure-8 in upper portion + rainbow theme.
+  // This is where the playful brand presence lives.
+  'quest-map':        { defaultState: 'idle',          position: 'top-center',   size: 56, movement: 'wander', rainbow: true  },
+
+  // Spell book / Parent / Child: subtle anchored corners.
+  'spell-book':       { defaultState: 'idle',          position: 'bottom-right', size: 48, movement: 'anchor', rainbow: false },
+  'parent-dashboard': { defaultState: 'idle',          position: 'top-right',    size: 44, movement: 'anchor', rainbow: false },
+  'child-switcher':   { defaultState: 'idle',          position: 'top-right',    size: 56, movement: 'anchor', rainbow: false },
 };
 
 export type LumiEvaluationStatus =
@@ -72,14 +90,16 @@ export interface LumiHUDProps {
   message?:             string;
   position?:            LumiPosition;
   size?:                number;
+  /** v2: override the screen's default movement mode. */
+  movement?:            LumiMovementMode;
+  /** v2: override the screen's default rainbow flag. */
+  rainbow?:             boolean;
   muted?:               boolean;
   hidden?:              boolean;
   zIndex?:              number;
 }
 
 export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
-  // ── Kill switch — render nothing if disabled. Hook order is preserved
-  //    because we still call all hooks below before any early return.
   const {
     screen,
     evaluationStatus,
@@ -89,6 +109,8 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
     message,
     position,
     size,
+    movement,
+    rainbow,
     muted             = false,
     hidden            = false,
     zIndex            = 100,
@@ -124,6 +146,13 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
     return preset.defaultState;
   }, [dailyLimitReached, transient, evaluationStatus, failureStreak, preset.defaultState]);
 
+  // Hard-mode forces anchor (so kids see the crown clearly without it darting around)
+  const resolvedMovement: LumiMovementMode =
+    hardMode ? 'anchor' : (movement ?? preset.movement);
+
+  // Hard-mode also forces non-rainbow (red crown is the brand cue)
+  const resolvedRainbow = hardMode ? false : (rainbow ?? preset.rainbow);
+
   if (!LUMI_ENABLED) return null;
   if (hidden) return null;
 
@@ -134,6 +163,8 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
       message={message}
       position={position    ?? preset.position}
       size={size            ?? preset.size}
+      movement={resolvedMovement}
+      rainbow={resolvedRainbow}
       muted={muted}
       zIndex={zIndex}
     />

@@ -2,7 +2,12 @@
  * components/Lumi/lumiTypes.ts
  *
  * Lumi — Lexi-Lens mascot.
- * Core types: state machine, props, theme tokens.
+ * Core types: state machine, props, theme tokens, movement modes.
+ *
+ * v2 additions:
+ *   • 'rainbow' theme tokens — full-color party variant
+ *   • RAINBOW_PALETTE — 6 hues used for body color-cycling and trail
+ *   • LumiMovementMode — 'anchor' (sits in corner) | 'wander' (figure-8)
  *
  * State machine philosophy:
  *   • Each state maps to a distinct animation profile + quote pool.
@@ -15,28 +20,28 @@
 // ─── State machine ────────────────────────────────────────────────────────────
 
 export type LumiState =
-  | 'idle'         // gentle bob — anywhere, ambient
-  | 'guide'        // points + speaks (onboarding, first-time use)
-  | 'scanning'     // orbits scan target, glitter trail, eyes wide
-  | 'success'      // happy wiggle + glitter burst (after match)
-  | 'fail'         // gentle tilt, no glitter, encouraging quote
-  | 'boss-help'    // hint mid-quest after failed attempts
-  | 'out-of-juice' // asleep / dim / drooping — rate-limit state
-  | 'cheering';    // big victory motion — overlay during VictoryFusionScreen
+  | 'idle'
+  | 'guide'
+  | 'scanning'
+  | 'success'
+  | 'fail'
+  | 'boss-help'
+  | 'out-of-juice'
+  | 'cheering';
 
 // ─── Quote intents ────────────────────────────────────────────────────────────
 
 export type QuoteIntent =
-  | 'greeting'        // first open of the day
-  | 'onboarding'      // first-time user explainer
-  | 'scanning'        // while ML Kit + Claude evaluate
-  | 'success-match'   // verdict matched
-  | 'success-partial' // verdict partial match
-  | 'fail-mismatch'   // verdict no match
-  | 'boss-hint'       // stuck, needs a nudge
-  | 'rate-limit'      // out of magic for the day
-  | 'victory'         // quest complete
-  | 'idle-flavor';    // occasional ambient line
+  | 'greeting'
+  | 'onboarding'
+  | 'scanning'
+  | 'success-match'
+  | 'success-partial'
+  | 'fail-mismatch'
+  | 'boss-hint'
+  | 'rate-limit'
+  | 'victory'
+  | 'idle-flavor';
 
 // ─── Position presets ─────────────────────────────────────────────────────────
 
@@ -49,17 +54,24 @@ export type LumiPosition =
   | 'center'
   | 'free';
 
+// ─── Movement modes (v2) ──────────────────────────────────────────────────────
+
+export type LumiMovementMode =
+  | 'anchor'       // stay at preset position (original behavior)
+  | 'wander'       // smooth figure-8 across upper portion of screen
+  | 'drift';       // gentle horizontal drift along an edge
+
 // ─── Theme variants ───────────────────────────────────────────────────────────
 
-export type LumiTheme = 'normal' | 'hard-mode' | 'sleeping';
+export type LumiTheme = 'normal' | 'hard-mode' | 'sleeping' | 'rainbow';
 
 export interface LumiThemeTokens {
-  bodyHighlight:  string;  // inner radial gradient stop 0
-  bodyShadow:     string;  // inner radial gradient stop 1
-  glow:           string;  // outer halo color
-  trail:          string;  // glitter particle color
-  star:           string;  // top antenna star
-  hasCrown:       boolean; // hard-mode crown overlay
+  bodyHighlight:  string;
+  bodyShadow:     string;
+  glow:           string;
+  trail:          string;
+  star:           string;
+  hasCrown:       boolean;
 }
 
 // ─── Lumi props ───────────────────────────────────────────────────────────────
@@ -70,47 +82,51 @@ export interface LumiMascotProps {
   message?:       string;
   /** Hard-mode quest? Switches to red/crown variant. */
   hardMode?:      boolean;
-  /** Pixel size of the mascot body (halo extends ~30% beyond). Default 64. */
+  /** Pixel size of the mascot body. Default 64. */
   size?:          number;
   /** Position preset. Use 'free' with freePosition for custom placement. */
   position?:      LumiPosition;
   freePosition?:  { x: number; y: number };
-  /** Override trail visibility. Default: on for active states only. */
+  /** v2: How Lumi moves around the screen. Default 'anchor'. */
+  movement?:      LumiMovementMode;
+  /** Override trail visibility. */
   showTrail?:     boolean;
-  /** Tap handler. Honor this to let kids interact (e.g. trigger a fresh quote). */
+  /** v2: Use the rainbow theme regardless of hardMode/state. Default false. */
+  rainbow?:       boolean;
+  /** Tap handler. */
   onTap?:         () => void;
-  /** Hide all speech bubbles for this session. */
+  /** Hide speech bubbles for this session. */
   muted?:         boolean;
-  /** Override Reduce Motion auto-detect. */
+  /** Override Reduce Motion. */
   reduceMotion?:  boolean;
   /** Padding from safe-area edges when using a position preset. Default 16. */
   edgeInset?:     number;
-  /** zIndex / elevation. Default 100 (above content, below modals). */
+  /** zIndex / elevation. Default 100. */
   zIndex?:        number;
 }
 
 // ─── Internal: animation profile per state ────────────────────────────────────
 
 export interface LumiAnimationProfile {
-  bobAmplitude:    number;   // px, vertical idle bob
+  bobAmplitude:    number;
   bobDurationMs:   number;
   wingFlapRateHz:  number;
-  orbitRadius:     number;   // px, used in 'scanning' & 'cheering'
+  orbitRadius:     number;
   orbitSpeedRpm:   number;
-  blinkChance:     number;   // 0–1 per second
+  blinkChance:     number;
   trailEnabled:    boolean;
-  trailRateMs:     number;   // particle spawn interval
-  scaleBase:       number;   // 1.0 = full size; 0.85 = sleepy/small
-  glowIntensity:   number;   // 0–1
+  trailRateMs:     number;
+  scaleBase:       number;
+  glowIntensity:   number;
 }
 
 // ─── Default theme tokens ─────────────────────────────────────────────────────
 
 export const LUMI_THEMES: Record<LumiTheme, LumiThemeTokens> = {
   normal: {
-    bodyHighlight: '#f3e8ff',
-    bodyShadow:    '#b794f6',
-    glow:          '#f5c842',
+    bodyHighlight: '#fef3c7',
+    bodyShadow:    '#a78bfa',
+    glow:          '#fde68a',
     trail:         '#fde68a',
     star:          '#f5c842',
     hasCrown:      false,
@@ -131,4 +147,41 @@ export const LUMI_THEMES: Record<LumiTheme, LumiThemeTokens> = {
     star:          '#94a3b8',
     hasCrown:      false,
   },
+  // v2: rainbow tokens — actual cycling colors driven by RAINBOW_PALETTE
+  // and a slow React-state timer in LumiMascot.
+  rainbow: {
+    bodyHighlight: '#fef3c7',
+    bodyShadow:    '#ec4899',
+    glow:          '#fbbf24',
+    trail:         '#a78bfa',
+    star:          '#fbbf24',
+    hasCrown:      false,
+  },
 };
+
+// ─── Rainbow palette (v2) ─────────────────────────────────────────────────────
+
+export const RAINBOW_PALETTE = [
+  '#ef4444',  // red
+  '#f97316',  // orange
+  '#facc15',  // yellow
+  '#22c55e',  // green
+  '#3b82f6',  // blue
+  '#a855f7',  // purple
+] as const;
+
+export const RAINBOW_HIGHLIGHT_PALETTE = [
+  '#fecaca',
+  '#fed7aa',
+  '#fef08a',
+  '#bbf7d0',
+  '#bfdbfe',
+  '#e9d5ff',
+] as const;
+
+export const SPARKLE_PALETTE = [
+  '#fde68a',
+  '#fbcfe8',
+  '#bfdbfe',
+  '#bbf7d0',
+] as const;

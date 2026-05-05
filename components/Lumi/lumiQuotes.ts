@@ -1,5 +1,5 @@
 /**
- * components/Lumi/lumiQuotes.ts
+ * components/Lumi/lumiQuotes.ts — v2
  *
  * Lumi's spoken lines.
  *
@@ -10,12 +10,13 @@
  *   • Sparkles with ✨ allowed, no other emoji clutter.
  *   • Never names a specific object (the Edge Function does that).
  *
- * Adding lines: keep arrays balanced (3-6 lines per intent). Pick is random.
+ * v2 enrichment:
+ *   • Idle-flavor pool expanded to 10 lines, ~half empty (so Lumi has natural
+ *     quiet windows — kids don't get spammed with bubbles every 11 seconds).
+ *   • All other pools enriched with more playful, varied copy.
  */
 
 import type { QuoteIntent } from './lumiTypes';
-
-// ─── Quote pool ───────────────────────────────────────────────────────────────
 
 export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
   greeting: [
@@ -23,6 +24,8 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Hello, friend! Ready for adventure?',
     'Sunrise! My spark is fresh ✨',
     'Look who\'s back! Let\'s find magic.',
+    'New day, new sparks ✨',
+    'Tome opened — let\'s play!',
   ],
 
   onboarding: [
@@ -30,6 +33,7 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Point your Lens at things to see their magic!',
     'Find what the quest asks for. I\'ll help!',
     'Tap the scan button when you\'re ready ✨',
+    'Look around — magic is everywhere!',
   ],
 
   scanning: [
@@ -39,6 +43,8 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Looking closely...',
     'Almost...',
     'Reading the magic...',
+    'A clue is hiding here ✨',
+    'Steady... steady...',
   ],
 
   'success-match': [
@@ -47,6 +53,9 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Sparkly match!',
     'Word-magic unlocked ✨',
     'You did it!',
+    'Boom — sparks lit up ✨',
+    'Brilliant find!',
+    'Yes! That was it!',
   ],
 
   'success-partial': [
@@ -54,6 +63,7 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Half the magic — keep going!',
     'On the right path!',
     'Some sparks lit up ✨',
+    'Almost there — try one more!',
   ],
 
   'fail-mismatch': [
@@ -62,6 +72,8 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'What ELSE could it be?',
     'Look around — magic is hiding!',
     'Almost! Let\'s try another.',
+    'No sparks yet. Look closer ✨',
+    'Different shape, different magic!',
   ],
 
   'boss-hint': [
@@ -69,6 +81,8 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Try something around the room ✨',
     'Small things often have big magic!',
     'Look closely at edges and shapes.',
+    'Soft? Hard? Smooth? Bumpy?',
+    'Search high AND low ✨',
   ],
 
   'rate-limit': [
@@ -76,6 +90,7 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Out of magic for today — rest time!',
     'Sleepy sparks... back at sunrise ✨',
     'Tome time. Fresh magic tomorrow!',
+    'Zzz... see you on the morning ✨',
   ],
 
   victory: [
@@ -83,14 +98,24 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Quest complete! You\'re amazing!',
     'Sparkle storm! ✨✨',
     'The magic is yours!',
+    'Heroes of the Tome ✨',
+    'That was magnificent!',
   ],
 
+  // Idle-flavor — ~50/50 mix of empty (quiet) and chatty.
+  // pickLumiQuote picks deterministically per salt; the salt rotates every
+  // ~11s in idle, so Lumi speaks roughly half the rotations.
   'idle-flavor': [
-    '',                          // mostly silent
+    '',                              // quiet
     '',
     '',
-    'What shall we find next?',
-    'Sparks waiting ✨',
+    '',
+    '',
+    'What shall we find next? ✨',
+    'Sparks waiting...',
+    'Tap to scan something!',
+    'Magic is hiding nearby ✨',
+    'Open the dungeon map ✨',
   ],
 } as const;
 
