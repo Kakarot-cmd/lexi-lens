@@ -2,7 +2,25 @@
  * supabase/functions/evaluate/index.ts
  * Lexi-Lens — Supabase Edge Function entry point.
  *
- * v4.4 fix (this file): iOS cross-scan property bleed
+ * v4.5 update (this file): cache_hit observability
+ *   • Cache hits now write a lightweight row to scan_attempts with
+ *     cache_hit=true and claude_latency_ms=null. Previously cache hits were
+ *     invisible to product analytics — we couldn't measure hit rate, couldn't
+ *     correlate cache effectiveness to retention, and the SQL queries we
+ *     wrote against claude_latency_ms returned only Claude-call rows by
+ *     accident.
+ *   • The Claude-success path now sets cache_hit=false explicitly (was
+ *     relying on the column DEFAULT — fine, but explicit is cheaper to
+ *     read).
+ *   • Cache-hit responses now include _rateLimit so the client UI's
+ *     scansToday counter stays consistent (cache hits don't increment it,
+ *     but the client should see a fresh value rather than a stale one).
+ *   • REQUIRED COMPANION MIGRATION: 20260506_add_cache_hit_observability.sql
+ *     adds the cache_hit column AND updates get_daily_scan_count to exclude
+ *     cache_hit=true rows so re-scans don't burn quota slots. Deploy the
+ *     migration BEFORE this file.
+ *
+ * v4.4 fix: iOS cross-scan property bleed
  *   • Symptom: scanning a matchstick on iOS returned a cached "gold ring"
  *     verdict from a previous scan — instant (<200 ms), wrong identification.
  *   • Cause: useObjectScanner.ts iOS path falls back to detectedLabel="object"
@@ -14,7 +32,7 @@
  *     is too generic to distinguish physical objects. Android scans (real
  *     ML Kit labels) are unaffected.
  *
- * Phase 3.5 additions — Rate Limiting + Abuse Prevention:
+ * Phase 3.5 — Rate Limiting + Abuse Prevention:
  *   • IP-level rate limit: max 20 requests/IP/minute (brute-force shield)
  *   • Daily child quota: max 50 Claude calls/child/day (get_daily_scan_count RPC)
  *   • All calls logged to scan_attempts (existing table — real column names)
@@ -27,16 +45,17 @@
  * scan_attempts columns used here:
  *   child_id, quest_id, detected_label, vision_confidence,
  *   resolved_name, overall_match, property_scores, child_feedback,
- *   xp_awarded, claude_latency_ms, ip_hash, rate_limited
+ *   xp_awarded, claude_latency_ms, ip_hash, rate_limited, cache_hit
  *
  * Execution order:
- *   1. CORS preflight
- *   2. Parse + validate body
- *   3. IP rate limit check  (ip_rate_limits table, 20 req/min)
- *   4. Daily quota check    (get_daily_scan_count RPC, 50/day)
- *   5. Redis cache check    (skipped for generic labels — iOS bleed fix)
- *   6. Claude evaluation
- *   7. INSERT into scan_attempts
+ *   1. CORS preflight + body parse
+ *   2. IP rate limit check  (ip_rate_limits table, 20 req/min)
+ *   3. Daily quota check    (get_daily_scan_count RPC, 50/day)
+ *   4. Redis cache check    (skipped for generic labels — iOS bleed fix)
+ *                           ↪ on hit: log cache row, return with _rateLimit
+ *   5. Claude evaluation
+ *   6. INSERT scan_attempts (cache_hit=false)
+ *   7. Cache the successful result (cacheSet)
  *   8. Return result + alert flags
  */
 
@@ -185,24 +204,27 @@ async function checkIpRateLimit(
   return { allowed: newCount <= IP_LIMIT_PER_MINUTE, requestCount: newCount };
 }
 
-// ─── scan_attempts logger ─────────────────────────────────────────────────────
+// ─── scan_attempts loggers ────────────────────────────────────────────────────
 //
-// logScanBlocked — call was blocked before Claude ran (rate limit or error)
-// logScanResult  — Claude ran and returned a full evaluation result
+// Three writers, three semantics:
+//   logScanBlocked   — call was blocked before Claude ran (rate limit / error)
+//   logScanResult    — Claude ran and returned a full evaluation (cache_hit=false)
+//   logScanCacheHit  — served from Redis cache (cache_hit=true, no Claude)
 //
-// Column mapping against actual scan_attempts schema:
+// Column mapping against scan_attempts schema:
 //   child_id          ← childId
 //   quest_id          ← questId
 //   detected_label    ← detectedLabel
 //   vision_confidence ← confidence
-//   ip_hash           ← ipHash          (added by Phase 3.5 migration)
-//   rate_limited      ← isRateLimited   (added by Phase 3.5 migration)
+//   ip_hash           ← ipHash             (Phase 3.5)
+//   rate_limited      ← isRateLimited      (Phase 3.5)
 //   resolved_name     ← result.resolvedObjectName
 //   overall_match     ← result.overallMatch
 //   property_scores   ← result.properties  (jsonb)
 //   child_feedback    ← result.childFeedback
 //   xp_awarded        ← result.xpAwarded
-//   claude_latency_ms ← claudeLatencyMs
+//   claude_latency_ms ← claudeLatencyMs    (null on cache hit)
+//   cache_hit         ← cacheHit           (v4.5 — observability)
 
 async function logScanBlocked(
   supabase: ReturnType<typeof createClient>,
@@ -224,6 +246,7 @@ async function logScanBlocked(
       ip_hash:           opts.ipHash        ?? null,
       rate_limited:      opts.isRateLimited,
       xp_awarded:        0,
+      cache_hit:         false,
     });
   } catch (e) {
     console.error("[evaluate] logScanBlocked INSERT failed:", e);
@@ -256,9 +279,57 @@ async function logScanResult(
       child_feedback:    opts.result.childFeedback,
       xp_awarded:        opts.result.xpAwarded,
       claude_latency_ms: opts.claudeLatencyMs,
+      cache_hit:         false,
     });
   } catch (e) {
     console.error("[evaluate] logScanResult INSERT failed:", e);
+  }
+}
+
+// v4.5 — NEW: log a row for a Redis cache hit so we can measure hit rate
+// from data instead of inferring from latency. claude_latency_ms is left
+// null deliberately — that's the unambiguous "no Claude call" signal.
+//
+// IMPORTANT: companion migration updates get_daily_scan_count to exclude
+// cache_hit=true rows, so this insert does NOT cause re-scans to burn
+// quota. Deploy the migration before this file.
+interface CachedEvaluation {
+  resolvedObjectName: string;
+  properties:         unknown;
+  overallMatch:       boolean;
+  childFeedback:      string;
+  xpAwarded:          number;
+}
+
+async function logScanCacheHit(
+  supabase: ReturnType<typeof createClient>,
+  opts: {
+    childId:       string;
+    questId?:      string;
+    detectedLabel: string;
+    confidence?:   number;
+    ipHash?:       string;
+    cachedResult:  CachedEvaluation;
+  }
+) {
+  try {
+    await supabase.from("scan_attempts").insert({
+      child_id:          opts.childId,
+      quest_id:          opts.questId        ?? null,
+      detected_label:    opts.detectedLabel,
+      vision_confidence: opts.confidence     ?? null,
+      ip_hash:           opts.ipHash         ?? null,
+      rate_limited:      false,
+      resolved_name:     opts.cachedResult.resolvedObjectName,
+      overall_match:     opts.cachedResult.overallMatch,
+      property_scores:   opts.cachedResult.properties,
+      child_feedback:    opts.cachedResult.childFeedback,
+      xp_awarded:        opts.cachedResult.xpAwarded,
+      claude_latency_ms: null,   // signal: no Claude call
+      cache_hit:         true,
+    });
+  } catch (e) {
+    console.error("[evaluate] logScanCacheHit INSERT failed:", e);
   }
 }
 
@@ -282,14 +353,25 @@ function utcMidnight(): string {
   return d.toISOString();
 }
 
+// Helper — alert flags shape used by both the cache-hit and Claude-call
+// response paths. Extracted so the two paths produce identical _rateLimit
+// envelopes; the only difference is the scansToday value (cache hits don't
+// increment, Claude calls do).
+function buildAlertFlags(scansToday: number) {
+  return {
+    scansToday,
+    dailyLimit:       DAILY_SCAN_LIMIT,
+    approachingLimit: scansToday >= Math.floor(DAILY_SCAN_LIMIT * ALERT_THRESHOLD_PCT),
+    limitReached:     scansToday >= DAILY_SCAN_LIMIT,
+  };
+}
+
 // ─── Main handler ─────────────────────────────────────────────────────────────
 
 serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: CORS_HEADERS });
   }
-
-  const startMs = Date.now();
 
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL")!,
@@ -414,14 +496,9 @@ serve(async (req: Request) => {
   // cache hit returns whatever was last cached for that key, regardless of
   // what the camera is actually pointing at.
   //
-  // Symptom: scanning a matchstick on iOS returned a cached "gold ring"
-  // verdict from a previous scan. Truly instant (~100 ms), wrong identification,
-  // wrong property feedback, scoped to the same (questId, pendingWords) bucket.
-  //
   // Fix: skip cache GET (and SET — see Section 7 below) entirely when
   // detectedLabel is too generic to distinguish physical objects. Android
-  // scans (real ML Kit labels) still cache normally — they have legitimate
-  // distinguishing input.
+  // scans (real ML Kit labels) still cache normally.
   const labelTrimmed   = ((detectedLabel as string) ?? "").toLowerCase().trim();
   const isGenericLabel = GENERIC_LABELS.has(labelTrimmed);
 
@@ -442,10 +519,28 @@ serve(async (req: Request) => {
   }
 
   if (cachedResult) {
-    
-    // Cache hits are NOT logged to scan_attempts — the original call was already
-    // logged, and cache hits don't consume a Claude token or count toward quota.
-    return jsonResponse({ ...(cachedResult as object), _cacheHit: true });
+    // v4.5: log the cache hit so it's visible to product analytics.
+    // claude_latency_ms is null (no Claude call); cache_hit is true.
+    // The companion migration's RPC update ensures this row does NOT
+    // count toward the daily 50/child quota.
+    const cached = cachedResult as CachedEvaluation;
+    await logScanCacheHit(supabase, {
+      childId,
+      questId:       questId as string | undefined,
+      detectedLabel: detectedLabel as string,
+      confidence:    confidence as number | undefined,
+      ipHash,
+      cachedResult:  cached,
+    });
+
+    // scansToday is unchanged on cache hit (cache hits don't burn quota).
+    // Including _rateLimit on the response keeps the client UI in sync —
+    // it won't show stale "scans today" numbers while the user is mid-quest.
+    return jsonResponse({
+      ...(cachedResult as object),
+      _cacheHit:  true,
+      _rateLimit: buildAlertFlags(scansToday),
+    });
   }
 
   // ── 5. Call Claude ────────────────────────────────────────────────────────
@@ -483,7 +578,7 @@ serve(async (req: Request) => {
     return jsonResponse({ error: msg }, 500);
   }
 
-  // ── 6. Log full result to scan_attempts ───────────────────────────────────
+  // ── 6. Log full result to scan_attempts (cache_hit=false) ─────────────────
   await logScanResult(supabase, {
     childId,
     questId:         questId as string | undefined,
@@ -504,18 +599,11 @@ serve(async (req: Request) => {
     await cacheSet(cacheKey, { ...evaluationResult, _cacheHit: false });
   }
 
-  // ── 8. Parent alert flags ─────────────────────────────────────────────────
+  // ── 8. Parent alert flags + return ────────────────────────────────────────
   const newScansToday = scansToday + 1;
-  const alertFlags = {
-    scansToday:       newScansToday,
-    dailyLimit:       DAILY_SCAN_LIMIT,
-    approachingLimit: newScansToday >= Math.floor(DAILY_SCAN_LIMIT * ALERT_THRESHOLD_PCT),
-    limitReached:     newScansToday >= DAILY_SCAN_LIMIT,
-  };
-
   return jsonResponse({
     ...evaluationResult,
     _cacheHit:  false,
-    _rateLimit: alertFlags,
+    _rateLimit: buildAlertFlags(newScansToday),
   });
 });
