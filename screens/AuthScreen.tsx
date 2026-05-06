@@ -1,40 +1,35 @@
 /**
- * AuthScreen.tsx  (Phase 4.1 — COPPA + GDPR-K update)
- * Lexi-Lens — parent authentication (login + signup).
+ * AuthScreen.tsx  (v4.5 — forgot password flow)
+ * Lexi-Lens — parent authentication.
  *
- * CHANGES FROM PREVIOUS VERSION:
+ * CHANGES FROM v4.4:
  *
- *   1. ConsentGateModal integrated into sign-up flow.
- *      When the parent taps "Create account", the consent gate appears
- *      FIRST (parental gate maths challenge + 4 opt-in checkboxes).
- *      Only after ALL four boxes are checked does the Supabase signUp()
- *      call fire. This satisfies COPPA §312.5(a) and GDPR-K Art. 8.
+ *   1. Forgot-password flow.
+ *      Tapping "Forgot password?" on the sign-in form opens a third mode
+ *      that collects an email address and calls
+ *      supabase.auth.resetPasswordForEmail(email, { redirectTo: ENV.deepLink.resetUrl }).
+ *      A success-state mode follows ("Check your email").
  *
- *   2. Consent metadata passed in user_metadata at signup.
- *      A Supabase DB trigger (handle_new_user_consent) reads these fields
- *      and writes a parental_consents row automatically — so the record
- *      is created even when email verification is required before a
- *      session is available.
+ *   2. Reset-confirmation mode.
+ *      When the parent taps the reset link in the email, App.tsx handles
+ *      the deep link, calls exchangeCodeForSession, and flips
+ *      useAuthFlow().recoveryActive to true. This screen reads that flag
+ *      and switches into "set new password" mode automatically. After
+ *      supabase.auth.updateUser({ password }) succeeds, recoveryActive is
+ *      cleared and the existing onAuthStateChange handler in App.tsx routes
+ *      the now-authenticated parent to ChildSwitcher.
  *
- *   3. Privacy Policy modal accessible from AuthScreen.
- *      "Privacy Policy" text in the legal footer is now tappable and
- *      opens the PrivacyPolicyScreen inline. This is required by:
- *        • Google Play data safety section
- *        • Apple App Store review guideline 5.1.1
- *        • COPPA §312.4 (link in first place where data is collected)
+ *   3. Deep-link scheme is now variant-aware.
+ *      ENV.deepLink.confirmUrl / .resetUrl reflect the current APP_VARIANT
+ *      (e.g. lexilensstaging://auth/reset on a staging build) so reset
+ *      links from a staging password reset can't leak into a production app.
  *
- *   4. Sign-in and sign-up paths separated into distinct functions.
- *      handleSubmit() → routes to gate (sign_up) or sign-in directly.
- *      performSignIn() → Supabase signInWithPassword.
- *      performSignUp(meta) → Supabase signUp with consent metadata.
- *
- * Two modes toggled inline — no separate screens:
- *   "sign_in"  → email + password + "Sign in" button
- *   "sign_up"  → display name + email + password + confirm + "Create account"
- *               → triggers ConsentGateModal first
- *
- * After successful auth the navigator's onAuthStateChange listener
- * (in App.tsx) will redirect to ChildSwitcher automatically.
+ * Original v4.1 behaviour preserved verbatim:
+ *   • ConsentGateModal in sign-up flow
+ *   • Consent metadata recorded via record-consent Edge Function
+ *   • Privacy Policy modal
+ *   • Pending-deletion banner with Restore / Keep options
+ *   • Email confirmation deep-link banner ("Email confirmed! Sign in below.")
  */
 
 import React, { useState, useRef, useCallback, useEffect } from "react";
@@ -55,12 +50,19 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
+import { ENV } from "../lib/env";
+import { useAuthFlow } from "../lib/authFlow";
 import { ConsentGateModal, ConsentMetadata } from "../components/ConsentGateModal";
 import { PrivacyPolicyScreen }               from "../components/PrivacyPolicyScreen";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type AuthMode = "sign_in" | "sign_up";
+type AuthMode =
+  | "sign_in"
+  | "sign_up"
+  | "forgot_request"   // collect email, send reset link
+  | "forgot_sent"      // success screen after sending the reset email
+  | "reset_confirm";   // post-deep-link: set new password
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
 
@@ -121,30 +123,48 @@ export function AuthScreen() {
   const [loading, setLoading] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [success,  setSuccess]  = useState(false);
-  // Set to true when the app is reopened via the confirmation deep link,
-  // so we can show a "Email confirmed! Sign in below." banner.
   const [emailConfirmed, setEmailConfirmed] = useState(false);
 
-  // Detect cold-start via confirmation link (warm-start is handled in App.tsx)
+  // v4.5 — recovery mode: flipped by App.tsx via useAuthFlow when a
+  // password-reset deep link is processed. We listen for this and switch
+  // into "set new password" mode immediately.
+  const recoveryActive = useAuthFlow((s) => s.recoveryActive);
+  const clearRecovery  = useAuthFlow((s) => s.clearRecovery);
+
+  // Detect cold-start via auth-confirm or auth-reset deep links.
+  // Warm-start is handled in App.tsx, but we also re-listen here for the
+  // narrow purpose of UI state (confirmation banner, mode switch).
   useEffect(() => {
-    Linking.getInitialURL().then((url: string | null) => {
-      if (url?.includes("auth/confirm")) setEmailConfirmed(true);
-    });
-    const sub = Linking.addEventListener("url", ({ url }: { url: string }) => {
-      if (url?.includes("auth/confirm")) {
+    const checkUrl = (url: string | null) => {
+      if (!url) return;
+      if (url.includes("auth/confirm")) {
         setEmailConfirmed(true);
-        // Switch to sign-in so the user can immediately log in
         setMode("sign_in");
+      } else if (url.includes("auth/reset")) {
+        setMode("reset_confirm");
       }
-    });
+    };
+    Linking.getInitialURL().then(checkUrl);
+    const sub = Linking.addEventListener("url", ({ url }) => checkUrl(url));
     return () => sub.remove();
   }, []);
+
+  // Whenever App.tsx flips authFlow.recoveryActive to true, switch to
+  // reset_confirm. This is the path that handles the live deep link too:
+  // App.tsx sees the URL, calls beginRecovery(), this effect responds.
+  useEffect(() => {
+    if (recoveryActive) {
+      setMode("reset_confirm");
+      setApiError(null);
+      setSuccess(false);
+    }
+  }, [recoveryActive]);
 
   // Phase 4.1: Consent + privacy state
   const [showConsentGate,  setShowConsentGate]  = useState(false);
   const [showPrivacyPolicy, setShowPrivacyPolicy] = useState(false);
 
-  // Phase 4.1: Deletion-recovery state — set when sign-in detects a pending deletion
+  // Phase 4.1: Deletion-recovery state
   const [pendingDeletion, setPendingDeletion] = useState<{
     daysLeft: number;
     restoringAccount: boolean;
@@ -175,9 +195,19 @@ export function AuthScreen() {
     if (mode === "sign_up" && !displayName.value.trim()) {
       touchDisplayName(); ok = false;
     }
-    if (validateEmail(email.value)) { touchEmail(); ok = false; }
-    if (validatePassword(password.value)) { touchPassword(); ok = false; }
-    if (mode === "sign_up" && password.value !== confirm.value) {
+
+    // Email is needed for sign_in, sign_up, forgot_request only.
+    if (mode === "sign_in" || mode === "sign_up" || mode === "forgot_request") {
+      if (validateEmail(email.value)) { touchEmail(); ok = false; }
+    }
+
+    // Password is needed for sign_in, sign_up, reset_confirm.
+    if (mode === "sign_in" || mode === "sign_up" || mode === "reset_confirm") {
+      if (validatePassword(password.value)) { touchPassword(); ok = false; }
+    }
+
+    // Confirm-password match is needed for sign_up + reset_confirm.
+    if ((mode === "sign_up" || mode === "reset_confirm") && password.value !== confirm.value) {
       touchConfirm(); ok = false;
     }
 
@@ -196,20 +226,14 @@ export function AuthScreen() {
       });
       if (error) throw error;
 
-      // ── Deletion-pending guard ─────────────────────────────────────────────
-      // If the parent requested deletion within the last 30 days, block full
-      // navigation but present a "Restore account" option instead of a dead end.
       const scheduledAt = data.session?.user?.app_metadata?.deletion_scheduled_at;
       if (scheduledAt) {
         const daysLeft = Math.ceil(
-          (new Date(scheduledAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)
+          (new Date(scheduledAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24),
         );
-        // Keep the session alive so cancel-deletion can use the JWT.
-        // DO NOT sign out here — we need the session for the restore flow.
         setPendingDeletion({ daysLeft, restoringAccount: false });
         return;
       }
-      // onAuthStateChange in App.tsx handles navigation on success
     } catch (err: any) {
       const msg: string = err?.message ?? "Something went wrong";
       if (msg.includes("Invalid login credentials")) {
@@ -223,15 +247,13 @@ export function AuthScreen() {
     }
   }, [email.value, password.value]);
 
-  // ── Restore account (cancel pending deletion) ────────────────────────────
-  // Called from the deletion-recovery banner in the sign-in form.
+  // ── Restore account (cancel pending deletion) ─────────────────────────────
   const handleRestoreAccount = useCallback(async () => {
     if (!pendingDeletion) return;
     setPendingDeletion((p) => p ? { ...p, restoringAccount: true } : null);
     try {
       const { error } = await supabase.functions.invoke("cancel-deletion", {});
       if (error) throw error;
-      // Deletion cleared — onAuthStateChange will now navigate normally
       setPendingDeletion(null);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch (err: any) {
@@ -246,7 +268,7 @@ export function AuthScreen() {
     await supabase.auth.signOut();
   }, []);
 
-  // ── Sign-up (called after consent gate passes) ───────────────────────────────
+  // ── Sign-up (called after consent gate passes) ────────────────────────────
   const performSignUp = useCallback(async (meta: ConsentMetadata) => {
     setLoading(true);
     setApiError(null);
@@ -255,15 +277,9 @@ export function AuthScreen() {
         email:    email.value.trim(),
         password: password.value,
         options: {
-          // Deep-link the confirmation email back into the app (not localhost).
-          // App.tsx handles this URL via Linking and calls exchangeCodeForSession().
-          emailRedirectTo: "lexilens://auth/confirm",
+          emailRedirectTo: ENV.deepLink.confirmUrl,
           data: {
             display_name: displayName.value.trim(),
-            // Consent metadata stored in raw_user_meta_data for reference.
-            // The DB trigger approach was removed (postgres doesn't own auth.users
-            // in Supabase — ERROR 42501). Consent is recorded below instead,
-            // using the user's own JWT immediately after signup.
             consent_policy_version:          meta.policyVersion,
             consent_consented_at:            meta.consentedAt,
             consent_coppa_confirmed:         meta.coppaConfirmed,
@@ -273,14 +289,8 @@ export function AuthScreen() {
           },
         },
       });
-
       if (error) throw error;
 
-      // ── Record parental consent via Edge Function ──────────────────────────
-      // We call the record-consent Edge Function (service role) instead of
-      // inserting directly from the client. This works regardless of whether
-      // email confirmation is enabled (data.session may be null, but data.user
-      // is always returned on successful signUp).
       if (data.user) {
         try {
           const { error: fnError } = await supabase.functions.invoke("record-consent", {
@@ -295,7 +305,6 @@ export function AuthScreen() {
             },
           });
           if (fnError) {
-            // Non-fatal — consent metadata is in raw_user_meta_data as backup.
             console.warn("[consent] record-consent function error:", fnError.message);
           }
         } catch (consentErr: any) {
@@ -303,11 +312,9 @@ export function AuthScreen() {
         }
       }
 
-      // Email verification pending — session will be null until the link is clicked
       if (data.session === null) {
         setSuccess(true);
       }
-      // If session is immediately available, onAuthStateChange in App.tsx handles redirect
     } catch (err: any) {
       const msg: string = err?.message ?? "Something went wrong";
       if (msg.includes("already registered")) {
@@ -315,7 +322,7 @@ export function AuthScreen() {
           "An account with this email already exists. " +
           "If you recently deleted this account, it will be permanently removed " +
           "within 30 days — after which you can register again. " +
-          "To restore it now, sign in and choose \"Keep account\"."
+          "To restore it now, sign in and choose \"Keep account\".",
         );
       } else {
         setApiError(msg);
@@ -326,24 +333,76 @@ export function AuthScreen() {
     }
   }, [email.value, password.value, displayName.value]);
 
-  // ── Primary "submit" handler ─────────────────────────────────────────────────
-  // Routes to consent gate for sign_up, or sign-in directly.
-  const handleSubmit = useCallback(async () => {
-    if (!validate()) {
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-      return;
+  // ── v4.5 — Send password reset email ──────────────────────────────────────
+  const performForgotRequest = useCallback(async () => {
+    setLoading(true);
+    setApiError(null);
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(
+        email.value.trim(),
+        { redirectTo: ENV.deepLink.resetUrl },
+      );
+      if (error) throw error;
+      switchMode("forgot_sent");
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (err: any) {
+      // Supabase rate-limits this endpoint hard. Surface the message so the
+      // parent knows whether to wait or check the email address.
+      setApiError(err?.message ?? "Couldn't send the reset email. Try again in a minute.");
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } finally {
+      setLoading(false);
     }
+  }, [email.value]);
 
-    if (mode === "sign_up") {
-      // COPPA requirement: show parental gate + consent form BEFORE any API call
-      setShowConsentGate(true);
-      return;
+  // ── v4.5 — Set the new password after the deep link ───────────────────────
+  const performResetConfirm = useCallback(async () => {
+    setLoading(true);
+    setApiError(null);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: password.value });
+      if (error) throw error;
+
+      // Recovery is done. Clear the flag so App.tsx's normal session →
+      // AppNavigator routing kicks in.
+      clearRecovery();
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      // No further action — onAuthStateChange will route to ChildSwitcher
+      // because we're already authenticated.
+    } catch (err: any) {
+      setApiError(err?.message ?? "Couldn't update your password. Try again.");
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } finally {
+      setLoading(false);
     }
+  }, [password.value, clearRecovery]);
 
-    await performSignIn();
-  }, [mode, validate, performSignIn]);
+  // ── Submit dispatcher ─────────────────────────────────────────────────────
+  const handleSubmit = useCallback(() => {
+    if (!validate()) return;
+    Haptics.selectionAsync();
 
-  // ── Consent gate callbacks ───────────────────────────────────────────────────
+    switch (mode) {
+      case "sign_in":
+        performSignIn();
+        break;
+      case "sign_up":
+        // Open consent gate first
+        setShowConsentGate(true);
+        break;
+      case "forgot_request":
+        performForgotRequest();
+        break;
+      case "reset_confirm":
+        performResetConfirm();
+        break;
+      default:
+        // forgot_sent has no submit
+        break;
+    }
+  }, [mode, performSignIn, performForgotRequest, performResetConfirm]);
+
+  // ── Consent gate handlers ─────────────────────────────────────────────────
   const handleConsented = useCallback((meta: ConsentMetadata) => {
     setShowConsentGate(false);
     performSignUp(meta);
@@ -353,17 +412,21 @@ export function AuthScreen() {
     setShowConsentGate(false);
   }, []);
 
-  // ── Email verification success screen ────────────────────────────────────────
-  if (success) {
+  // ─────────────────────────────────────────────────────────────────────────
+  // Render — the form changes shape based on `mode`. A single ScrollView
+  // contains the relevant fields + actions for each mode.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // After a successful sign-up the user must verify email.
+  if (success && mode === "sign_up") {
     return (
       <View style={[styles.root, styles.center, { paddingTop: insets.top }]}>
-        <Text style={styles.successEmoji}>📬</Text>
+        <Text style={styles.successEmoji}>📧</Text>
         <Text style={styles.successTitle}>Check your email</Text>
         <Text style={styles.successBody}>
           We sent a confirmation link to{"\n"}
-          <Text style={{ fontWeight: "600" }}>{email.value.trim()}</Text>
-          {"\n\n"}
-          Tap it to activate your account, then come back and sign in.
+          <Text style={{ fontWeight: "700" }}>{email.value}</Text>{"\n\n"}
+          Tap the link to finish creating your account.
         </Text>
         <TouchableOpacity
           style={styles.switchModeBtn}
@@ -375,7 +438,32 @@ export function AuthScreen() {
     );
   }
 
-  // ── Main form ─────────────────────────────────────────────────────────────────
+  // ── Forgot-sent success screen ────────────────────────────────────────────
+  if (mode === "forgot_sent") {
+    return (
+      <View style={[styles.root, styles.center, { paddingTop: insets.top }]}>
+        <Text style={styles.successEmoji}>🔑</Text>
+        <Text style={styles.successTitle}>Check your email</Text>
+        <Text style={styles.successBody}>
+          We sent a password reset link to{"\n"}
+          <Text style={{ fontWeight: "700" }}>{email.value}</Text>{"\n\n"}
+          Tap the link to set a new password.
+          {"\n\n"}
+          <Text style={{ fontSize: 12, color: P.inkLight }}>
+            Didn't see it? Check your spam folder. The link expires in 1 hour.
+          </Text>
+        </Text>
+        <TouchableOpacity
+          style={styles.switchModeBtn}
+          onPress={() => switchMode("sign_in")}
+        >
+          <Text style={styles.switchModeBtnText}>Back to sign in</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+
+  // ── Standard form (sign_in / sign_up / forgot_request / reset_confirm) ───
   return (
     <>
       <KeyboardAvoidingView
@@ -385,234 +473,274 @@ export function AuthScreen() {
         <ScrollView
           contentContainerStyle={[
             styles.scroll,
-            { paddingTop: insets.top + 24, paddingBottom: insets.bottom + 40 },
+            { paddingTop: insets.top + 28, paddingBottom: insets.bottom + 32 },
           ]}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          {/* Wordmark */}
+
+          {/* ── Wordmark ──────────────────────────────────── */}
           <View style={styles.wordmark}>
-            <Text style={styles.wordmarkEmoji}>📖</Text>
+            <Text style={styles.wordmarkEmoji}>📚</Text>
             <Text style={styles.wordmarkTitle}>Lexi-Lens</Text>
-            <Text style={styles.wordmarkSub}>Vocabulary Adventure for Children</Text>
+            <Text style={styles.wordmarkSub}>Vocabulary quests for curious kids</Text>
           </View>
 
-          <Animated.View style={[styles.card, { opacity: fadeAnim }]}>
-            <Text style={styles.formTitle}>
-              {mode === "sign_in" ? "Welcome back" : "Create a parent account"}
-            </Text>
-            <Text style={styles.formSub}>
-              {mode === "sign_in"
-                ? "Sign in to manage your child's vocabulary progress."
-                : "One account for the whole family. You control all child profiles."}
-            </Text>
-
-            {/* Email-confirmed banner — shown when user returns via confirmation link */}
-            {emailConfirmed && !apiError && (
-              <View style={styles.confirmedBox}>
-                <Text style={styles.confirmedText}>
-                  ✅ Email confirmed! Sign in below to start your adventure.
-                </Text>
-              </View>
-            )}
-
-            {/* API-level error */}
-            {apiError && (
-              <View style={styles.apiErrorBox}>
-                <Text style={styles.apiErrorText}>{apiError}</Text>
-              </View>
-            )}
-
-            {/* Deletion-recovery banner — shown instead of dead-end error */}
-            {pendingDeletion && !apiError && (
+          {/* ── Pending-deletion banner ───────────────────── */}
+          {pendingDeletion && (
+            <View style={[styles.card, { paddingVertical: 18 }]}>
               <View style={styles.deletionRecoveryBox}>
                 <Text style={styles.deletionRecoveryTitle}>
-                  ⏳ Account scheduled for deletion
+                  ⏳ Deletion scheduled in {pendingDeletion.daysLeft} day{pendingDeletion.daysLeft !== 1 ? "s" : ""}
                 </Text>
                 <Text style={styles.deletionRecoveryBody}>
-                  {"Your account will be permanently deleted in "}
-                  <Text style={{ fontWeight: "700" }}>
-                    {pendingDeletion.daysLeft} day{pendingDeletion.daysLeft !== 1 ? "s" : ""}
-                  </Text>
-                  {". Child data has already been removed."}
-                </Text>
-                <Text style={styles.deletionRecoveryBody}>
-                  {"Changed your mind? You can restore your account now."}
+                  Your account is queued for permanent deletion.
+                  Restore it now to keep all profiles, words, and progress.
                 </Text>
                 <View style={styles.deletionRecoveryActions}>
                   <TouchableOpacity
-                    style={[
-                      styles.restoreBtn,
-                      pendingDeletion.restoringAccount && { opacity: 0.6 },
-                    ]}
+                    style={styles.restoreBtn}
                     onPress={handleRestoreAccount}
                     disabled={pendingDeletion.restoringAccount}
-                    accessibilityLabel="Restore account and cancel deletion"
                   >
-                    <Text style={styles.restoreBtnText}>
-                      {pendingDeletion.restoringAccount ? "Restoring…" : "✓ Restore my account"}
-                    </Text>
+                    {pendingDeletion.restoringAccount
+                      ? <ActivityIndicator color="#fff" size="small" />
+                      : <Text style={styles.restoreBtnText}>Restore account</Text>
+                    }
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={styles.keepDeletionBtn}
-                    onPress={handleKeepDeletion}
-                    accessibilityLabel="Keep deletion and sign out"
-                  >
-                    <Text style={styles.keepDeletionBtnText}>Keep deletion</Text>
+                  <TouchableOpacity style={styles.keepDeletionBtn} onPress={handleKeepDeletion}>
+                    <Text style={styles.keepDeletionBtnText}>Sign out</Text>
                   </TouchableOpacity>
                 </View>
               </View>
-            )}
-
-            {/* Display name (sign-up only) */}
-            {mode === "sign_up" && (
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>Your name</Text>
-                <TextInput
-                  style={[
-                    styles.input,
-                    displayName.touched && !displayName.value.trim() && styles.inputError,
-                  ]}
-                  placeholder="e.g. Sarah"
-                  placeholderTextColor={P.inkFaint}
-                  value={displayName.value}
-                  onChangeText={setDisplayName}
-                  onBlur={touchDisplayName}
-                  autoCapitalize="words"
-                  returnKeyType="next"
-                  accessibilityLabel="Your display name"
-                />
-                {displayName.touched && !displayName.value.trim() && (
-                  <FieldError message="Your name is required" />
-                )}
-              </View>
-            )}
-
-            {/* Email */}
-            <View style={styles.fieldGroup}>
-              <Text style={styles.label}>Email address</Text>
-              <TextInput
-                style={[
-                  styles.input,
-                  email.touched && !!validateEmail(email.value) && styles.inputError,
-                ]}
-                placeholder="you@example.com"
-                placeholderTextColor={P.inkFaint}
-                value={email.value}
-                onChangeText={setEmail}
-                onBlur={touchEmail}
-                keyboardType="email-address"
-                autoCapitalize="none"
-                autoCorrect={false}
-                returnKeyType="next"
-                accessibilityLabel="Email address"
-              />
-              {email.touched && !!validateEmail(email.value) && (
-                <FieldError message={validateEmail(email.value)!} />
-              )}
             </View>
+          )}
 
-            {/* Password */}
-            <View style={styles.fieldGroup}>
-              <Text style={styles.label}>Password</Text>
-              <TextInput
-                style={[
-                  styles.input,
-                  password.touched && !!validatePassword(password.value) && styles.inputError,
-                ]}
-                placeholder={mode === "sign_up" ? "At least 8 characters" : "Your password"}
-                placeholderTextColor={P.inkFaint}
-                value={password.value}
-                onChangeText={setPassword}
-                onBlur={touchPassword}
-                secureTextEntry
-                returnKeyType={mode === "sign_up" ? "next" : "done"}
-                onSubmitEditing={mode === "sign_in" ? handleSubmit : undefined}
-                accessibilityLabel="Password"
-              />
-              {password.touched && !!validatePassword(password.value) && (
-                <FieldError message={validatePassword(password.value)!} />
-              )}
-            </View>
-
-            {/* Confirm password (sign-up only) */}
-            {mode === "sign_up" && (
-              <View style={styles.fieldGroup}>
-                <Text style={styles.label}>Confirm password</Text>
-                <TextInput
-                  style={[
-                    styles.input,
-                    confirm.touched && password.value !== confirm.value && styles.inputError,
-                  ]}
-                  placeholder="Repeat your password"
-                  placeholderTextColor={P.inkFaint}
-                  value={confirm.value}
-                  onChangeText={setConfirm}
-                  onBlur={touchConfirm}
-                  secureTextEntry
-                  returnKeyType="done"
-                  onSubmitEditing={handleSubmit}
-                  accessibilityLabel="Confirm password"
-                />
-                {confirm.touched && password.value !== confirm.value && (
-                  <FieldError message="Passwords don't match" />
-                )}
-              </View>
-            )}
-
-            {/* COPPA notice for sign-up */}
-            {mode === "sign_up" && (
-              <View style={styles.coppaNoticeBox}>
-                <Text style={styles.coppaNoticeText}>
-                  🔐  Tapping "Create account" will open a{" "}
-                  <Text style={styles.coppaNoticeBold}>parent verification step</Text>{" "}
-                  required by COPPA children's privacy law.
-                </Text>
-              </View>
-            )}
-
-            {/* Submit */}
-            <TouchableOpacity
-              style={[styles.submitBtn, loading && styles.submitBtnDisabled]}
-              onPress={handleSubmit}
-              disabled={loading}
-              accessibilityRole="button"
-              accessibilityLabel={mode === "sign_in" ? "Sign in" : "Create account — opens parental consent"}
-            >
-              {loading ? (
-                <ActivityIndicator color={P.white} />
-              ) : (
-                <Text style={styles.submitBtnText}>
-                  {mode === "sign_in" ? "Sign in" : "Create account →"}
-                </Text>
-              )}
-            </TouchableOpacity>
-          </Animated.View>
-
-          {/* Mode toggle */}
-          <View style={styles.toggleRow}>
-            <Text style={styles.toggleText}>
-              {mode === "sign_in" ? "New to Lexi-Lens?" : "Already have an account?"}
-            </Text>
-            <TouchableOpacity
-              onPress={() => switchMode(mode === "sign_in" ? "sign_up" : "sign_in")}
-              accessibilityRole="button"
-            >
-              <Text style={styles.toggleLink}>
-                {mode === "sign_in" ? "Create account" : "Sign in"}
+          {/* ── Email-confirmed banner (one-shot) ─────────── */}
+          {emailConfirmed && !pendingDeletion && (
+            <View style={[styles.card, { backgroundColor: "#ecfdf5", borderColor: "#a7f3d0", paddingVertical: 14 }]}>
+              <Text style={{ color: "#047857", fontSize: 14, fontWeight: "600", textAlign: "center" }}>
+                ✓ Email confirmed! Sign in below.
               </Text>
-            </TouchableOpacity>
-          </View>
+            </View>
+          )}
 
-          {/* Legal footer with tappable Privacy Policy */}
+          {/* ── Form card ─────────────────────────────────── */}
+          {!pendingDeletion && (
+            <Animated.View style={[styles.card, { opacity: fadeAnim }]}>
+              <Text style={styles.formTitle}>
+                {mode === "sign_in"        ? "Welcome back"
+                 : mode === "sign_up"      ? "Create your account"
+                 : mode === "forgot_request" ? "Reset your password"
+                 : "Set a new password"}
+              </Text>
+              <Text style={styles.formSub}>
+                {mode === "sign_in"        ? "Sign in to continue your child's adventure"
+                 : mode === "sign_up"      ? "Track your child's vocabulary growth"
+                 : mode === "forgot_request" ? "We'll email you a secure link to set a new password"
+                 : "Choose a strong password (at least 8 characters)"}
+              </Text>
+
+              {/* API error banner */}
+              {apiError && (
+                <View style={styles.errorBox}>
+                  <Text style={styles.errorText}>{apiError}</Text>
+                </View>
+              )}
+
+              {/* Display name (sign_up only) */}
+              {mode === "sign_up" && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.label}>Your name</Text>
+                  <TextInput
+                    style={[styles.input, displayName.touched && !displayName.value.trim() && styles.inputError]}
+                    placeholder="Mom, Dad, or your nickname"
+                    placeholderTextColor={P.inkFaint}
+                    value={displayName.value}
+                    onChangeText={setDisplayName}
+                    onBlur={touchDisplayName}
+                    autoCapitalize="words"
+                    autoCorrect={false}
+                    returnKeyType="next"
+                    accessibilityLabel="Display name"
+                  />
+                  {displayName.touched && !displayName.value.trim() && (
+                    <FieldError message="Please tell us your name" />
+                  )}
+                </View>
+              )}
+
+              {/* Email — used by sign_in, sign_up, forgot_request */}
+              {(mode === "sign_in" || mode === "sign_up" || mode === "forgot_request") && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.label}>Email</Text>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      email.touched && !!validateEmail(email.value) && styles.inputError,
+                    ]}
+                    placeholder="you@example.com"
+                    placeholderTextColor={P.inkFaint}
+                    value={email.value}
+                    onChangeText={setEmail}
+                    onBlur={touchEmail}
+                    keyboardType="email-address"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    returnKeyType={mode === "forgot_request" ? "done" : "next"}
+                    onSubmitEditing={mode === "forgot_request" ? handleSubmit : undefined}
+                    accessibilityLabel="Email address"
+                  />
+                  {email.touched && !!validateEmail(email.value) && (
+                    <FieldError message={validateEmail(email.value)!} />
+                  )}
+                </View>
+              )}
+
+              {/* Password — sign_in, sign_up, reset_confirm */}
+              {(mode === "sign_in" || mode === "sign_up" || mode === "reset_confirm") && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.label}>
+                    {mode === "reset_confirm" ? "New password" : "Password"}
+                  </Text>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      password.touched && !!validatePassword(password.value) && styles.inputError,
+                    ]}
+                    placeholder={
+                      mode === "sign_up" || mode === "reset_confirm"
+                        ? "At least 8 characters"
+                        : "Your password"
+                    }
+                    placeholderTextColor={P.inkFaint}
+                    value={password.value}
+                    onChangeText={setPassword}
+                    onBlur={touchPassword}
+                    secureTextEntry
+                    returnKeyType={
+                      mode === "sign_up" || mode === "reset_confirm" ? "next" : "done"
+                    }
+                    onSubmitEditing={mode === "sign_in" ? handleSubmit : undefined}
+                    accessibilityLabel={mode === "reset_confirm" ? "New password" : "Password"}
+                  />
+                  {password.touched && !!validatePassword(password.value) && (
+                    <FieldError message={validatePassword(password.value)!} />
+                  )}
+                </View>
+              )}
+
+              {/* Forgot-password link (sign_in only) */}
+              {mode === "sign_in" && (
+                <TouchableOpacity
+                  style={styles.forgotLinkRow}
+                  onPress={() => switchMode("forgot_request")}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Text style={styles.forgotLinkText}>Forgot password?</Text>
+                </TouchableOpacity>
+              )}
+
+              {/* Confirm password — sign_up + reset_confirm */}
+              {(mode === "sign_up" || mode === "reset_confirm") && (
+                <View style={styles.fieldGroup}>
+                  <Text style={styles.label}>Confirm password</Text>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      confirm.touched && password.value !== confirm.value && styles.inputError,
+                    ]}
+                    placeholder="Repeat your password"
+                    placeholderTextColor={P.inkFaint}
+                    value={confirm.value}
+                    onChangeText={setConfirm}
+                    onBlur={touchConfirm}
+                    secureTextEntry
+                    returnKeyType="done"
+                    onSubmitEditing={handleSubmit}
+                    accessibilityLabel="Confirm password"
+                  />
+                  {confirm.touched && password.value !== confirm.value && (
+                    <FieldError message="Passwords don't match" />
+                  )}
+                </View>
+              )}
+
+              {/* COPPA notice for sign-up */}
+              {mode === "sign_up" && (
+                <View style={styles.coppaNoticeBox}>
+                  <Text style={styles.coppaNoticeText}>
+                    🔐  Tapping "Create account" will open a{" "}
+                    <Text style={styles.coppaNoticeBold}>parent verification step</Text>{" "}
+                    required by COPPA children's privacy law.
+                  </Text>
+                </View>
+              )}
+
+              {/* Submit */}
+              <TouchableOpacity
+                style={[styles.submitBtn, loading && styles.submitBtnDisabled]}
+                onPress={handleSubmit}
+                disabled={loading}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  mode === "sign_in"        ? "Sign in"
+                  : mode === "sign_up"      ? "Create account — opens parental consent"
+                  : mode === "forgot_request" ? "Send password reset email"
+                  : "Update password"
+                }
+              >
+                {loading ? (
+                  <ActivityIndicator color={P.white} />
+                ) : (
+                  <Text style={styles.submitBtnText}>
+                    {mode === "sign_in"        ? "Sign in"
+                     : mode === "sign_up"      ? "Create account →"
+                     : mode === "forgot_request" ? "Send reset link"
+                     : "Update password →"}
+                  </Text>
+                )}
+              </TouchableOpacity>
+            </Animated.View>
+          )}
+
+          {/* ── Mode toggle / back link ───────────────────── */}
+          {!pendingDeletion && (
+            <View style={styles.toggleRow}>
+              {mode === "sign_in" && (
+                <>
+                  <Text style={styles.toggleText}>New to Lexi-Lens?</Text>
+                  <TouchableOpacity onPress={() => switchMode("sign_up")}>
+                    <Text style={styles.toggleLink}>Create account</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+              {mode === "sign_up" && (
+                <>
+                  <Text style={styles.toggleText}>Already have an account?</Text>
+                  <TouchableOpacity onPress={() => switchMode("sign_in")}>
+                    <Text style={styles.toggleLink}>Sign in</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+              {(mode === "forgot_request" || mode === "reset_confirm") && (
+                <>
+                  <Text style={styles.toggleText}>Remembered it?</Text>
+                  <TouchableOpacity onPress={() => {
+                    if (mode === "reset_confirm") clearRecovery();
+                    switchMode("sign_in");
+                  }}>
+                    <Text style={styles.toggleLink}>Back to sign in</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+            </View>
+          )}
+
+          {/* Legal footer */}
           <Text style={styles.legalText}>
-            By creating an account you agree to our{" "}
-            <Text
-              style={styles.legalLink}
-              onPress={() => setShowPrivacyPolicy(true)}
-              accessibilityRole="link"
-              accessibilityLabel="Read our Privacy Policy"
-            >
+            By continuing you agree to the{" "}
+            <Text style={styles.legalLink} onPress={() => setShowPrivacyPolicy(true)}>
               Privacy Policy
             </Text>
             .{"\n"}
@@ -621,7 +749,7 @@ export function AuthScreen() {
         </ScrollView>
       </KeyboardAvoidingView>
 
-      {/* ── COPPA Parental Gate + Consent ──────────────────────────── */}
+      {/* COPPA Parental Gate + Consent */}
       <ConsentGateModal
         visible={showConsentGate}
         onConsented={handleConsented}
@@ -632,7 +760,7 @@ export function AuthScreen() {
         }}
       />
 
-      {/* ── Privacy Policy full-screen modal ───────────────────────── */}
+      {/* Privacy Policy full-screen modal */}
       <Modal
         visible={showPrivacyPolicy}
         animationType="slide"
@@ -676,73 +804,65 @@ const styles = StyleSheet.create({
   formSub:   { fontSize: 13, color: P.inkLight, lineHeight: 19, marginBottom: 20 },
 
   // API error
-  // Email-confirmed success banner
-  confirmedBox: {
-    backgroundColor: "#f0fdf4",
-    borderRadius:    10,
-    borderWidth:     1,
-    borderColor:     "#86efac",
-    padding:         12,
-    marginBottom:    16,
-  },
-  confirmedText: { fontSize: 13, color: "#166534", lineHeight: 18, fontWeight: "600" },
-
-  apiErrorBox: {
+  errorBox: {
     backgroundColor: P.errorBg,
-    borderRadius:    10,
-    borderWidth:     1,
     borderColor:     P.errorBorder,
+    borderWidth:     1,
+    borderRadius:    10,
     padding:         12,
     marginBottom:    16,
   },
-  apiErrorText: { fontSize: 13, color: P.errorText, lineHeight: 18 },
+  errorText: { color: P.errorText, fontSize: 13, lineHeight: 19 },
 
   // Fields
-  fieldGroup:  { marginBottom: 16 },
-  label:       { fontSize: 13, fontWeight: "600", color: P.inkMid, marginBottom: 6 },
+  fieldGroup: { marginBottom: 16 },
+  label:      { fontSize: 13, fontWeight: "600", color: P.inkBrown, marginBottom: 6 },
   input: {
-    backgroundColor:   P.parchment,
-    borderRadius:      10,
-    borderWidth:       1,
-    borderColor:       P.warmBorder,
-    paddingHorizontal: 14,
-    paddingVertical:   12,
-    fontSize:          15,
-    color:             P.inkBrown,
-  },
-  inputError:  { borderColor: "#fca5a5", backgroundColor: "#fff5f5" },
-  fieldError:  { fontSize: 12, color: P.errorText, marginTop: 5 },
-
-  // COPPA gate pre-notice
-  coppaNoticeBox: {
-    backgroundColor: P.amberLight,
-    borderRadius:    10,
+    backgroundColor: P.parchment,
+    borderColor:     P.warmBorder,
     borderWidth:     1,
-    borderColor:     P.amberBorder,
-    padding:         12,
-    marginBottom:    16,
+    borderRadius:    10,
+    paddingHorizontal: 14,
+    paddingVertical:   Platform.OS === "ios" ? 13 : 11,
+    fontSize:        15,
+    color:           P.inkBrown,
+  },
+  inputError: { borderColor: P.errorBorder, backgroundColor: "#fff5f5" },
+  fieldError: { color: P.errorText, fontSize: 11, marginTop: 4, marginLeft: 4 },
+
+  // Forgot-password link
+  forgotLinkRow: { alignSelf: "flex-end", marginTop: -4, marginBottom: 12 },
+  forgotLinkText: { fontSize: 13, color: P.amber, fontWeight: "600" },
+
+  // COPPA pre-submit notice
+  coppaNoticeBox: {
+    backgroundColor:   P.amberLight,
+    borderColor:       P.amberBorder,
+    borderWidth:       1,
+    borderRadius:      10,
+    padding:           12,
+    marginBottom:      16,
   },
   coppaNoticeText: { fontSize: 12, color: P.inkMid, lineHeight: 18 },
-  coppaNoticeBold: { fontWeight: "700", color: P.inkBrown },
+  coppaNoticeBold: { fontWeight: "700", color: P.amber },
 
   // Submit
   submitBtn: {
-    backgroundColor: P.amber,
-    borderRadius:    14,
-    paddingVertical: 16,
-    alignItems:      "center",
-    marginTop:       8,
+    backgroundColor:   P.amber,
+    borderRadius:      12,
+    paddingVertical:   14,
+    alignItems:        "center",
+    marginTop:         4,
   },
-  submitBtnDisabled: { opacity: 0.65 },
-  submitBtnText: { fontSize: 16, fontWeight: "700", color: P.white },
+  submitBtnDisabled: { opacity: 0.6 },
+  submitBtnText:     { color: P.white, fontSize: 15, fontWeight: "700" },
 
   // Toggle
   toggleRow: {
     flexDirection:  "row",
     justifyContent: "center",
-    alignItems:     "center",
     gap:            6,
-    marginBottom:   20,
+    marginBottom:   24,
   },
   toggleText: { fontSize: 14, color: P.inkLight },
   toggleLink: { fontSize: 14, fontWeight: "700", color: P.amber },
@@ -773,7 +893,7 @@ const styles = StyleSheet.create({
   },
   switchModeBtnText: { fontSize: 15, fontWeight: "600", color: P.inkMid },
 
-  // Phase 4.1 — Deletion-recovery banner (shown at sign-in when account is pending deletion)
+  // Phase 4.1 — Deletion-recovery banner
   deletionRecoveryBox: {
     backgroundColor: "#fffbeb",
     borderRadius:    12,
@@ -782,16 +902,8 @@ const styles = StyleSheet.create({
     padding:         16,
     gap:             10,
   },
-  deletionRecoveryTitle: {
-    fontSize:   14,
-    fontWeight: "700",
-    color:      "#92400e",
-  },
-  deletionRecoveryBody: {
-    fontSize:   13,
-    color:      "#78350f",
-    lineHeight: 19,
-  },
+  deletionRecoveryTitle: { fontSize: 14, fontWeight: "700", color: "#92400e" },
+  deletionRecoveryBody:  { fontSize: 13, color: "#78350f", lineHeight: 19 },
   deletionRecoveryActions: {
     flexDirection: "row",
     gap:           10,
@@ -804,11 +916,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical:   9,
   },
-  restoreBtnText: {
-    color:      "#fff",
-    fontSize:   13,
-    fontWeight: "600",
-  },
+  restoreBtnText: { color: "#fff", fontSize: 13, fontWeight: "600" },
   keepDeletionBtn: {
     borderRadius:      8,
     borderWidth:       1,
@@ -816,8 +924,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical:   9,
   },
-  keepDeletionBtnText: {
-    color:    "#9c7540",
-    fontSize: 13,
-  },
+  keepDeletionBtnText: { color: "#9c7540", fontSize: 13 },
 });

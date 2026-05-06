@@ -10,6 +10,11 @@ import {
 
 initSentry();
 
+// ─── Env (also fires startup config validation) ──────────────────────────────
+
+import { ENV, assertEnvOrWarn } from "./lib/env";
+assertEnvOrWarn();
+
 // ─── React + RN ───────────────────────────────────────────────────────────────
 
 import { useEffect, useState, useCallback, useRef } from "react";
@@ -32,6 +37,10 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import type { Session } from "@supabase/supabase-js";
 import { supabase } from "./lib/supabase";
 
+// ─── Auth flow store (v4.5: password recovery coordination) ─────────────────
+
+import { useAuthFlow, getAuthFlow } from "./lib/authFlow";
+
 // ─── Navigation param lists ───────────────────────────────────────────────────
 
 import type { RootStackParamList, AuthStackParamList } from "./types/navigation";
@@ -49,7 +58,6 @@ import { OnboardingScreen }    from "./screens/OnboardingScreen";
 // ─── Components ───────────────────────────────────────────────────────────────
 
 import { ErrorBoundary }           from "./components/ErrorBoundary";
-// N4 — Achievement badge toast overlay (global, above all screens)
 import { AchievementToastOverlay } from "./components/AchievementToast";
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -57,40 +65,27 @@ import { AchievementToastOverlay } from "./components/AchievementToast";
 import { useGameStore } from "./store/gameStore";
 
 // ─── Analytics ────────────────────────────────────────────────────────────────
-// Phase 3.7 instrumentation — game_sessions / quest_sessions / word_outcomes.
-// Wire-up missing since launch; persistence patch ships these tables for real.
+
 import { useAnalytics } from "./hooks/useAnalytics";
 
-// ─── Lumi mascot — sound bootstrap + daily greeting ──────────────────────────
-// Lumi is rendered per-screen via <LumiHUD/>. App.tsx only needs to:
-//   1. Initialize the sound + haptic dispatcher once at startup.
-//   2. Mark today's greeting as shown after the first auth+child resolves
-//      (so the next cold start fires it). The actual greeting visual is
-//      part of LumiHUD on whichever screen the user lands on first.
-import {
-  initLumiSounds,
-  shouldGreetToday,
-  markGreetedToday,
-  playLumiGreeting,
-} from "./components/Lumi";
+// ─── Lumi mascot ──────────────────────────────────────────────────────────────
 
-// ─── Web placeholder (camera not available in browser) ───────────────────────
+import { initLumiSounds } from "./components/Lumi/lumiSounds";
+import { shouldGreetToday, markGreetedToday } from "./components/Lumi/lumiGreeting";
+import { playLumiGreeting } from "./components/Lumi/lumiSounds";
+
+// ─── Web placeholder for Scan ─────────────────────────────────────────────────
 
 function ScanPlaceholder() {
   return (
-    <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center", padding: 32 }}>
-      <Text style={{ fontSize: 48, marginBottom: 16 }}>📱</Text>
-      <Text style={{ fontSize: 20, fontWeight: "700", color: "#f3e8ff", textAlign: "center", marginBottom: 12 }}>
-        Camera required
-      </Text>
-      <Text style={{ fontSize: 14, color: "#a78bfa", textAlign: "center", lineHeight: 22 }}>
-        This feature works on a real Android device with the custom APK installed.
+    <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 32 }}>
+      <Text style={{ fontSize: 18, color: "#7c3aed", textAlign: "center" }}>
+        Camera scanning is only available on iOS and Android. Try Lexi-Lens on a phone or tablet.
       </Text>
     </View>
   );
 }
 
-// Dynamically import ScanScreen only on native
 const ScanScreen = Platform.OS === "web"
   ? ScanPlaceholder
   : require("./screens/ScanScreen").ScanScreen;
@@ -168,7 +163,6 @@ function AppNavigator() {
         )}
       </AppNav.Screen>
 
-      {/* ── N1: First-session onboarding ──────────────────────────────────── */}
       <AppNav.Screen name="Onboarding">
         {(props) => (
           <ErrorBoundary screen="OnboardingScreen">
@@ -187,6 +181,10 @@ function App() {
   const [initialising, setInitialising] = useState(true);
   const activeChild                     = useGameStore((s) => s.activeChild);
 
+  // v4.5 — password recovery state. Starts false, flipped true by deep link
+  // or PASSWORD_RECOVERY auth event, cleared by AuthScreen after updateUser.
+  const recoveryActive = useAuthFlow((s) => s.recoveryActive);
+
   const navigationRef = useNavigationContainerRef();
 
   // ── Lumi sound bootstrap (once at app start) ──────────────────────────────
@@ -203,8 +201,20 @@ function App() {
     });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, s) => {
+      (event, s) => {
         setSession(s);
+
+        // v4.5 — if Supabase tells us this session was reached via the
+        // password recovery flow, flip authFlow into recovery mode so the
+        // app stays on AuthScreen until the new password is saved.
+        if (event === "PASSWORD_RECOVERY") {
+          getAuthFlow().beginRecovery();
+          addGameBreadcrumb({
+            category: "auth",
+            message:  "PASSWORD_RECOVERY event — entering reset_confirm mode",
+          });
+        }
+
         if (!s) {
           clearUserContext();
           addGameBreadcrumb({ category: "auth", message: "User signed out" });
@@ -212,17 +222,27 @@ function App() {
           addGameBreadcrumb({
             category: "auth",
             message:  "Session established",
-            data:     { userId: s.user.id },
+            data:     { userId: s.user.id, event },
           });
         }
-      }
+      },
     );
 
-    // ── Deep-link handler — email-confirmation redirect ─────────────────────
+    // ── Deep-link handler ────────────────────────────────────────────────────
     const handleDeepLink = async ({ url }: { url: string | null }) => {
       if (!url) return;
       try {
         const parsed = new URL(url);
+
+        // v4.5 — recognise the password-reset path BEFORE token exchange so
+        // AuthScreen can route to reset_confirm even if the auth event lags.
+        const isResetPath =
+          url.includes("auth/reset") ||
+          parsed.searchParams.get("type") === "recovery";
+
+        if (isResetPath) {
+          getAuthFlow().beginRecovery();
+        }
 
         // PKCE code exchange — Supabase JS v2 default
         const code = parsed.searchParams.get("code");
@@ -231,8 +251,8 @@ function App() {
           if (error) {
             addGameBreadcrumb({
               category: "auth",
-              message: "Email confirm code exchange failed",
-              data: { error: error.message },
+              message:  "Code exchange failed",
+              data:     { error: error.message, isResetPath },
             });
           }
           return;
@@ -244,8 +264,12 @@ function App() {
           const params = new URLSearchParams(fragment);
           const access_token  = params.get("access_token");
           const refresh_token = params.get("refresh_token");
+          const type          = params.get("type");
           if (access_token && refresh_token) {
             await supabase.auth.setSession({ access_token, refresh_token });
+          }
+          if (type === "recovery") {
+            getAuthFlow().beginRecovery();
           }
         }
       } catch {
@@ -253,9 +277,7 @@ function App() {
       }
     };
 
-    // Cold-start: app launched directly via the confirmation link
     Linking.getInitialURL().then((url) => handleDeepLink({ url }));
-    // Warm-start: app was already running when the link was tapped
     const linkingSub = Linking.addEventListener("url", handleDeepLink);
 
     return () => {
@@ -280,7 +302,7 @@ function App() {
     }
   }, [activeChild?.id, session?.user?.id]);
 
-  // ── Lumi daily greeting — fires once per local calendar day ────────────────
+  // ── Lumi daily greeting ────────────────────────────────────────────────────
   useEffect(() => {
     if (!session || !activeChild?.id) return;
     let cancelled = false;
@@ -291,35 +313,22 @@ function App() {
         playLumiGreeting();
         await markGreetedToday();
       } catch {
-        // Non-fatal — skip greeting on any error
+        // Non-fatal
       }
     })();
     return () => { cancelled = true; };
   }, [session?.user?.id, activeChild?.id]);
 
   // ── Game-session lifecycle — Phase 3.7 ─────────────────────────────────────
-  // SESSION COUNTERS FIX (v4.4): counters live in gameStore.sessionCounters,
-  // bumped from beginQuest and markQuestCompletion. Read live at flush-time
-  // via useGameStore.getState() — getState() returns the current snapshot,
-  // not a stale closure capture.
-  //
-  // SCREEN_SEQUENCE FIRST-ENTRY FIX (v4.4.2): seed with the current route so
-  // the first nav event for a session isn't lost when NavigationContainer's
-  // onStateChange fires before the activeChild useEffect runs.
   const { startSession, endSession } = useAnalytics();
   const screenSequenceRef = useRef<string[]>([]);
 
   useEffect(() => {
     if (!activeChild?.id) return;
 
-    // Open a fresh session row for this child.
     screenSequenceRef.current = [];
     useGameStore.getState().resetSessionCounters();
 
-    // v4.4.2 — seed with the current route so the first nav event for this
-    // session isn't lost. isReady() guard prevents "navigation hasn't been
-    // initialized" error on cold start when this effect can fire before the
-    // NavigationContainer finishes mounting.
     const initialRoute = navigationRef.isReady()
       ? navigationRef.getCurrentRoute()
       : null;
@@ -329,7 +338,6 @@ function App() {
 
     startSession();
 
-    // Cleanup runs on child switch OR sign-out — close the row.
     return () => {
       const c = useGameStore.getState().sessionCounters;
       endSession({
@@ -341,7 +349,6 @@ function App() {
     };
   }, [activeChild?.id, startSession, endSession]);
 
-  // Close the session when the app moves to background, reopen on foreground.
   useEffect(() => {
     if (!activeChild?.id) return;
 
@@ -358,7 +365,6 @@ function App() {
         screenSequenceRef.current = [];
         useGameStore.getState().resetSessionCounters();
 
-        // v4.4.2 — seed when foregrounding too. isReady() guard for safety.
         const route = navigationRef.isReady()
           ? navigationRef.getCurrentRoute()
           : null;
@@ -386,8 +392,6 @@ function App() {
       });
       Sentry.setTag("active_screen", route.name);
 
-      // Phase 3.7: accumulate the screen sequence for the closing
-      // game_sessions.screen_sequence column. Dedup consecutive duplicates.
       const seq = screenSequenceRef.current;
       if (seq[seq.length - 1] !== route.name) {
         seq.push(route.name);
@@ -405,6 +409,11 @@ function App() {
     );
   }
 
+  // v4.5 — show AuthNavigator if there's no session OR if we're in
+  // password-recovery mode (session exists but parent must reset password
+  // before reaching the game).
+  const showAuth = !session || recoveryActive;
+
   return (
     <ErrorBoundary screen="App">
       <SafeAreaProvider>
@@ -412,10 +421,10 @@ function App() {
           ref={navigationRef}
           onStateChange={handleNavigationStateChange}
         >
-          {session ? <AppNavigator /> : <AuthNavigator />}
+          {showAuth ? <AuthNavigator /> : <AppNavigator />}
         </NavigationContainer>
 
-        {/* N4 — Badge toast overlay — floats above all screens, touches pass through */}
+        {/* N4 — Badge toast overlay */}
         <AchievementToastOverlay />
 
       </SafeAreaProvider>
