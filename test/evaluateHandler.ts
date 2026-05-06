@@ -6,9 +6,16 @@
  *   Deno.env.get(k) → process.env[k]
  *   crypto.subtle   → globalThis.crypto.subtle (built-in on Node 20+)
  *   btoa            → globalThis.btoa (built-in on Node 16+)
+ *
+ * v4.7 changes:
+ *   • buildCacheKey gained pendingWords parameter (was 2-arg, now 3-arg)
+ *   • Cache key prefix now includes ENV_NAME from CACHE_ENV_NAMESPACE
+ *   • buildCacheKey normalisation expanded: case + whitespace + plural rule
+ *   • CACHE_TTL_S widened from 7 days → 14 days to match prod
+ *   • Added _resetEnvNameForTests helper for test-time env mutation
  */
 
-// ─── Constants (verbatim) ─────────────────────────────────────────────────────
+// ─── Constants (verbatim from production) ─────────────────────────────────────
 
 export const DAILY_SCAN_LIMIT    = 50;
 export const ALERT_THRESHOLD_PCT = 0.80;
@@ -17,13 +24,59 @@ export const IP_WINDOW_MS        = 60_000;
 
 const REDIS_URL   = process.env.UPSTASH_REDIS_REST_URL   ?? "";
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN ?? "";
-const CACHE_TTL_S = 7 * 24 * 60 * 60;
+const CACHE_TTL_S = 14 * 24 * 60 * 60;  // v4.5 — 14 days
 
-// ─── buildCacheKey (verbatim) ─────────────────────────────────────────────────
+// ─── Cache env namespace (v4.7) ──────────────────────────────────────────────
+//
+// Read at module load. Tests that need to alter this should mutate
+// process.env.CACHE_ENV_NAMESPACE then call _resetEnvNameForTests().
+//
+// Fail-safe: an unset / invalid value lands in the "default" namespace —
+// distinct from both "staging" and "prod" — so a misconfigured project at
+// least doesn't collide with either real env.
 
-export function buildCacheKey(detectedLabel: string, questId: string): string {
-  const raw = `${detectedLabel.toLowerCase().trim()}::${questId}`;
-  return `lexi:eval:${btoa(raw).replace(/=/g, "")}`;
+let ENV_NAME: string = resolveEnvName();
+
+function resolveEnvName(): string {
+  const fromEnv = process.env.CACHE_ENV_NAMESPACE?.trim().toLowerCase();
+  if (fromEnv && /^[a-z0-9_-]+$/.test(fromEnv)) return fromEnv;
+  return "default";
+}
+
+/**
+ * Test-only helper: re-read CACHE_ENV_NAMESPACE from process.env.
+ * Allows tests to mutate the env var, call this, and exercise the
+ * prefix logic without resetting the module.
+ */
+export function _resetEnvNameForTests(): void {
+  ENV_NAME = resolveEnvName();
+}
+
+// ─── buildCacheKey (v4.7 — 3-arg, env-prefixed, normalised) ──────────────────
+//
+// Mirrors supabase/functions/evaluate/index.ts buildCacheKey verbatim except
+// for the Deno→Node globals. Plural rule is conservative: only strips
+// trailing 's' when preceded by a letter that is NOT 's' and NOT 'e':
+//   "rings"   → "ring"     ✓ (g before s)
+//   "books"   → "book"     ✓ (k before s)
+//   "glass"   → "glass"    ✓ (ss preserved)
+//   "glasses" → "glasses"  ✓ (es preserved)
+//   "phones"  → "phones"   ✓ (e before s blocks — miss, accepted cost)
+
+export function buildCacheKey(
+  detectedLabel: string,
+  questId:       string,
+  pendingWords:  string[] = []
+): string {
+  const normalize = (s: string) =>
+    s.toLowerCase()
+     .trim()
+     .replace(/\s+/g, " ")
+     .replace(/([a-z]{2,})([^se])s\b/g, "$1$2");
+
+  const sortedWords = [...pendingWords].map(normalize).sort().join(",");
+  const raw         = `${normalize(detectedLabel)}::${questId}::${sortedWords}`;
+  return `${ENV_NAME}:lexi:eval:${btoa(raw).replace(/=/g, "")}`;
 }
 
 // ─── utcMidnight (verbatim) ───────────────────────────────────────────────────
@@ -61,9 +114,9 @@ export async function hashIp(ip: string): Promise<string> {
     .slice(0, 16);
 }
 
-// ─── cacheGet shape validation (extracted from inline cacheGet body) ──────────
-// The production fix: cache entries missing the three required fields are
-// treated as misses so the broken-format entries don't render an empty card.
+// ─── Cache shape validation ──────────────────────────────────────────────────
+// Production fix: cache entries missing the three required fields are
+// treated as misses so broken-format entries don't render an empty card.
 
 export function isValidCacheShape(parsed: unknown): boolean {
   if (!parsed || typeof parsed !== "object") return false;
@@ -75,7 +128,7 @@ export function isValidCacheShape(parsed: unknown): boolean {
   );
 }
 
-// ─── xpRates body extractor (verbatim from main handler) ──────────────────────
+// ─── XP rates body extractor (verbatim from main handler) ────────────────────
 
 export function extractXpRates(body: Record<string, unknown>): {
   firstTry: number; secondTry: number; thirdPlus: number;
@@ -88,7 +141,7 @@ export function extractXpRates(body: Record<string, unknown>): {
   };
 }
 
-// ─── 429 response builders (extracted for shape-test) ─────────────────────────
+// ─── 429 response builders (extracted for shape-test) ────────────────────────
 
 export function buildIpLimitResponseBody() {
   return {
@@ -110,22 +163,13 @@ export function buildDailyQuotaResponseBody(scansToday: number) {
   };
 }
 
-// ─── checkIpRateLimit (verbatim, type-relaxed for testability) ────────────────
-
-interface MockSupabaseTable {
-  select: (cols: string) => MockSupabaseTable;
-  eq:     (col: string, val: unknown) => MockSupabaseTable;
-  maybeSingle: () => Promise<{ data: { request_count: number; window_start: string } | null }>;
-  upsert: (row: Record<string, unknown>) => Promise<{ data: null; error: null }>;
-  update: (row: Record<string, unknown>) => MockSupabaseTable;
-}
-
-interface MockSupabaseClient {
-  from: (table: string) => MockSupabaseTable;
-}
+// ─── checkIpRateLimit (verbatim) ─────────────────────────────────────────────
+// Note: the production version takes a Supabase client; here we accept any
+// object that exposes .from(...).select / .insert / .update / .upsert /
+// .eq / .maybeSingle. The test suite passes in a stub.
 
 export async function checkIpRateLimit(
-  supabase: MockSupabaseClient,
+  supabase: any,
   ipHash:   string
 ): Promise<{ allowed: boolean; requestCount: number }> {
   const windowStart = new Date(Date.now() - IP_WINDOW_MS).toISOString();
@@ -154,34 +198,44 @@ export async function checkIpRateLimit(
   return { allowed: newCount <= IP_LIMIT_PER_MINUTE, requestCount: newCount };
 }
 
-// ─── Cache-skip rule for retries (extracted from main handler) ────────────────
-// Production: cache check is skipped on retries (failedAttempts > 0) so the
-// child gets fresh feedback after a failed attempt.
+// ─── shouldCheckCache (verbatim) ─────────────────────────────────────────────
+// Cache is bypassed on retry attempts because nudge hints are session-
+// specific. Only first-try evaluations are cacheable.
 
-export function shouldCheckCache(failedAttempts: number | undefined): boolean {
-  return (failedAttempts ?? 0) === 0;
+export function shouldCheckCache(failedAttempts: number): boolean {
+  return failedAttempts === 0;
 }
 
-// ─── Body validation extracted from main handler ──────────────────────────────
+// ─── validateBody (verbatim) ─────────────────────────────────────────────────
 
-export type BodyValidation =
-  | { valid: true }
-  | { valid: false; status: number; body: { error: string } };
-
-export function validateBody(body: Record<string, unknown>): BodyValidation {
-  if (!body.childId || typeof body.childId !== "string") {
-    return { valid: false, status: 400, body: { error: "childId is required" } };
-  }
-  if (!body.detectedLabel || typeof body.detectedLabel !== "string") {
-    return { valid: false, status: 400, body: { error: "detectedLabel is required" } };
-  }
-  return { valid: true };
+export function validateBody(body: Record<string, unknown>): {
+  valid: boolean; missing: string[];
+} {
+  const required = [
+    "childId",
+    "imageBase64",
+    "currentWord",
+    "questId",
+    "detectedLabel",
+  ];
+  const missing = required.filter((k) => body[k] === undefined || body[k] === null);
+  return { valid: missing.length === 0, missing };
 }
 
-// ─── IP extraction from request headers (extracted from main handler) ────────
+// ─── extractIp (verbatim) ────────────────────────────────────────────────────
+// Order: x-forwarded-for (first hop) → cf-connecting-ip → fallback
 
-export function extractIp(headers: Headers): string {
-  return headers.get("x-forwarded-for")?.split(",")[0]?.trim()
-       ?? headers.get("cf-connecting-ip")
-       ?? "unknown";
+export function extractIp(headers: Headers | Record<string, string | undefined>): string {
+  const get = (k: string): string | undefined => {
+    if (headers instanceof Headers) return headers.get(k) ?? undefined;
+    return headers[k] ?? headers[k.toLowerCase()];
+  };
+
+  const xff = get("x-forwarded-for");
+  if (xff) return xff.split(",")[0]?.trim() || "unknown";
+
+  const cf = get("cf-connecting-ip");
+  if (cf) return cf;
+
+  return "unknown";
 }

@@ -143,7 +143,9 @@ async function cacheSet(key: string, value: unknown): Promise<void> {
   } catch { /* non-fatal */ }
 }
 
-const ENV_NAME = (() => {
+
+
+const ENV_NAME: string = (() => {
   const fromEnv = Deno.env.get("CACHE_ENV_NAMESPACE")?.trim().toLowerCase();
   if (fromEnv && /^[a-z0-9_-]+$/.test(fromEnv)) return fromEnv;
   // Fail-safe: don't silently collide. "default" is distinct from both
@@ -156,14 +158,16 @@ const ENV_NAME = (() => {
   return "default";
 })();
 
+// ─── REPLACE the existing buildCacheKey function with this version ───────────
+
 function buildCacheKey(
   detectedLabel: string,
   questId:       string,
   pendingWords:  string[]
 ): string {
-  // Tier 1 normalisation — collapse case, internal whitespace, and simple
-  // English plurals so "Gold Ring" / "gold ring" / "Gold Rings" all hit the
-  // same cache entry.
+  // v4.5: Tier 1 normalisation — collapse case, internal whitespace, and
+  // simple English plurals so "Gold Ring" / "gold ring" / "Gold Rings" all
+  // hit the same cache entry.
   //
   // Plural rule is conservative: only strips trailing 's' when preceded by
   // a letter that is NOT 's' and NOT 'e'. So:
@@ -176,6 +180,8 @@ function buildCacheKey(
   //
   // Trade-off: we miss vowel+s plurals (apples, phones, shoes) to guarantee
   // we never wrong-collapse glass↔glasses or similar.
+  //
+  // v4.7: env-prefix added to the returned key (see ENV_NAME above).
   const normalize = (s: string) =>
     s.toLowerCase()
      .trim()

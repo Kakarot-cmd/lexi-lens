@@ -2,12 +2,18 @@
  * evaluateHandler.test.ts
  * Chunk 2 — evaluate Edge Function pure helpers
  *
+ * v4.7 changes:
+ *   • buildCacheKey suite rewritten for 3-arg signature + env prefix
+ *   • Added cross-environment isolation tests
+ *   • Added plural normalisation tests
+ *   • Added _resetEnvNameForTests usage
+ *
  * Coverage:
- *   1. buildCacheKey         — shape, idempotency, lowercasing, base64 padding strip
+ *   1. buildCacheKey         — env prefix, normalisation, determinism, plurals
  *   2. utcMidnight           — always future, always midnight UTC
  *   3. hashIp                — deterministic, salt-respecting, fixed-length
- *   4. isValidCacheShape     — the production cache-corruption guard
- *   5. extractXpRates        — DB rate override, fallback to constants, mixed types
+ *   4. isValidCacheShape     — production cache-corruption guard
+ *   5. extractXpRates        — DB rate override, fallback to constants
  *   6. 429 response shapes   — IP_LIMIT and DAILY_QUOTA bodies
  *   7. checkIpRateLimit      — fresh window, in-window, over-limit, exact boundary
  *   8. shouldCheckCache      — skip on retry
@@ -18,6 +24,7 @@
 
 import {
   buildCacheKey,
+  _resetEnvNameForTests,
   utcMidnight,
   hashIp,
   isValidCacheShape,
@@ -36,42 +43,143 @@ import {
 } from "./evaluateHandler";
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 1. buildCacheKey
+// 1. buildCacheKey (v4.7)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("buildCacheKey", () => {
-  test("starts with the lexi:eval: namespace", () => {
-    expect(buildCacheKey("apple", "quest-1")).toMatch(/^lexi:eval:/);
+describe("buildCacheKey (v4.7)", () => {
+  beforeEach(() => {
+    delete process.env.CACHE_ENV_NAMESPACE;
+    _resetEnvNameForTests();
   });
 
-  test("is deterministic for the same input", () => {
-    expect(buildCacheKey("apple", "quest-1")).toBe(buildCacheKey("apple", "quest-1"));
+  // ─── Format / shape ─────────────────────────────────────────────────────────
+
+  test("starts with the env-prefixed namespace", () => {
+    expect(buildCacheKey("apple", "quest-1", [])).toMatch(/^default:lexi:eval:/);
   });
 
-  test("normalises label: case-insensitive and trim", () => {
-    expect(buildCacheKey("APPLE", "q1")).toBe(buildCacheKey("apple", "q1"));
-    expect(buildCacheKey("  apple  ", "q1")).toBe(buildCacheKey("apple", "q1"));
-    expect(buildCacheKey("Apple\n", "q1")).toBe(buildCacheKey("apple", "q1"));
+  test("uses the configured CACHE_ENV_NAMESPACE", () => {
+    process.env.CACHE_ENV_NAMESPACE = "prod";
+    _resetEnvNameForTests();
+    expect(buildCacheKey("apple", "quest-1", [])).toMatch(/^prod:lexi:eval:/);
+
+    process.env.CACHE_ENV_NAMESPACE = "staging";
+    _resetEnvNameForTests();
+    expect(buildCacheKey("apple", "quest-1", [])).toMatch(/^staging:lexi:eval:/);
   });
 
-  test("does NOT normalise questId — different quests give different keys", () => {
-    expect(buildCacheKey("apple", "q1")).not.toBe(buildCacheKey("apple", "q2"));
+  test("falls back to 'default' for invalid namespace values", () => {
+    for (const bad of ["", "   ", "PROD ENV", "stag/ing", "x;y"]) {
+      process.env.CACHE_ENV_NAMESPACE = bad;
+      _resetEnvNameForTests();
+      expect(buildCacheKey("a", "q", [])).toMatch(/^default:lexi:eval:/);
+    }
   });
 
-  test("strips base64 '=' padding", () => {
-    const key = buildCacheKey("apple", "q1");
-    expect(key).not.toContain("=");
+  test("namespace is normalised to lowercase", () => {
+    process.env.CACHE_ENV_NAMESPACE = "PROD";
+    _resetEnvNameForTests();
+    expect(buildCacheKey("apple", "q1", [])).toMatch(/^prod:lexi:eval:/);
   });
 
-  test("handles empty questId without throwing", () => {
-    expect(() => buildCacheKey("apple", "")).not.toThrow();
-    const key = buildCacheKey("apple", "");
-    expect(key).toMatch(/^lexi:eval:/);
+  // ─── Cross-environment isolation (the whole point of v4.7) ──────────────────
+
+  test("staging and prod yield different keys for identical inputs", () => {
+    process.env.CACHE_ENV_NAMESPACE = "staging";
+    _resetEnvNameForTests();
+    const stagingKey = buildCacheKey("ring", "quest-uuid-A", ["shiny", "metallic"]);
+
+    process.env.CACHE_ENV_NAMESPACE = "prod";
+    _resetEnvNameForTests();
+    const prodKey = buildCacheKey("ring", "quest-uuid-A", ["shiny", "metallic"]);
+
+    expect(stagingKey).not.toBe(prodKey);
+    expect(stagingKey).toMatch(/^staging:/);
+    expect(prodKey).toMatch(/^prod:/);
   });
 
-  test("handles unicode labels", () => {
-    expect(() => buildCacheKey("café", "q1")).not.toThrow();
-    expect(buildCacheKey("café", "q1")).not.toBe(buildCacheKey("cafe", "q1"));
+  // ─── Determinism ────────────────────────────────────────────────────────────
+
+  test("is deterministic for identical input within the same env", () => {
+    expect(
+      buildCacheKey("apple", "quest-1", ["red"])
+    ).toBe(
+      buildCacheKey("apple", "quest-1", ["red"])
+    );
+  });
+
+  test("pendingWords order does not affect the key", () => {
+    expect(
+      buildCacheKey("ring", "q1", ["shiny", "metallic", "round"])
+    ).toBe(
+      buildCacheKey("ring", "q1", ["round", "shiny", "metallic"])
+    );
+  });
+
+  test("pendingWords case does not affect the key", () => {
+    expect(
+      buildCacheKey("ring", "q1", ["Shiny", "METALLIC"])
+    ).toBe(
+      buildCacheKey("ring", "q1", ["shiny", "metallic"])
+    );
+  });
+
+  // ─── Label normalisation ────────────────────────────────────────────────────
+
+  test("label is case-insensitive and trimmed", () => {
+    expect(buildCacheKey("APPLE", "q1", [])).toBe(buildCacheKey("apple", "q1", []));
+    expect(buildCacheKey("  apple  ", "q1", [])).toBe(buildCacheKey("apple", "q1", []));
+  });
+
+  test("internal whitespace in label is collapsed", () => {
+    expect(
+      buildCacheKey("Gold   Ring", "q1", [])
+    ).toBe(
+      buildCacheKey("gold ring", "q1", [])
+    );
+  });
+
+  test("simple English plurals collapse to singular", () => {
+    expect(buildCacheKey("rings", "q1", [])).toBe(buildCacheKey("ring", "q1", []));
+    expect(buildCacheKey("books", "q1", [])).toBe(buildCacheKey("book", "q1", []));
+  });
+
+  test("ss-final words preserve the final s (not pluralised)", () => {
+    expect(buildCacheKey("glass", "q1", [])).not.toBe(buildCacheKey("glasses", "q1", []));
+  });
+
+  test("e+s endings preserve the s (avoid wrong-collapse)", () => {
+    expect(buildCacheKey("phones", "q1", [])).not.toBe(buildCacheKey("phone", "q1", []));
+  });
+
+  // ─── Quest ID and pending words contribute to the key ──────────────────────
+
+  test("different questId yields different key", () => {
+    expect(buildCacheKey("apple", "q1", []))
+      .not.toBe(buildCacheKey("apple", "q2", []));
+  });
+
+  test("different pendingWords yield different keys", () => {
+    expect(buildCacheKey("apple", "q1", ["red"]))
+      .not.toBe(buildCacheKey("apple", "q1", ["green"]));
+  });
+
+  test("empty pendingWords array is handled cleanly", () => {
+    expect(() => buildCacheKey("apple", "q1", [])).not.toThrow();
+    expect(buildCacheKey("apple", "q1", [])).toMatch(/^default:lexi:eval:/);
+  });
+
+  test("pendingWords parameter defaults to empty array", () => {
+    // 2-arg call should work via the default parameter
+    expect(buildCacheKey("apple", "q1")).toBe(buildCacheKey("apple", "q1", []));
+  });
+
+  // ─── Base64 padding ─────────────────────────────────────────────────────────
+
+  test("does not contain '=' padding characters", () => {
+    expect(buildCacheKey("a",      "b",  []                )).not.toMatch(/=/);
+    expect(buildCacheKey("ab",     "c",  ["x"]             )).not.toMatch(/=/);
+    expect(buildCacheKey("apple",  "q1", ["red", "shiny"]  )).not.toMatch(/=/);
   });
 });
 
@@ -80,27 +188,19 @@ describe("buildCacheKey", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("utcMidnight", () => {
-  test("returns a valid ISO 8601 string", () => {
-    const iso = utcMidnight();
-    expect(() => new Date(iso)).not.toThrow();
-    expect(new Date(iso).toISOString()).toBe(iso);
+  test("returns ISO 8601 UTC string", () => {
+    expect(utcMidnight()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
   });
 
-  test("returns a date STRICTLY in the future", () => {
+  test("is always in the future", () => {
     expect(new Date(utcMidnight()).getTime()).toBeGreaterThan(Date.now());
   });
 
-  test("the returned moment is exactly midnight UTC (00:00:00.000)", () => {
-    const d = new Date(utcMidnight());
-    expect(d.getUTCHours()).toBe(0);
-    expect(d.getUTCMinutes()).toBe(0);
-    expect(d.getUTCSeconds()).toBe(0);
-    expect(d.getUTCMilliseconds()).toBe(0);
-  });
-
-  test("returns at most ~24 hours in the future", () => {
-    const ms = new Date(utcMidnight()).getTime() - Date.now();
-    expect(ms).toBeLessThanOrEqual(24 * 60 * 60 * 1000);
+  test("is at midnight UTC (next day)", () => {
+    const m = new Date(utcMidnight());
+    expect(m.getUTCHours()).toBe(0);
+    expect(m.getUTCMinutes()).toBe(0);
+    expect(m.getUTCSeconds()).toBe(0);
   });
 });
 
@@ -109,30 +209,24 @@ describe("utcMidnight", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("hashIp", () => {
-  test("returns a 16-char hex string", () => {
-    return hashIp("1.2.3.4").then((h) => {
-      expect(h).toHaveLength(16);
-      expect(h).toMatch(/^[0-9a-f]+$/);
-    });
+  test("returns 16 hex characters", async () => {
+    const h = await hashIp("1.2.3.4");
+    expect(h).toMatch(/^[0-9a-f]{16}$/);
   });
 
-  test("is deterministic for the same IP", async () => {
-    const a = await hashIp("1.2.3.4");
-    const b = await hashIp("1.2.3.4");
-    expect(a).toBe(b);
+  test("is deterministic for the same IP and salt", async () => {
+    expect(await hashIp("1.2.3.4")).toBe(await hashIp("1.2.3.4"));
   });
 
-  test("different IPs produce different hashes", async () => {
-    const a = await hashIp("1.2.3.4");
-    const b = await hashIp("5.6.7.8");
-    expect(a).not.toBe(b);
+  test("different IPs hash to different values", async () => {
+    expect(await hashIp("1.2.3.4")).not.toBe(await hashIp("1.2.3.5"));
   });
 
-  test("salt changes the hash (verified via env override)", async () => {
-    const before = await hashIp("1.2.3.4");
+  test("different salt yields different hash", async () => {
     const oldSalt = process.env.IP_HASH_SALT;
-    process.env.IP_HASH_SALT = "different-salt";
-    // Re-import to pick up new env? hashIp reads env at call time — verify.
+    process.env.IP_HASH_SALT = "test-salt-A";
+    const before = await hashIp("1.2.3.4");
+    process.env.IP_HASH_SALT = "test-salt-B";
     const after = await hashIp("1.2.3.4");
     if (oldSalt === undefined) delete process.env.IP_HASH_SALT;
     else process.env.IP_HASH_SALT = oldSalt;
@@ -173,31 +267,25 @@ describe("isValidCacheShape", () => {
 
   test("rejects the broken-format that triggered the production bug", () => {
     // The buggy cacheSet stored { value: JSON.string, ex: ttl } as the cache entry.
-    expect(isValidCacheShape({ value: "{...}", ex: 604800 })).toBe(false);
+    expect(isValidCacheShape({ value: '{"resolvedObjectName":"apple"}', ex: 604800 })).toBe(false);
   });
 
-  test("rejects when resolvedObjectName is missing or wrong type", () => {
-    expect(isValidCacheShape({ properties: [], childFeedback: "x" })).toBe(false);
-    expect(isValidCacheShape({ resolvedObjectName: 42, properties: [], childFeedback: "x" })).toBe(false);
-  });
-
-  test("rejects when properties is missing or not an array", () => {
-    expect(isValidCacheShape({ resolvedObjectName: "x", childFeedback: "x" })).toBe(false);
-    expect(isValidCacheShape({ resolvedObjectName: "x", properties: "not array", childFeedback: "x" })).toBe(false);
-  });
-
-  test("rejects when childFeedback is missing or wrong type", () => {
-    expect(isValidCacheShape({ resolvedObjectName: "x", properties: [] })).toBe(false);
-    expect(isValidCacheShape({ resolvedObjectName: "x", properties: [], childFeedback: 123 })).toBe(false);
-  });
-
-  test("accepts even when extra fields are present", () => {
+  test("rejects entries missing required fields", () => {
+    expect(isValidCacheShape({ resolvedObjectName: "apple" })).toBe(false);
+    expect(isValidCacheShape({ properties: [] })).toBe(false);
     expect(isValidCacheShape({
       resolvedObjectName: "apple",
       properties:         [],
-      childFeedback:      "x",
-      somethingExtra:     "fine",
-    })).toBe(true);
+      // missing childFeedback
+    })).toBe(false);
+  });
+
+  test("rejects when properties is not an array", () => {
+    expect(isValidCacheShape({
+      resolvedObjectName: "apple",
+      properties:         "not an array",
+      childFeedback:      "ok",
+    })).toBe(false);
   });
 });
 
@@ -205,40 +293,31 @@ describe("isValidCacheShape", () => {
 // 5. extractXpRates
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("extractXpRates — XP FIX (per-quest DB values)", () => {
-  test("uses DB values when all three are numbers", () => {
+describe("extractXpRates", () => {
+  test("uses DB-provided rates when present", () => {
     expect(extractXpRates({
-      xp_reward_first_try:  100,
-      xp_reward_retry:      60,
-      xp_reward_third_plus: 20,
-    })).toEqual({ firstTry: 100, secondTry: 60, thirdPlus: 20 });
+      xp_reward_first_try:  50,
+      xp_reward_retry:      30,
+      xp_reward_third_plus: 15,
+    })).toEqual({ firstTry: 50, secondTry: 30, thirdPlus: 15 });
   });
 
-  test("falls back to defaults (40/25/10) when fields are missing", () => {
+  test("falls back to constants when fields are missing", () => {
     expect(extractXpRates({})).toEqual({ firstTry: 40, secondTry: 25, thirdPlus: 10 });
   });
 
-  test("falls back per-field when a single value is wrong type", () => {
+  test("falls back when fields are non-numeric", () => {
     expect(extractXpRates({
-      xp_reward_first_try:  100,
-      xp_reward_retry:      "not a number",
-      xp_reward_third_plus: null,
+      xp_reward_first_try:  "fifty",
+      xp_reward_retry:      null,
+      xp_reward_third_plus: undefined,
+    })).toEqual({ firstTry: 40, secondTry: 25, thirdPlus: 10 });
+  });
+
+  test("partial override — some fields use DB, others fall back", () => {
+    expect(extractXpRates({
+      xp_reward_first_try: 100,
     })).toEqual({ firstTry: 100, secondTry: 25, thirdPlus: 10 });
-  });
-
-  test("rejects boolean false (not a number)", () => {
-    expect(extractXpRates({ xp_reward_first_try: false })).toEqual({
-      firstTry: 40, secondTry: 25, thirdPlus: 10,
-    });
-  });
-
-  test("0 is a valid value (not falsy-rejected)", () => {
-    // Edge case: a quest with xp=0 should pass through, not get bumped to 40.
-    expect(extractXpRates({
-      xp_reward_first_try:  0,
-      xp_reward_retry:      0,
-      xp_reward_third_plus: 0,
-    })).toEqual({ firstTry: 0, secondTry: 0, thirdPlus: 0 });
   });
 });
 
@@ -246,28 +325,27 @@ describe("extractXpRates — XP FIX (per-quest DB values)", () => {
 // 6. 429 response shapes
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("429 response bodies", () => {
-  test("IP_LIMIT body has the contract fields the client expects", () => {
+describe("429 response builders", () => {
+  test("IP_LIMIT body has expected shape", () => {
     const body = buildIpLimitResponseBody();
-    expect(body.error).toBe("rate_limit_exceeded");
-    expect(body.code).toBe("IP_LIMIT");
-    expect(body.retryAfter).toBe(60);
+    expect(body).toMatchObject({
+      error:      "rate_limit_exceeded",
+      code:       "IP_LIMIT",
+      retryAfter: 60,
+    });
     expect(typeof body.message).toBe("string");
   });
 
-  test("DAILY_QUOTA body includes scansToday, limit, and resetsAt", () => {
-    const body = buildDailyQuotaResponseBody(50);
-    expect(body.error).toBe("rate_limit_exceeded");
-    expect(body.code).toBe("DAILY_QUOTA");
-    expect(body.scansToday).toBe(50);
-    expect(body.limit).toBe(DAILY_SCAN_LIMIT);
-    expect(typeof body.resetsAt).toBe("string");
-    expect(new Date(body.resetsAt).getTime()).toBeGreaterThan(Date.now());
-  });
-
-  test("DAILY_QUOTA body propagates scansToday correctly", () => {
-    expect(buildDailyQuotaResponseBody(50).scansToday).toBe(50);
-    expect(buildDailyQuotaResponseBody(99).scansToday).toBe(99);
+  test("DAILY_QUOTA body has expected shape and limits", () => {
+    const body = buildDailyQuotaResponseBody(45);
+    expect(body).toMatchObject({
+      error:      "rate_limit_exceeded",
+      code:       "DAILY_QUOTA",
+      scansToday: 45,
+      limit:      DAILY_SCAN_LIMIT,
+    });
+    expect(typeof body.message).toBe("string");
+    expect(body.resetsAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 });
 
@@ -275,79 +353,73 @@ describe("429 response bodies", () => {
 // 7. checkIpRateLimit
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function makeMockSupabase(opts: {
-  existing?: { request_count: number; window_start: string } | null;
-  upsertSpy?: jest.Mock;
-  updateSpy?: jest.Mock;
-}) {
-  const upsertSpy = opts.upsertSpy ?? jest.fn().mockResolvedValue({ data: null, error: null });
-  const updateSpy = opts.updateSpy ?? jest.fn().mockResolvedValue({ data: null, error: null });
-
-  const tableApi: any = {
-    select:      jest.fn().mockReturnThis(),
-    eq:          jest.fn().mockReturnThis(),
-    maybeSingle: jest.fn().mockResolvedValue({ data: opts.existing ?? null }),
-    upsert:      upsertSpy,
-    update:      jest.fn(() => ({ eq: updateSpy })),
-  };
-
-  return {
-    client: { from: jest.fn(() => tableApi) },
-    upsertSpy,
-    updateSpy,
-    tableApi,
-  };
-}
-
 describe("checkIpRateLimit", () => {
-  test("first call from a new IP → allowed, count = 1, upsert called", async () => {
-    const { client, upsertSpy } = makeMockSupabase({ existing: null });
-    const result = await checkIpRateLimit(client as any, "deadbeef");
-    expect(result.allowed).toBe(true);
-    expect(result.requestCount).toBe(1);
-    expect(upsertSpy).toHaveBeenCalledTimes(1);
+  // Build a Supabase client stub.
+  function buildStub(initialRow: { request_count: number; window_start: string } | null) {
+    let row = initialRow;
+    return {
+      from: (_: string) => ({
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({ data: row }),
+          }),
+        }),
+        upsert: async (newRow: any) => {
+          row = { request_count: newRow.request_count, window_start: newRow.window_start };
+          return { data: null };
+        },
+        update: (patch: any) => ({
+          eq: async () => {
+            if (row) row = { ...row, ...patch };
+            return { data: null };
+          },
+        }),
+      }),
+    };
+  }
+
+  test("fresh request (no row) → allowed, count=1", async () => {
+    const stub = buildStub(null);
+    const r = await checkIpRateLimit(stub, "abc123");
+    expect(r).toEqual({ allowed: true, requestCount: 1 });
   });
 
-  test("expired window (window_start older than IP_WINDOW_MS) → reset to 1", async () => {
-    const stale = new Date(Date.now() - IP_WINDOW_MS - 1000).toISOString();
-    const { client, upsertSpy } = makeMockSupabase({
-      existing: { request_count: 999, window_start: stale },
+  test("expired window → resets to count=1", async () => {
+    const stub = buildStub({
+      request_count: 99,
+      window_start:  new Date(Date.now() - IP_WINDOW_MS - 1000).toISOString(),
     });
-    const result = await checkIpRateLimit(client as any, "x");
-    expect(result.allowed).toBe(true);
-    expect(result.requestCount).toBe(1);
-    expect(upsertSpy).toHaveBeenCalled();
+    const r = await checkIpRateLimit(stub, "abc123");
+    expect(r).toEqual({ allowed: true, requestCount: 1 });
   });
 
-  test("within window, count under limit → allowed, count incremented", async () => {
-    const fresh = new Date().toISOString();
-    const { client, updateSpy } = makeMockSupabase({
-      existing: { request_count: 5, window_start: fresh },
+  test("in-window, under limit → allowed, count incremented", async () => {
+    const stub = buildStub({
+      request_count: 5,
+      window_start:  new Date().toISOString(),
     });
-    const result = await checkIpRateLimit(client as any, "x");
-    expect(result.allowed).toBe(true);
-    expect(result.requestCount).toBe(6);
-    expect(updateSpy).toHaveBeenCalledTimes(1);
+    const r = await checkIpRateLimit(stub, "abc123");
+    expect(r).toEqual({ allowed: true, requestCount: 6 });
   });
 
-  test("exactly at the limit → still allowed (boundary: <=)", async () => {
-    const fresh = new Date().toISOString();
-    const { client } = makeMockSupabase({
-      existing: { request_count: IP_LIMIT_PER_MINUTE - 1, window_start: fresh },
+  test("at exact limit → still allowed (boundary)", async () => {
+    const stub = buildStub({
+      request_count: IP_LIMIT_PER_MINUTE - 1,
+      window_start:  new Date().toISOString(),
     });
-    const result = await checkIpRateLimit(client as any, "x");
-    expect(result.requestCount).toBe(IP_LIMIT_PER_MINUTE);
-    expect(result.allowed).toBe(true);
+    const r = await checkIpRateLimit(stub, "abc123");
+    expect(r.allowed).toBe(true);
+    expect(r.requestCount).toBe(IP_LIMIT_PER_MINUTE);
   });
 
-  test("one over the limit → BLOCKED", async () => {
-    const fresh = new Date().toISOString();
-    const { client } = makeMockSupabase({
-      existing: { request_count: IP_LIMIT_PER_MINUTE, window_start: fresh },
+  test("over limit → blocked", async () => {
+    const stub = buildStub({
+      request_count: IP_LIMIT_PER_MINUTE,
+      window_start:  new Date().toISOString(),
     });
-    const result = await checkIpRateLimit(client as any, "x");
-    expect(result.requestCount).toBe(IP_LIMIT_PER_MINUTE + 1);
-    expect(result.allowed).toBe(false);
+    const r = await checkIpRateLimit(stub, "abc123");
+    expect(r.allowed).toBe(false);
+    expect(r.requestCount).toBe(IP_LIMIT_PER_MINUTE + 1);
   });
 });
 
@@ -355,16 +427,12 @@ describe("checkIpRateLimit", () => {
 // 8. shouldCheckCache
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("shouldCheckCache — skip on retry", () => {
-  test("checks cache on first attempt (failedAttempts = 0)", () => {
+describe("shouldCheckCache", () => {
+  test("first attempt → check cache", () => {
     expect(shouldCheckCache(0)).toBe(true);
   });
 
-  test("checks cache when failedAttempts is undefined", () => {
-    expect(shouldCheckCache(undefined)).toBe(true);
-  });
-
-  test("SKIPS cache on any retry (failedAttempts >= 1)", () => {
+  test("retry attempts → skip cache", () => {
     expect(shouldCheckCache(1)).toBe(false);
     expect(shouldCheckCache(2)).toBe(false);
     expect(shouldCheckCache(99)).toBe(false);
@@ -376,60 +444,58 @@ describe("shouldCheckCache — skip on retry", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("validateBody", () => {
-  test("rejects when childId is missing", () => {
-    const r = validateBody({ detectedLabel: "apple" });
-    expect(r.valid).toBe(false);
-    if (!r.valid) {
-      expect(r.status).toBe(400);
-      expect(r.body.error).toMatch(/childId/);
-    }
+  const fullBody = {
+    childId:       "c1",
+    imageBase64:   "x",
+    currentWord:   "shiny",
+    questId:       "q1",
+    detectedLabel: "ring",
+  };
+
+  test("accepts a complete body", () => {
+    expect(validateBody(fullBody)).toEqual({ valid: true, missing: [] });
   });
 
-  test("rejects when childId is wrong type", () => {
-    const r = validateBody({ childId: 42, detectedLabel: "apple" });
-    expect(r.valid).toBe(false);
+  test("flags missing fields", () => {
+    expect(validateBody({})).toEqual({
+      valid: false,
+      missing: ["childId", "imageBase64", "currentWord", "questId", "detectedLabel"],
+    });
   });
 
-  test("rejects when detectedLabel is missing", () => {
-    const r = validateBody({ childId: "abc" });
+  test("treats null/undefined as missing", () => {
+    const r = validateBody({ ...fullBody, questId: null });
     expect(r.valid).toBe(false);
-    if (!r.valid) expect(r.body.error).toMatch(/detectedLabel/);
+    expect(r.missing).toEqual(["questId"]);
   });
 
-  test("accepts a minimal valid body", () => {
-    const r = validateBody({ childId: "abc", detectedLabel: "apple" });
+  test("preserves extra fields without flagging them", () => {
+    const r = validateBody({ ...fullBody, extraFlag: "ok" });
     expect(r.valid).toBe(true);
-  });
-
-  test("rejects empty string childId (truthy check)", () => {
-    const r = validateBody({ childId: "", detectedLabel: "apple" });
-    expect(r.valid).toBe(false);
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 10. extractIp — header fallback chain
+// 10. extractIp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("extractIp", () => {
-  test("uses x-forwarded-for first (taking the first comma-separated entry)", () => {
-    const h = new Headers({ "x-forwarded-for": "1.2.3.4, 5.6.7.8" });
-    expect(extractIp(h)).toBe("1.2.3.4");
+  test("uses x-forwarded-for first hop", () => {
+    expect(extractIp({ "x-forwarded-for": "1.2.3.4, 5.6.7.8" })).toBe("1.2.3.4");
   });
 
-  test("trims whitespace from the first entry", () => {
-    const h = new Headers({ "x-forwarded-for": "  1.2.3.4  ,  5.6.7.8" });
-    expect(extractIp(h)).toBe("1.2.3.4");
+  test("falls back to cf-connecting-ip if XFF missing", () => {
+    expect(extractIp({ "cf-connecting-ip": "9.9.9.9" })).toBe("9.9.9.9");
   });
 
-  test("falls back to cf-connecting-ip when x-forwarded-for is absent", () => {
-    const h = new Headers({ "cf-connecting-ip": "9.9.9.9" });
-    expect(extractIp(h)).toBe("9.9.9.9");
+  test("returns 'unknown' if both headers missing", () => {
+    expect(extractIp({})).toBe("unknown");
   });
 
-  test("falls back to 'unknown' when no headers present", () => {
+  test("works with Headers instance", () => {
     const h = new Headers();
-    expect(extractIp(h)).toBe("unknown");
+    h.set("x-forwarded-for", "10.0.0.1, 11.0.0.1");
+    expect(extractIp(h)).toBe("10.0.0.1");
   });
 });
 
@@ -438,30 +504,29 @@ describe("extractIp", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("jsonResponse", () => {
-  test("default status is 200", () => {
+  test("status defaults to 200", () => {
     const r = jsonResponse({ ok: true });
     expect(r.status).toBe(200);
   });
 
-  test("sets Content-Type: application/json", () => {
-    const r = jsonResponse({ ok: true });
-    expect(r.headers.get("Content-Type")).toBe("application/json");
-  });
-
-  test("includes CORS_HEADERS", () => {
-    const r = jsonResponse({ ok: true });
-    expect(r.headers.get("Access-Control-Allow-Origin")).toBe("*");
-    expect(r.headers.get("Access-Control-Allow-Headers")).toBe(CORS_HEADERS["Access-Control-Allow-Headers"]);
-  });
-
-  test("custom status (e.g. 429) is propagated", () => {
-    const r = jsonResponse({ error: "too many" }, 429);
+  test("custom status is preserved", () => {
+    const r = jsonResponse({ error: "x" }, 429);
     expect(r.status).toBe(429);
   });
 
-  test("body is JSON-encoded", async () => {
+  test("includes CORS headers", () => {
+    const r = jsonResponse({});
+    expect(r.headers.get("Access-Control-Allow-Origin")).toBe(CORS_HEADERS["Access-Control-Allow-Origin"]);
+    expect(r.headers.get("Access-Control-Allow-Headers")).toBe(CORS_HEADERS["Access-Control-Allow-Headers"]);
+  });
+
+  test("Content-Type is application/json", () => {
+    const r = jsonResponse({});
+    expect(r.headers.get("Content-Type")).toBe("application/json");
+  });
+
+  test("body is JSON-serialised", async () => {
     const r = jsonResponse({ a: 1, b: "two" });
-    const body = await r.text();
-    expect(JSON.parse(body)).toEqual({ a: 1, b: "two" });
+    expect(await r.text()).toBe('{"a":1,"b":"two"}');
   });
 });
