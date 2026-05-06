@@ -79,7 +79,7 @@ const GENERIC_LABELS = new Set(["", "object", "unknown", "thing", "item"]);
 
 const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL")   ?? "";
 const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
-const CACHE_TTL_S = 7 * 24 * 60 * 60; // 7 days
+const CACHE_TTL_S = 14 * 24 * 60 * 60; // 14 days
 
 async function cacheGet(key: string): Promise<unknown | null> {
   if (!REDIS_URL) return null;
@@ -148,16 +148,29 @@ function buildCacheKey(
   questId:       string,
   pendingWords:  string[]
 ): string {
-  // FIX (Boredom Behemoth chip-stuck-grey): pending property words are
-  // part of the cache key so a first-attempt cache hit never returns a
-  // response shaped for a different pending set.
+  // v4.5: Tier 1 normalisation — collapse case, internal whitespace, and
+  // simple English plurals so "Gold Ring" / "gold ring" / "Gold Rings" all
+  // hit the same cache entry.
   //
-  // Without this: scan 1 evaluated [a,b,c] and cached. Later scan with
-  // pending=[b,c] would cache-hit and return [a,b,c]'s response — Claude's
-  // verdict feedback then references properties no longer in the chip
-  // strip, causing the "all 3 available but chips greyed out" mismatch.
-  const sortedWords = [...pendingWords].map((w) => w.toLowerCase().trim()).sort().join(",");
-  const raw = `${detectedLabel.toLowerCase().trim()}::${questId}::${sortedWords}`;
+  // Plural rule is conservative: only strips trailing 's' when preceded by
+  // a letter that is NOT 's' and NOT 'e'. So:
+  //   "rings"    → "ring"     ✓ (g before s)
+  //   "books"    → "book"     ✓ (k before s)
+  //   "glass"    → "glass"    ✓ (ss preserved — second s before s blocks)
+  //   "glasses"  → "glasses"  ✓ (es preserved — e before s blocks)
+  //   "boxes"    → "boxes"    ✓ (es preserved — suboptimal but safe)
+  //   "phones"   → "phones"   ✓ (e before s blocks — miss, accepted cost)
+  //
+  // Trade-off: we miss vowel+s plurals (apples, phones, shoes) to guarantee
+  // we never wrong-collapse glass↔glasses or similar.
+  const normalize = (s: string) =>
+    s.toLowerCase()
+     .trim()
+     .replace(/\s+/g, " ")
+     .replace(/([a-z]{2,})([^se])s\b/g, "$1$2");
+
+  const sortedWords = [...pendingWords].map(normalize).sort().join(",");
+  const raw         = `${normalize(detectedLabel)}::${questId}::${sortedWords}`;
   return `lexi:eval:${btoa(raw).replace(/=/g, "")}`;
 }
 
