@@ -1,11 +1,20 @@
-import "react-native-url-polyfill/auto";
-import AsyncStorage from "@react-native-async-storage/async-storage";
-import { createClient } from "@supabase/supabase-js";
+/**
+ * lib/supabase.ts
+ * Lexi-Lens — Supabase client singleton.
+ *
+ * Updated for the dev/staging/prod environment split (v4.5):
+ * URL and anon key now come from `lib/env.ts` instead of reading
+ * `process.env.EXPO_PUBLIC_*` directly. Behaviour is identical when
+ * APP_VARIANT is unset (falls back to a single .env file).
+ */
 
-const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL ?? "";
-const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY ?? "";
+import 'react-native-url-polyfill/auto';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { createClient } from '@supabase/supabase-js';
 
-export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+import { ENV } from './env';
+
+export const supabase = createClient(ENV.supabase.url, ENV.supabase.anonKey, {
   auth: {
     storage:            AsyncStorage,
     autoRefreshToken:   true,
@@ -13,6 +22,8 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     detectSessionInUrl: false,
   },
 });
+
+// ─── Convenience wrappers (unchanged from previous version) ──────────────────
 
 export async function getUser() {
   const { data: { user }, error } = await supabase.auth.getUser();
@@ -32,7 +43,7 @@ export async function signOut() {
 }
 
 export function onAuthStateChange(
-  callback: (event: string, session: any) => void
+  callback: (event: string, session: any) => void,
 ) {
   return supabase.auth.onAuthStateChange(callback);
 }

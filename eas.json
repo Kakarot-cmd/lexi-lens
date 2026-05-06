@@ -3,32 +3,80 @@
     "version": ">= 18.7.0",
     "appVersionSource": "remote"
   },
+
   "build": {
+
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "channel": "development",
+      "env": {
+        "APP_VARIANT": "development",
+        "EXPO_PUBLIC_APP_VARIANT": "development",
+        "EXPO_PUBLIC_SUPABASE_URL": "$EXPO_PUBLIC_SUPABASE_URL_STAGING",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "$EXPO_PUBLIC_SUPABASE_ANON_KEY_STAGING",
+        "EXPO_PUBLIC_SENTRY_DSN": "$EXPO_PUBLIC_SENTRY_DSN_STAGING"
+      },
       "android": {
         "buildType": "apk"
-      }
-    },
-    "preview": {
-      "distribution": "internal",
-      "android": {
-        "buildType": "apk"
-      }
-    },
-    "production": {
-      "autoIncrement": true
-    },
-    "ios": {
-      "distribution": "store",
-      "autoIncrement": true,
+      },
       "ios": {
-    "buildConfiguration": "Release"  
-  }
+        "simulator": false
+      }
+    },
+
+    "staging": {
+      "distribution": "internal",
+      "channel": "staging",
+      "autoIncrement": true,
+      "env": {
+        "APP_VARIANT": "staging",
+        "EXPO_PUBLIC_APP_VARIANT": "staging",
+        "EXPO_PUBLIC_SUPABASE_URL": "$EXPO_PUBLIC_SUPABASE_URL_STAGING",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "$EXPO_PUBLIC_SUPABASE_ANON_KEY_STAGING",
+        "EXPO_PUBLIC_SENTRY_DSN": "$EXPO_PUBLIC_SENTRY_DSN_STAGING",
+        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "$EXPO_PUBLIC_REVENUECAT_IOS_KEY_SANDBOX",
+        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "$EXPO_PUBLIC_REVENUECAT_ANDROID_KEY_SANDBOX"
+      },
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "ios": {
+        "buildConfiguration": "Release"
+      }
+    },
+
+    "production": {
+      "channel": "production",
+      "autoIncrement": true,
+      "env": {
+        "APP_VARIANT": "production",
+        "EXPO_PUBLIC_APP_VARIANT": "production",
+        "EXPO_PUBLIC_SUPABASE_URL": "$EXPO_PUBLIC_SUPABASE_URL_PROD",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "$EXPO_PUBLIC_SUPABASE_ANON_KEY_PROD",
+        "EXPO_PUBLIC_SENTRY_DSN": "$EXPO_PUBLIC_SENTRY_DSN_PROD",
+        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "$EXPO_PUBLIC_REVENUECAT_IOS_KEY_PROD",
+        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "$EXPO_PUBLIC_REVENUECAT_ANDROID_KEY_PROD"
+      },
+      "android": {
+        "buildType": "app-bundle"
+      },
+      "ios": {
+        "buildConfiguration": "Release"
+      }
     }
   },
+
   "submit": {
-    "production": {}
+    "production": {
+      "android": {
+        "track": "production"
+      }
+    },
+    "staging": {
+      "android": {
+        "track": "internal"
+      }
+    }
   }
 }
