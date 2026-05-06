@@ -143,14 +143,27 @@ async function cacheSet(key: string, value: unknown): Promise<void> {
   } catch { /* non-fatal */ }
 }
 
+const ENV_NAME = (() => {
+  const fromEnv = Deno.env.get("CACHE_ENV_NAMESPACE")?.trim().toLowerCase();
+  if (fromEnv && /^[a-z0-9_-]+$/.test(fromEnv)) return fromEnv;
+  // Fail-safe: don't silently collide. "default" is distinct from both
+  // "staging" and "prod", so a misconfigured project at least lands in its
+  // own keyspace, and the warning surfaces in Edge Function logs.
+  console.warn(
+    "[buildCacheKey] CACHE_ENV_NAMESPACE not set or invalid — using 'default'. " +
+    "Set this secret on each Supabase project to avoid cross-env cache collision."
+  );
+  return "default";
+})();
+
 function buildCacheKey(
   detectedLabel: string,
   questId:       string,
   pendingWords:  string[]
 ): string {
-  // v4.5: Tier 1 normalisation — collapse case, internal whitespace, and
-  // simple English plurals so "Gold Ring" / "gold ring" / "Gold Rings" all
-  // hit the same cache entry.
+  // Tier 1 normalisation — collapse case, internal whitespace, and simple
+  // English plurals so "Gold Ring" / "gold ring" / "Gold Rings" all hit the
+  // same cache entry.
   //
   // Plural rule is conservative: only strips trailing 's' when preceded by
   // a letter that is NOT 's' and NOT 'e'. So:
@@ -171,7 +184,7 @@ function buildCacheKey(
 
   const sortedWords = [...pendingWords].map(normalize).sort().join(",");
   const raw         = `${normalize(detectedLabel)}::${questId}::${sortedWords}`;
-  return `lexi:eval:${btoa(raw).replace(/=/g, "")}`;
+  return `${ENV_NAME}:lexi:eval:${btoa(raw).replace(/=/g, "")}`;
 }
 
 // ─── IP rate limit ────────────────────────────────────────────────────────────
