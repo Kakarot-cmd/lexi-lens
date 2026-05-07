@@ -1,5 +1,5 @@
 /**
- * app.config.js — Lexi-Lens dynamic Expo config (v4.5)
+ * app.config.js — Lexi-Lens dynamic Expo config (v4.5.1)
  *
  * Reads APP_VARIANT (set by EAS via the env block in eas.json, or by your
  * .env.local for Metro/dev-client) and applies the matching identifiers.
@@ -27,6 +27,18 @@
  * Verify: eas secret:list
  *
  * Local dev: copy .env.example → .env.local and fill in dev or staging values.
+ *
+ * EAS Update (added v4.5.1):
+ *   `runtimeVersion: { policy: "appVersion" }` ties the OTA channel to the
+ *   `version` field below. Every build at version "1.0.12" shares one
+ *   runtime — JS-only updates published while at 1.0.12 reach all 1.0.12
+ *   builds. Bumping to 1.0.13 starts a fresh runtime. This is the safest
+ *   policy because it forces a native rebuild whenever you change the
+ *   version, which is the moment native code is most likely to have shifted.
+ *
+ *   If you change a native dependency without bumping `version`, OTA could
+ *   ship JS that calls into a native module the installed binary doesn't
+ *   have. The fix is: bump version any time a native change goes in.
  */
 
 const VARIANT = (process.env.APP_VARIANT ?? 'development').trim();
@@ -146,8 +158,17 @@ export default {
       appVariant: VARIANT,
     },
 
+    // ── EAS Update ────────────────────────────────────────────────────────
+    // `url` points at the EAS Update endpoint for this project (matches
+    // extra.eas.projectId above). `runtimeVersion.policy: "appVersion"`
+    // ties OTA compatibility to the `version` field above — see the
+    // header comment for the full reasoning.
     updates: {
+      url: 'https://u.expo.dev/7fe2d61b-242a-4de3-91a7-1422f6876164',
       fallbackToCacheTimeout: 0,
+    },
+    runtimeVersion: {
+      policy: 'appVersion',
     },
 
     owner: 'navinj',

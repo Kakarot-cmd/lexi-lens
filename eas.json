@@ -26,12 +26,12 @@
     },
 
     "staging": {
-      "distribution": "internal",
+      "distribution": "store",
       "channel": "staging",
       "autoIncrement": true,
       "env": {
-        "APP_VARIANT": "staging",
-        "EXPO_PUBLIC_APP_VARIANT": "staging",
+        "APP_VARIANT": "production",
+        "EXPO_PUBLIC_APP_VARIANT": "production",
         "EXPO_PUBLIC_SUPABASE_URL": "$EXPO_PUBLIC_SUPABASE_URL_STAGING",
         "EXPO_PUBLIC_SUPABASE_ANON_KEY": "$EXPO_PUBLIC_SUPABASE_ANON_KEY_STAGING",
         "EXPO_PUBLIC_SENTRY_DSN": "$EXPO_PUBLIC_SENTRY_DSN_STAGING",
@@ -47,6 +47,7 @@
     },
 
     "production": {
+      "distribution": "store",
       "channel": "production",
       "autoIncrement": true,
       "env": {
@@ -68,14 +69,14 @@
   },
 
   "submit": {
-    "production": {
-      "android": {
-        "track": "production"
-      }
-    },
     "staging": {
       "android": {
         "track": "internal"
+      }
+    },
+    "production": {
+      "android": {
+        "track": "production"
       }
     }
   }
