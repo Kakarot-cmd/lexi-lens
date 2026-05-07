@@ -2,6 +2,15 @@
  * hooks/useLexiEvaluate.ts
  * Lexi-Lens — client-side hook for the evaluate Edge Function.
  *
+ * v4.7 additions (Compliance polish — verdict reporting):
+ *   • EvaluationResult gains _scanAttemptId — the row id of the
+ *     scan_attempts row that backs this verdict. Returned by the Edge
+ *     Function on both cache-hit and Claude paths so VerdictCard's
+ *     "Report" button can submit a verdict_report linked to the
+ *     specific scan.
+ *   • The hook exposes a clean `scanAttemptId` alias so consumers don't
+ *     have to know about the `_`-prefixed wire-protocol field.
+ *
  * v3.7 additions (Sentry Crash Reporting):
  *   • callEdgeFunction wrapped in withSentrySpan for performance tracing
  *   • addGameBreadcrumb on every call lifecycle event (start, retry, verdict)
@@ -112,6 +121,8 @@ export interface EvaluationResult {
   _cacheHit?:         boolean;
   /** v3.5 — rate-limit telemetry from Edge Function */
   _rateLimit?:        RateLimitInfo;
+  /** v4.7 — scan_attempts.id for this verdict; null only if the row insert failed */
+  _scanAttemptId?:    string | null;
 }
 
 export interface EvaluatePayload {
@@ -146,6 +157,8 @@ interface UseLexiEvaluateReturn {
   masteryResult:    MasteryUpdateResult | null;
   /** v3.4 — true when the last result came from Redis cache (< 10 ms) */
   cacheHit:         boolean;
+  /** v4.7 — scan_attempts.id for the most recent verdict, for verdict reporting */
+  scanAttemptId:    string | null;
   // ── v3.5 rate limit fields ──────────────────────────────────────────────
   /** "DAILY_QUOTA" | "IP_LIMIT" | null */
   rateLimitCode:    RateLimitCode | null;
@@ -309,6 +322,7 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
   const [error,            setError]            = useState<string | null>(null);
   const [masteryResult,    setMasteryResult]    = useState<MasteryUpdateResult | null>(null);
   const [cacheHit,         setCacheHit]         = useState<boolean>(false);
+  const [scanAttemptId,    setScanAttemptId]    = useState<string | null>(null);
   // v3.5
   const [rateLimitCode,    setRateLimitCode]    = useState<RateLimitCode | null>(null);
   const [scansToday,       setScansToday]       = useState<number>(0);
@@ -326,6 +340,7 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
     setError(null);
     setMasteryResult(null);
     setCacheHit(false);
+    setScanAttemptId(null);
     setRateLimitCode(null);
 
     try {
@@ -361,8 +376,9 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
         xp_reward_third_plus: payload.xp_reward_third_plus ?? 10,
       });
 
-      // ── Step 3: Record cache hit flag ────────────────────────────────────
+      // ── Step 3: Record cache hit flag + scan attempt id (v4.7) ──────────
       setCacheHit(evaluationResult._cacheHit === true);
+      setScanAttemptId(evaluationResult._scanAttemptId ?? null);
 
       // ── Step 4: v3.5 — Update rate-limit telemetry from server ──────────
       if (evaluationResult._rateLimit) {
@@ -447,6 +463,7 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
     setError(null);
     setMasteryResult(null);
     setCacheHit(false);
+    setScanAttemptId(null);
     setRateLimitCode(null);
     // Keep scansToday / dailyLimit — they reflect real server state
     inFlight.current = false;
@@ -458,6 +475,7 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
     error,
     masteryResult,
     cacheHit,
+    scanAttemptId,
     rateLimitCode,
     scansToday,
     dailyLimit,

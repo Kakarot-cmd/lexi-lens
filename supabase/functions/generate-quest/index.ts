@@ -2,7 +2,12 @@
  * supabase/functions/generate-quest/index.ts
  * Lexi-Lens — AI Quest Generator (Phase 3.3 + propCount update)
  *
- * POST /functions/v1/generate-quest
+ * v4.7 — Compliance polish: prepend CHILD_SAFETY_PREFIX to the system prompt.
+ *   Sourced from supabase/functions/_shared/childSafety.ts. Applied to every
+ *   Claude-using Edge Function uniformly. Guarantees that quest names, enemy
+ *   names, spell descriptions, and feedback ceilings cannot drift into
+ *   unsafe territory regardless of the parent-supplied theme. Adds ~250
+ *   tokens to the system prompt; runtime cost on Haiku 4.5 is negligible.
  *
  * Changes in this version:
  *   • Accepts `propCount` (1–5) in the request body. When provided it overrides
@@ -31,6 +36,7 @@
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
@@ -186,7 +192,9 @@ For SAGE tier: pick from the upper half of the age-band word pool, not words alr
 For SCHOLAR/APPRENTICE: use words from the lower-mid pool regardless of mastery.`
     : "";
 
-  return `You are a vocabulary curriculum designer for Lexi-Lens, a children's AR vocabulary RPG.
+  return `${CHILD_SAFETY_PREFIX}
+
+You are a vocabulary curriculum designer for Lexi-Lens, a children's AR vocabulary RPG.
 Your job is to generate a single vocabulary quest that children complete by finding a real physical
 object that matches specific word properties with their device camera.
 

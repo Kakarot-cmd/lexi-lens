@@ -2,6 +2,14 @@
  * supabase/functions/export-word-tome/index.ts
  * Lexi-Lens — Phase 2.6: Word Tome PDF Export
  *
+ * v4.7 — Compliance polish: pass CHILD_SAFETY_PREFIX as the Claude `system`
+ *   parameter when generating the portfolio summary. Sourced from
+ *   supabase/functions/_shared/childSafety.ts. Applied uniformly to every
+ *   Claude-using Edge Function. Notably here: the summary is sent via
+ *   email/printout to a parent and may be read by the child too, so the
+ *   prefix's "no PII echoing, age-appropriate, neutral" guarantees apply.
+ *   Adds ~250 tokens.
+ *
  * POST /functions/v1/export-word-tome
  *
  * WHY AN EDGE FUNCTION:
@@ -45,6 +53,7 @@
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -299,6 +308,7 @@ Rules:
       body: JSON.stringify({
         model:      MODEL,
         max_tokens: 150,
+        system:     CHILD_SAFETY_PREFIX,
         messages:   [{ role: "user", content: prompt }],
       }),
     });

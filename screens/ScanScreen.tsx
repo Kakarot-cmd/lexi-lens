@@ -489,6 +489,7 @@ export function ScanScreen({ route, navigation }: Props) {
     error,
     masteryResult,
     cacheHit,
+    scanAttemptId,
     evaluate,
     reset: resetEval,
     rateLimitCode,
@@ -915,6 +916,7 @@ export function ScanScreen({ route, navigation }: Props) {
             error={error}
             masteryResult={masteryResult}
             cacheHit={cacheHit}
+            scanAttemptId={scanAttemptId}
             onContinue={handleContinue}
             onTryAgain={handleTryAgain}
           />

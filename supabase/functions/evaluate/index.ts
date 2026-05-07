@@ -2,6 +2,19 @@
  * supabase/functions/evaluate/index.ts
  * Lexi-Lens — Supabase Edge Function entry point.
  *
+ * v4.7 update — Compliance polish: scan_attempt_id surfaced to client
+ *   • logScanResult and logScanCacheHit now return the inserted row's id.
+ *     The id is returned to the client as `_scanAttemptId` on the verdict
+ *     response so the in-app "Report this verdict" button can link a
+ *     report to a specific scan_attempts row via the new
+ *     report-verdict Edge Function.
+ *   • Both cache-hit and Claude-call paths return the id. The cache-hit
+ *     path needed it because cached verdicts are equally reportable.
+ *   • logScanBlocked is unchanged — blocked attempts are not reportable
+ *     (no verdict was rendered to the child).
+ *   • Behaviour change: the response shape gains one field. Older clients
+ *     ignoring unknown keys are unaffected.
+ *
  * v4.5 update (this file): cache_hit observability
  *   • Cache hits now write a lightweight row to scan_attempts with
  *     cache_hit=true and claude_latency_ms=null. Previously cache hits were
@@ -296,9 +309,9 @@ async function logScanResult(
     claudeLatencyMs: number;
     result:          Awaited<ReturnType<typeof evaluateObject>>;
   }
-) {
+): Promise<string | null> {
   try {
-    await supabase.from("scan_attempts").insert({
+    const { data, error } = await supabase.from("scan_attempts").insert({
       child_id:          opts.childId,
       quest_id:          opts.questId        ?? null,
       detected_label:    opts.detectedLabel,
@@ -312,9 +325,15 @@ async function logScanResult(
       xp_awarded:        opts.result.xpAwarded,
       claude_latency_ms: opts.claudeLatencyMs,
       cache_hit:         false,
-    });
+    }).select("id").single();
+    if (error) {
+      console.error("[evaluate] logScanResult INSERT error:", error.message);
+      return null;
+    }
+    return (data as { id: string } | null)?.id ?? null;
   } catch (e) {
     console.error("[evaluate] logScanResult INSERT failed:", e);
+    return null;
   }
 }
 
@@ -343,9 +362,9 @@ async function logScanCacheHit(
     ipHash?:       string;
     cachedResult:  CachedEvaluation;
   }
-) {
+): Promise<string | null> {
   try {
-    await supabase.from("scan_attempts").insert({
+    const { data, error } = await supabase.from("scan_attempts").insert({
       child_id:          opts.childId,
       quest_id:          opts.questId        ?? null,
       detected_label:    opts.detectedLabel,
@@ -359,9 +378,15 @@ async function logScanCacheHit(
       xp_awarded:        opts.cachedResult.xpAwarded,
       claude_latency_ms: null,   // signal: no Claude call
       cache_hit:         true,
-    });
+    }).select("id").single();
+    if (error) {
+      console.error("[evaluate] logScanCacheHit INSERT error:", error.message);
+      return null;
+    }
+    return (data as { id: string } | null)?.id ?? null;
   } catch (e) {
     console.error("[evaluate] logScanCacheHit INSERT failed:", e);
+    return null;
   }
 }
 
@@ -555,8 +580,12 @@ serve(async (req: Request) => {
     // claude_latency_ms is null (no Claude call); cache_hit is true.
     // The companion migration's RPC update ensures this row does NOT
     // count toward the daily 50/child quota.
+    //
+    // v4.7: capture the inserted row's id and surface it as
+    // _scanAttemptId on the response so the client's "Report this
+    // verdict" button can link a report to this exact scan.
     const cached = cachedResult as CachedEvaluation;
-    await logScanCacheHit(supabase, {
+    const scanAttemptId = await logScanCacheHit(supabase, {
       childId,
       questId:       questId as string | undefined,
       detectedLabel: detectedLabel as string,
@@ -570,8 +599,9 @@ serve(async (req: Request) => {
     // it won't show stale "scans today" numbers while the user is mid-quest.
     return jsonResponse({
       ...(cachedResult as object),
-      _cacheHit:  true,
-      _rateLimit: buildAlertFlags(scansToday),
+      _cacheHit:       true,
+      _scanAttemptId:  scanAttemptId,
+      _rateLimit:      buildAlertFlags(scansToday),
     });
   }
 

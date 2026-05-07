@@ -1,6 +1,25 @@
 /**
  * VerdictCard.tsx — Lexi-Lens result card
  *
+ * v4.7 additions (Compliance polish — verdict reporting):
+ *   • Adds a small "Report" button beneath the action button on any
+ *     non-error verdict. Tapping opens a modal sheet with five reason
+ *     buttons (wrong_object, wrong_property, feels_inappropriate,
+ *     too_hard, too_easy) plus an "Other" path with a 200-char note
+ *     field.
+ *   • The submission goes to the report-verdict Edge Function which
+ *     verifies parent ownership of the scan_attempt server-side. The
+ *     button does NOT show on error states (no scan_attempt to link to).
+ *   • While the submission is in flight, the button shows "Sending…";
+ *     on success, a subtle "Thanks — report sent" confirmation appears
+ *     in place of the button (it doesn't auto-dismiss the card so the
+ *     child can still tap Continue / Try again).
+ *   • On failure (network, 401, 403, 500), shows "Report failed — try
+ *     again later" without leaking the specific error to the child.
+ *   • The free-text note never goes to Sentry — only the structured
+ *     reason and the scan_attempt context. The note is a privacy-
+ *     sensitive field gated behind RLS.
+ *
  * v3.4 additions (Redis Response Caching):
  *   • Accepts cacheHit prop from useLexiEvaluate
  *   • Shows a small "⚡ Instant" pill beneath the resolved object name
@@ -14,7 +33,7 @@
  *  - "Continue quest" when something found, "Try another object" when nothing found
  */
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   View,
   Text,
@@ -24,10 +43,17 @@ import {
   Animated,
   Dimensions,
   Platform,
+  Modal,
+  TextInput,
+  ActivityIndicator,
+  KeyboardAvoidingView,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { EvaluationResult, EvaluateStatus } from "../hooks/useLexiEvaluate";
 import type { MasteryUpdateResult } from "../services/MasteryService";
+import { supabase } from "../lib/supabase";
+import { ENV } from "../lib/env";
+import { addGameBreadcrumb, captureVerdictReport } from "../lib/sentry";
 
 interface VerdictCardProps {
   status:         Extract<EvaluateStatus, "match" | "no-match" | "error">;
@@ -37,6 +63,8 @@ interface VerdictCardProps {
   masteryResult?: MasteryUpdateResult | null;
   /** v3.4 — true when result served from Redis cache (< 10 ms) */
   cacheHit?:      boolean;
+  /** v4.7 — scan_attempts.id for this verdict; enables the Report button */
+  scanAttemptId?: string | null;
   onContinue:     () => void;
   onTryAgain:     () => void;
 }
@@ -136,13 +164,256 @@ function XPCounter({ xp }: { xp: number }) {
   );
 }
 
+// ─── v4.7: Verdict report types + sheet ───────────────────────────────────────
+
+type ReportReason =
+  | "wrong_object"
+  | "wrong_property"
+  | "feels_inappropriate"
+  | "too_hard"
+  | "too_easy"
+  | "other";
+
+type ReportSubmitState = "idle" | "sending" | "success" | "error";
+
+const REPORT_REASONS: Array<{ value: ReportReason; label: string; emoji: string }> = [
+  { value: "wrong_object",        label: "Wrong object",            emoji: "🔍" },
+  { value: "wrong_property",      label: "Wrong about a property",  emoji: "✖️" },
+  { value: "feels_inappropriate", label: "Feels not right for kids", emoji: "🛡️" },
+  { value: "too_hard",            label: "Too hard for my child",   emoji: "🧗" },
+  { value: "too_easy",            label: "Too easy for my child",   emoji: "🪶" },
+  { value: "other",               label: "Something else",          emoji: "💬" },
+];
+
+interface ReportSheetProps {
+  visible:         boolean;
+  scanAttemptId:   string;
+  detectedLabel?:  string | null;
+  resolvedName?:   string | null;
+  cacheHit?:       boolean;
+  questId?:        string;
+  onClose:         () => void;
+}
+
+/**
+ * Modal sheet shown when the user taps the small "Report" button on a verdict.
+ *
+ * Two-step flow:
+ *   Step 1 — choose a reason. Tapping any non-"other" reason submits
+ *            immediately (no friction; the child / parent shouldn't have to
+ *            type to flag a clear miss).
+ *   Step 2 — only shown for the "Other" reason: optional 200-char note,
+ *            then Submit.
+ *
+ * After submission:
+ *   • Success → swap to a brief "Thanks — sent" view with a Done button.
+ *   • Error   → inline message; reasons stay tappable for retry.
+ */
+function ReportSheet({
+  visible,
+  scanAttemptId,
+  detectedLabel,
+  resolvedName,
+  cacheHit,
+  questId,
+  onClose,
+}: ReportSheetProps) {
+  const [selected, setSelected]   = useState<ReportReason | null>(null);
+  const [note,     setNote]       = useState("");
+  const [state,    setState]      = useState<ReportSubmitState>("idle");
+  const [errMsg,   setErrMsg]     = useState<string | null>(null);
+
+  // Reset transient state every time the sheet is freshly opened.
+  useEffect(() => {
+    if (visible) {
+      setSelected(null);
+      setNote("");
+      setState("idle");
+      setErrMsg(null);
+    }
+  }, [visible]);
+
+  async function submit(reason: ReportReason) {
+    setState("sending");
+    setErrMsg(null);
+
+    try {
+      const { data, error } = await supabase.functions.invoke("report-verdict", {
+        body: {
+          scanAttemptId,
+          reason,
+          note:        reason === "other" ? note.trim().slice(0, 200) : undefined,
+          appVariant:  ENV.variant,
+          appVersion:  ENV.appVersion,
+        },
+      });
+
+      if (error || !data || (data as { ok?: boolean }).ok !== true) {
+        throw new Error(error?.message ?? "Submission failed");
+      }
+
+      // Mirror to Sentry as a "warning" event so spikes show on the
+      // crash dashboard. Note is intentionally NOT included.
+      captureVerdictReport({
+        scanAttemptId,
+        questId,
+        detectedLabel: detectedLabel ?? undefined,
+        resolvedName:  resolvedName  ?? undefined,
+        reason,
+        cacheHit,
+      });
+
+      addGameBreadcrumb({
+        category: "report",
+        message:  `Verdict reported: ${reason}`,
+        data:     { scanAttemptId, reason, cacheHit: cacheHit ?? false },
+      });
+
+      setState("success");
+    } catch (e) {
+      // Don't leak the underlying error to the user — this is a
+      // child-facing UI. Generic message + Sentry breadcrumb for triage.
+      addGameBreadcrumb({
+        category: "report",
+        message:  "Verdict report submission failed",
+        level:    "warning",
+        data:     {
+          scanAttemptId,
+          reason,
+          message: e instanceof Error ? e.message : String(e),
+        },
+      });
+      setErrMsg("Couldn't send report — please try again in a bit.");
+      setState("error");
+    }
+  }
+
+  function handleReasonTap(r: ReportReason) {
+    setSelected(r);
+    if (r !== "other") {
+      // Clear-cut reason: submit immediately, no friction.
+      submit(r);
+    }
+  }
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="fade"
+      onRequestClose={state === "sending" ? undefined : onClose}
+    >
+      <KeyboardAvoidingView
+        style={reportStyles.backdrop}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+      >
+        <View style={reportStyles.sheet}>
+          <View style={reportStyles.handle} />
+
+          {state === "success" ? (
+            <View style={reportStyles.successWrap}>
+              <Text style={reportStyles.successEmoji}>✦</Text>
+              <Text style={reportStyles.successTitle}>Thanks — report sent</Text>
+              <Text style={reportStyles.successBody}>
+                We'll review this verdict to make Lexi-Lens better.
+              </Text>
+              <TouchableOpacity
+                style={reportStyles.doneBtn}
+                onPress={onClose}
+              >
+                <Text style={reportStyles.doneBtnText}>Done</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <>
+              <Text style={reportStyles.sheetTitle}>What's wrong with this verdict?</Text>
+              <Text style={reportStyles.sheetSubtitle}>
+                Tap a reason to send a report. We use these to improve the app.
+              </Text>
+
+              <ScrollView style={reportStyles.reasonList} showsVerticalScrollIndicator={false}>
+                {REPORT_REASONS.map((r) => {
+                  const isSel    = selected === r.value;
+                  const disabled = state === "sending";
+                  return (
+                    <TouchableOpacity
+                      key={r.value}
+                      style={[
+                        reportStyles.reasonBtn,
+                        isSel && reportStyles.reasonBtnSelected,
+                        disabled && reportStyles.reasonBtnDisabled,
+                      ]}
+                      onPress={() => handleReasonTap(r.value)}
+                      disabled={disabled}
+                    >
+                      <Text style={reportStyles.reasonEmoji}>{r.emoji}</Text>
+                      <Text style={reportStyles.reasonLabel}>{r.label}</Text>
+                      {isSel && state === "sending" && (
+                        <ActivityIndicator size="small" color="#a78bfa" style={{ marginLeft: 8 }} />
+                      )}
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+
+              {selected === "other" && state !== "sending" && (
+                <View style={reportStyles.noteWrap}>
+                  <TextInput
+                    style={reportStyles.noteInput}
+                    value={note}
+                    onChangeText={(t) => setNote(t.slice(0, 200))}
+                    placeholder="Tell us a bit more (optional, 200 chars)"
+                    placeholderTextColor="#6b5fa0"
+                    multiline
+                    maxLength={200}
+                    editable={state !== "sending"}
+                  />
+                  <View style={reportStyles.noteRow}>
+                    <Text style={reportStyles.noteCount}>{note.length}/200</Text>
+                    <TouchableOpacity
+                      style={reportStyles.submitBtn}
+                      onPress={() => submit("other")}
+                    >
+                      <Text style={reportStyles.submitBtnText}>Send report</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              )}
+
+              {errMsg && (
+                <Text style={reportStyles.errorText}>{errMsg}</Text>
+              )}
+
+              <TouchableOpacity
+                style={reportStyles.cancelBtn}
+                onPress={onClose}
+                disabled={state === "sending"}
+              >
+                <Text style={reportStyles.cancelBtnText}>
+                  {state === "sending" ? "Sending…" : "Cancel"}
+                </Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+}
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 export function VerdictCard({
-  status, result, error, masteryResult, cacheHit, onContinue, onTryAgain,
+  status, result, error, masteryResult, cacheHit, scanAttemptId, onContinue, onTryAgain,
 }: VerdictCardProps) {
+	
+	  //console.log("[VerdictCard] scanAttemptId=", scanAttemptId, "status=", status);  // ← ADD THIS
+
   const insets    = useSafeAreaInsets();
   const slideAnim = useRef(new Animated.Value(CARD_H)).current;
+
+  // v4.7 — verdict report sheet state
+  const [reportOpen, setReportOpen] = useState(false);
 
   useEffect(() => {
     Animated.spring(slideAnim, {
@@ -293,11 +564,34 @@ export function VerdictCard({
                   <Text style={styles.retryBtnText}>Try another object</Text>
                 </TouchableOpacity>
               )}
+
+              {/* v4.7 — Report this verdict (small, low-visibility link) */}
+              {scanAttemptId && (
+                <TouchableOpacity
+                  style={styles.reportLink}
+                  onPress={() => setReportOpen(true)}
+                  accessibilityLabel="Report this verdict"
+                >
+                  <Text style={styles.reportLinkText}>⚐ Report this verdict</Text>
+                </TouchableOpacity>
+              )}
             </>
           )}
 
         </ScrollView>
       </View>
+
+      {/* v4.7 — Report sheet (rendered outside the card so the modal layers cleanly) */}
+      {scanAttemptId && (
+        <ReportSheet
+          visible={reportOpen}
+          scanAttemptId={scanAttemptId}
+          detectedLabel={result?.resolvedObjectName ?? null}
+          resolvedName={result?.resolvedObjectName ?? null}
+          cacheHit={cacheHit}
+          onClose={() => setReportOpen(false)}
+        />
+      )}
     </Animated.View>
   );
 }
@@ -420,4 +714,134 @@ const styles = StyleSheet.create({
   masteryIcon:  { fontSize: 28 },
   masteryTitle: { fontSize: 14, fontWeight: "700", color: "#fbbf24", marginBottom: 2 },
   masteryBody:  { fontSize: 13, color: "#fde68a", lineHeight: 18 },
+
+  // v4.7 — Report verdict link (under main action buttons)
+  reportLink: {
+    alignSelf: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    marginTop: 10,
+    marginBottom: 4,
+  },
+  reportLinkText: {
+    fontSize: 12,
+    color: P.textDim,
+    letterSpacing: 0.4,
+    textDecorationLine: "underline",
+    textDecorationColor: P.textDim,
+  },
+});
+
+// ─── v4.7 — Report sheet styles ───────────────────────────────────────────────
+
+const reportStyles = StyleSheet.create({
+  backdrop: {
+    flex: 1,
+    backgroundColor: "rgba(15, 6, 32, 0.78)",
+    justifyContent: "flex-end",
+  },
+  sheet: {
+    backgroundColor: P.cardBg,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    borderTopWidth: 1,
+    borderColor: P.cardBorder,
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: Platform.OS === "ios" ? 32 : 20,
+    maxHeight: "80%",
+  },
+  handle: {
+    width: 40, height: 4, backgroundColor: P.textDim,
+    borderRadius: 2, alignSelf: "center", marginBottom: 14,
+  },
+  sheetTitle: {
+    fontSize: 18, fontWeight: "700", color: P.textPrimary,
+    textAlign: "center", marginBottom: 4,
+  },
+  sheetSubtitle: {
+    fontSize: 13, color: P.textMuted,
+    textAlign: "center", marginBottom: 16,
+  },
+  reasonList: {
+    maxHeight: 320,
+  },
+  reasonBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: P.midPurple,
+    borderColor: P.cardBorder,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    marginBottom: 8,
+  },
+  reasonBtnSelected: {
+    backgroundColor: "#2a1058",
+    borderColor: "#7c3aed",
+  },
+  reasonBtnDisabled: {
+    opacity: 0.5,
+  },
+  reasonEmoji: { fontSize: 20, marginRight: 12 },
+  reasonLabel: { flex: 1, fontSize: 15, color: P.textPrimary, fontWeight: "500" },
+
+  noteWrap: {
+    marginTop: 8,
+  },
+  noteInput: {
+    backgroundColor: P.midPurple,
+    borderColor: P.cardBorder,
+    borderWidth: 1,
+    borderRadius: 12,
+    color: P.textPrimary,
+    fontSize: 14,
+    padding: 12,
+    minHeight: 70,
+    textAlignVertical: "top",
+  },
+  noteRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginTop: 8,
+  },
+  noteCount: { fontSize: 11, color: P.textDim },
+  submitBtn: {
+    backgroundColor: "#7c3aed",
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+  },
+  submitBtnText: { color: "#fff", fontWeight: "700", fontSize: 14 },
+
+  errorText: {
+    color: "#fca5a5",
+    fontSize: 12,
+    textAlign: "center",
+    marginTop: 10,
+  },
+
+  cancelBtn: {
+    alignItems: "center",
+    paddingVertical: 14,
+    marginTop: 10,
+  },
+  cancelBtnText: { color: P.textMuted, fontSize: 14, fontWeight: "600" },
+
+  successWrap: {
+    alignItems: "center",
+    paddingVertical: 12,
+  },
+  successEmoji: { fontSize: 40, marginBottom: 8, color: "#22c55e" },
+  successTitle: { fontSize: 18, fontWeight: "700", color: P.textPrimary, marginBottom: 6 },
+  successBody:  { fontSize: 13, color: P.textMuted, textAlign: "center", marginBottom: 18 },
+  doneBtn: {
+    backgroundColor: "#7c3aed",
+    borderRadius: 14,
+    paddingVertical: 14,
+    paddingHorizontal: 36,
+  },
+  doneBtnText: { color: "#fff", fontSize: 15, fontWeight: "700" },
 });

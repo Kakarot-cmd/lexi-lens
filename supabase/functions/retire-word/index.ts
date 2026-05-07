@@ -2,6 +2,13 @@
  * supabase/functions/retire-word/index.ts
  * Lexi-Lens — Phase 1.5: retire-word Edge Function
  *
+ * v4.7 — Compliance polish: prepend CHILD_SAFETY_PREFIX to the system prompt.
+ *   Sourced from supabase/functions/_shared/childSafety.ts. Applied to every
+ *   Claude-using Edge Function uniformly. Important here because the input
+ *   "mastered word" is parent-influenceable (custom quests) and the synonym
+ *   Claude returns is rendered straight into the child-facing celebration
+ *   banner.
+ *
  * Called by MasteryService.fetchHarderSynonym() when a child's mastery
  * for a word crosses the 0.8 retirement threshold.
  *
@@ -20,6 +27,7 @@
  */
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin":  "*",
@@ -79,7 +87,9 @@ serve(async (req: Request) => {
       body: JSON.stringify({
 		model: MODEL,
         max_tokens: 200,
-        system: `You are a vocabulary curriculum designer for a children's educational game.
+        system: `${CHILD_SAFETY_PREFIX}
+
+You are a vocabulary curriculum designer for a children's educational game.
 Your task: find a harder synonym for a word a child has just mastered.
 
 Rules:

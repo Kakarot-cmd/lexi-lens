@@ -3,33 +3,60 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LexiLore Privacy Policy</title>
+  <title>Lexi-Lens Privacy Policy</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #333; }
+    body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #333; line-height: 1.55; }
     h1 { color: #4a0e8f; }
-    h2 { color: #6b21a8; margin-top: 30px; }
+    h2 { color: #6b21a8; margin-top: 28px; }
+    p, li { margin: 10px 0; }
+    ul { padding-left: 22px; }
+    .meta { color: #6b6478; font-size: 0.9em; }
+    code { background: #f5f0ff; padding: 1px 6px; border-radius: 4px; font-size: 0.92em; }
   </style>
 </head>
 <body>
-  <h1>LexiLore: AR Vocabulary Quest — Privacy Policy</h1>
-  <p><strong>Last updated: April 29, 2026</strong></p>
+  <h1>Lexi-Lens — Privacy Policy</h1>
+  <p class="meta"><strong>Last updated: May 7, 2026</strong></p>
+  <p class="meta">Lexi-Lens is published by NJ Labs.</p>
 
   <h2>Camera</h2>
-  <p>The camera is used solely for real-time object recognition to support vocabulary learning. No images or video are stored, transmitted, or shared with any third party.</p>
+  <p>Lexi-Lens uses your device camera solely for real-time object recognition during vocabulary quests. Images and video frames are processed in-memory only and are never stored on our servers, never written to your device's photo library, and never shared with third parties or advertisers. On Android, object detection runs on-device via Google ML Kit and the image never leaves the phone unless a verdict is requested. On iOS, the visible camera frame is sent to our evaluation service and discarded immediately after the verdict is returned.</p>
 
   <h2>Data We Collect</h2>
-  <p>We collect: parent email address (for account management only), child first name (display only, no surname collected), and quest progress and scanned word history (stored securely on our servers).</p>
+  <ul>
+    <li><strong>Parent email address</strong> — for account creation and password recovery only. Never used for marketing.</li>
+    <li><strong>Child first name</strong> — display only, shown inside the app. We do not collect surnames, dates of birth, school names, or any other identifier.</li>
+    <li><strong>Quest progress and scanned word history</strong> — stored on our servers so progress survives across devices.</li>
+    <li><strong>Anonymous diagnostic data</strong> — crash logs and performance metrics, with personal identifiers removed before transmission.</li>
+  </ul>
+  <p>We do not collect, infer, or store: precise location, device contacts, photos library, microphone audio, advertising identifiers, or any third-party tracking signal.</p>
 
-  <h2>Children's Privacy (COPPA)</h2>
-  <p>LexiLore is designed for children ages 5–12 under parental supervision. We do not collect personal information from children under 13 without verified parental consent. A parental consent flow is required before any child profile is created.</p>
+  <h2>Children's Privacy (COPPA &amp; GDPR-K)</h2>
+  <p>Lexi-Lens is designed for children aged 5–12 used under parental supervision. Before any child profile can be created, the parent must complete a verified consent flow that confirms their age and authority to consent on the child's behalf. This complies with the U.S. Children's Online Privacy Protection Act (16 CFR Part 312) and Article 8 of the EU General Data Protection Regulation. We collect the minimum data necessary to operate the educational features of the app and nothing else.</p>
+
+  <h2>How AI Is Used</h2>
+  <p>Lexi-Lens uses Anthropic's Claude AI to evaluate scanned objects against vocabulary properties and generate quest content. When a scan is performed, the detected object label, the vocabulary words being evaluated, the child's age band, and (on iOS) the camera frame are sent to our evaluation service, which forwards them to Anthropic. The child's name and parent email are never sent to the AI service. Anthropic does not train its models on Lexi-Lens user data.</p>
 
   <h2>Data Deletion</h2>
-  <p>Parents may request deletion of all account data at any time from within the app under Parent Dashboard → Request Data Deletion. All data will be permanently deleted within 30 days.</p>
+  <p>Parents may request deletion of all account data at any time from inside the app: <strong>Parent Dashboard → Word Tome → enter Parent PIN → Request Account Deletion</strong>. After confirmation, all child profiles, quest progress, scanned word history, and the parent account itself are permanently deleted within 30 days. Anonymous diagnostic data may persist for up to 90 days for app stability purposes and is not linked to any deleted account.</p>
+  <p>Email-based deletion requests can also be sent to the address below.</p>
 
   <h2>Third-Party Services</h2>
-  <p>We use Supabase for secure data storage and Sentry for crash reporting (diagnostic data only, not linked to user identity). No data is shared with advertisers.</p>
+  <ul>
+    <li><strong>Supabase</strong> — secure data storage and authentication (EU and US regions).</li>
+    <li><strong>Anthropic</strong> — AI evaluation service (Claude). Anthropic's privacy practices: <code>anthropic.com/privacy</code></li>
+    <li><strong>Sentry</strong> — anonymous crash reporting. Personal identifiers are stripped before any event is transmitted.</li>
+    <li><strong>Upstash Redis</strong> — short-lived cache of evaluation results; cache keys do not contain child identifiers.</li>
+  </ul>
+  <p>No data is shared with advertisers, data brokers, or analytics providers.</p>
+
+  <h2>Reporting a Problem</h2>
+  <p>From the verdict screen at the end of any scan, a parent or child can tap "Report" to flag a verdict that seems inappropriate, factually wrong, or off-topic for the child's age. Reports are reviewed by us and used only to improve quest quality.</p>
+
+  <h2>Changes to This Policy</h2>
+  <p>If we materially change how we collect or use data, we will publish a new version of this policy and the in-app consent flow will require parents to review the changes before continuing.</p>
 
   <h2>Contact</h2>
-  <p>For privacy questions or data deletion requests, contact us at: <strong>beautifulhearts.n@gmail.com</strong></p>
+  <p>For privacy questions, deletion requests, or any concern about how Lexi-Lens handles your data, contact us at: <strong>beautifulhearts.n@gmail.com</strong></p>
 </body>
 </html>

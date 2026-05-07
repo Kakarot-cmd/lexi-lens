@@ -2,6 +2,21 @@
  * evaluateObject.ts
  * Lexi-Lens — supabase/functions/evaluate/evaluateObject.ts
  *
+ * v4.7 — Compliance polish: prepend CHILD_SAFETY_PREFIX to the system prompt.
+ *   • Prefix is sourced from supabase/functions/_shared/childSafety.ts and is
+ *     applied uniformly to every Claude-using Edge Function in this project.
+ *   • Adds ~250 tokens to the system prompt — still well under any prompt
+ *     cache threshold (caching is not viable on Haiku 4.5 at current size
+ *     regardless; see roadmap). The runtime cost on Haiku at the project's
+ *     observed Q4 volume is below $0.50/month — material safety improvement
+ *     for negligible spend.
+ *   • Behavior change you may notice: when Claude is unsure whether the
+ *     scanned object should produce a meaningful verdict (e.g. an image
+ *     containing a person's face), it now returns generic placeholder
+ *     output (resolvedObjectName: "object", childFeedback: "Let's try
+ *     another scan!") rather than describing what it sees. This is the
+ *     fail-safe contract documented in the prefix.
+ *
  * v1.6.1 — Issue 1 fix: dead-code OR in xpAwarded
  * ─────────────────────────────────────────────────────
  * Dead code: xpAwarded used `overallMatch || passingCount > 0`
@@ -19,6 +34,10 @@
  * v1.6: Negative phrase + contradiction validation
  * v1.5: Mastery-aware Claude prompt
  */
+
+// ─── Imports ──────────────────────────────────────────────────────────────────
+
+import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -238,7 +257,9 @@ HOW TO USE THE MASTERY PROFILE:
 `
     : "";
 
-  return `You are an encouraging vocabulary coach for a child aged ${childAge}.
+  return `${CHILD_SAFETY_PREFIX}
+
+You are an encouraging vocabulary coach for a child aged ${childAge}.
 ${questName ? `Quest: "${questName}"` : ""}
 ${masterySection}
 Your task: evaluate whether the detected object genuinely demonstrates each required vocabulary property.

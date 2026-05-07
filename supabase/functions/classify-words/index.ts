@@ -2,6 +2,12 @@
  * supabase/functions/classify-words/index.ts
  * Lexi-Lens — N3: Mastery Radar Chart
  *
+ * v4.7 — Compliance polish: prepend CHILD_SAFETY_PREFIX to the system prompt.
+ *   Sourced from supabase/functions/_shared/childSafety.ts. Applied uniformly
+ *   to every Claude-using Edge Function. classify-words receives words that
+ *   have already passed through evaluate / generate-quest, so risk is low,
+ *   but the safety prefix is consistent project-wide. Adds ~250 tokens.
+ *
  * Classifies vocabulary words by sensory domain using Claude.
  * Writes results to the global `word_domains` lookup table, so each unique
  * word is classified ONCE across the entire user base — subsequent calls
@@ -42,6 +48,7 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.103.0";
+import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 
 // ─── Constants ────────────────────────────────────────────────────────────
 
@@ -210,7 +217,9 @@ async function classifyBatch(
     .map((w, i) => `${i + 1}. "${w.word}"${w.definition ? ` — ${w.definition}` : ""}`)
     .join("\n");
 
-  const systemPrompt = `You classify English vocabulary words by their primary sensory domain for a children's vocabulary game.
+  const systemPrompt = `${CHILD_SAFETY_PREFIX}
+
+You classify English vocabulary words by their primary sensory domain for a children's vocabulary game.
 
 Domains (assign each word to EXACTLY ONE):
 - texture:   how it feels to touch (fuzzy, smooth, rough, soft, hard, slippery, sticky, bumpy)
