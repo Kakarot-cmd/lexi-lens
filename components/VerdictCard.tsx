@@ -366,7 +366,6 @@ function ReportSheet({
                     placeholderTextColor="#6b5fa0"
                     multiline
                     maxLength={200}
-                    editable={state !== "sending"}
                   />
                   <View style={reportStyles.noteRow}>
                     <Text style={reportStyles.noteCount}>{note.length}/200</Text>
@@ -406,9 +405,6 @@ function ReportSheet({
 export function VerdictCard({
   status, result, error, masteryResult, cacheHit, scanAttemptId, onContinue, onTryAgain,
 }: VerdictCardProps) {
-	
-	  //console.log("[VerdictCard] scanAttemptId=", scanAttemptId, "status=", status);  // ← ADD THIS
-
   const insets    = useSafeAreaInsets();
   const slideAnim = useRef(new Animated.Value(CARD_H)).current;
 

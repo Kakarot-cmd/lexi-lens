@@ -208,12 +208,8 @@ export function initSentry(): string | null {
 
       // Scrub free-form text fields where secrets / emails could leak via
       // captureException(message) calls.
-      if (event.message) {
-        if (typeof event.message === "string") {
-          event.message = scrubString(event.message);
-        } else if (event.message.message) {
-          event.message.message = scrubString(event.message.message);
-        }
+      if (typeof event.message === "string") {
+        event.message = scrubString(event.message);
       }
       if (event.exception?.values) {
         for (const ex of event.exception.values) {
