@@ -1,43 +1,34 @@
 /**
- * evaluateObject.ts
+ * supabase/functions/evaluate/evaluateObject.ts
  * Lexi-Lens — supabase/functions/evaluate/evaluateObject.ts
  *
- * v4.7 — Compliance polish: prepend CHILD_SAFETY_PREFIX to the system prompt.
- *   • Prefix is sourced from supabase/functions/_shared/childSafety.ts and is
- *     applied uniformly to every Claude-using Edge Function in this project.
- *   • Adds ~250 tokens to the system prompt — still well under any prompt
- *     cache threshold (caching is not viable on Haiku 4.5 at current size
- *     regardless; see roadmap). The runtime cost on Haiku at the project's
- *     observed Q4 volume is below $0.50/month — material safety improvement
- *     for negligible spend.
- *   • Behavior change you may notice: when Claude is unsure whether the
- *     scanned object should produce a meaningful verdict (e.g. an image
- *     containing a person's face), it now returns generic placeholder
- *     output (resolvedObjectName: "object", childFeedback: "Let's try
- *     another scan!") rather than describing what it sees. This is the
- *     fail-safe contract documented in the prefix.
+ * v5.2.1 — Per-label resolved-name cache integration
+ *   • composeResultFromCachedOnly() now accepts an optional `resolvedName`
+ *     argument. When the per-label cache provides a model-corrected name
+ *     for the detectedLabel, the caller passes it through; otherwise the
+ *     function falls back to detectedLabel as in v5.2.0.
+ *   • No change to evaluateObject() itself — it always returns a fresh
+ *     model-produced resolvedObjectName, which the caller then writes to
+ *     the per-label cache so future full-hits can recover it.
  *
+ * v5.2 — Per-property cache integration
+ *   • New `previouslyEvaluatedProperties` option lets the caller pass in
+ *     property scores already retrieved from the per-property cache.
+ *   • Result combination happens inside this function. Returned
+ *     EvaluationResult contains the FULL property list (cached + fresh).
+ *
+ * v5.1 — Model provider abstraction (adapter argument)
+ * v4.7 — CHILD_SAFETY_PREFIX
  * v1.6.1 — Issue 1 fix: dead-code OR in xpAwarded
- * ─────────────────────────────────────────────────────
- * Dead code: xpAwarded used `overallMatch || passingCount > 0`
- * With some() semantics (ANY property passing → overallMatch=true),
- * the `|| passingCount > 0` branch is structurally unreachable:
- *   passingCount>0 → some() → overallMatch=true → first branch always fires.
- * When overallMatch=false (nothing passed), baseXp=0, so the OR branch
- * computed 0×passingCount×multiBonus=0 regardless — dead code.
- *
- * Fix (option A — clarity, zero behavior change):
- *   Remove the dead OR. overallMatch already encodes the gate.
- *   some() is preserved — it was correctly committed in April to allow
- *   multi-property quests where each scan targets a subset of properties.
- *
- * v1.6: Negative phrase + contradiction validation
- * v1.5: Mastery-aware Claude prompt
+ * v1.6  — Negative phrase + contradiction validation
+ * v1.5  — Mastery-aware system prompt
  */
 
 // ─── Imports ──────────────────────────────────────────────────────────────────
 
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
+import { ModelCallError }      from "../_shared/models/types.ts";
+import type { ModelAdapter }   from "../_shared/models/types.ts";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -59,7 +50,7 @@ export interface EvaluationResult {
   properties:         PropertyScore[];
   overallMatch:       boolean;
   childFeedback:      string;
-  nudgeHint?:         string;
+  nudgeHint?:         string | null;
   xpAwarded:          number;
 }
 
@@ -75,10 +66,18 @@ export interface MasteryEntry {
   timesUsed:   number;
 }
 
-interface EvaluateObjectOptions {
+export interface EvaluateObjectOptions {
   detectedLabel:      string;
   confidence:         number;
   frameBase64?:       string | null;
+  /**
+   * Properties that the model should evaluate this scan.
+   *
+   * v5.2: when the caller has already pulled some property scores from
+   * the per-property cache, requiredProperties contains ONLY the ones
+   * that missed cache. Cached scores arrive separately via
+   * `previouslyEvaluatedProperties`.
+   */
   requiredProperties: PropertyRequirement[];
   childAge:           number;
   failedAttempts?:    number;
@@ -86,15 +85,20 @@ interface EvaluateObjectOptions {
   masteryProfile?:    MasteryEntry[];
   /**
    * Words the child has already won in earlier scans this quest.
-   * Sent so Claude can acknowledge progress in feedback without
-   * re-evaluating them, AND so it doesn't claim a property "passes"
-   * for one that's no longer in the requiredProperties list.
+   * Different from previouslyEvaluatedProperties (which is per-property
+   * cache hits from THIS scan). alreadyFoundWords are stripped from
+   * evaluation; previouslyEvaluatedProperties are passed through to the
+   * final result with their cached scores intact.
    */
   alreadyFoundWords?: string[];
   /**
-   * XP FIX — per-quest XP rates from the DB (xp_reward_first_try / xp_reward_retry).
-   * When supplied the Edge Function uses these instead of the hardcoded constants so
-   * the value shown on the quest card matches what actually gets awarded.
+   * v5.2 — Property scores for the same scan that were retrieved from
+   * the per-property cache. Format: full PropertyScore objects whose
+   * `word` field matches words NOT in requiredProperties.
+   */
+  previouslyEvaluatedProperties?: PropertyScore[];
+  /**
+   * XP FIX — per-quest XP rates from the DB.
    */
   xpRates?: { firstTry: number; secondTry: number; thirdPlus: number };
 }
@@ -107,15 +111,11 @@ const CONTRADICTION_CAP       = 0.55;
 const XP_FIRST_TRY            = 40;
 const XP_SECOND_TRY           = 25;
 const XP_THIRD_PLUS           = 10;
-const MODEL                   = "claude-haiku-4-5-20251001";
-const MAX_TOKENS               = 700;
-const ANTHROPIC_API_URL        = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION        = "2023-06-01";
+const MAX_TOKENS              = 700;
 
 // ─── v1.6: Negative phrase validation ────────────────────────────────────────
 
 const NEGATIVE_PHRASES: string[] = [
-  // Direct negations
   "does not", "doesn't", "do not", "don't",
   "is not", "isn't", "are not", "aren't",
   "will not", "won't", "cannot", "can't",
@@ -126,14 +126,12 @@ const NEGATIVE_PHRASES: string[] = [
   "not applicable", "not qualify", "not qualif",
   "fails to", "fail to", "failed to",
   "lacks", "lack ", "lacking",
-  // Property-specific mismatches
   "not flexible", "not rigid", "not fragile", "not durable",
   "not translucent", "not transparent", "not opaque",
   "not smooth", "not rough", "not soft", "not hard",
   "not hollow", "not solid", "not porous",
   "not magnetic", "not conductive", "not insulating",
   "not buoyant", "not absorbent", "not reflective",
-  // Semantic contradiction markers
   "opposite of", "contrary to", "rather than", "the reverse",
   "instead of", "in contrast", "does the opposite",
   "fails the", "does not meet", "does not satisfy",
@@ -141,7 +139,6 @@ const NEGATIVE_PHRASES: string[] = [
 ];
 
 const HEDGING_PHRASES: string[] = [
-  // Epistemic hedges that weaken a confident score
   "might be", "could be", "may be", "possibly",
   "perhaps", "arguably", "debatable", "questionable",
   "it depends", "in some ways", "to some extent",
@@ -157,9 +154,6 @@ const HEDGING_PHRASES: string[] = [
 function validatePropertyScore(prop: PropertyScore): PropertyScore {
   const reasoning = prop.reasoning.toLowerCase();
 
-  // Hard rejection — clear negative language forces score to 0 regardless of
-  // what Claude's numeric score says (the "resonant for fabric" bug class).
-  // Only applies when score is below pass threshold — trust Claude when score >= 0.7.
   if (prop.score < PROPERTY_PASS_THRESHOLD) {
     const hardMatch = NEGATIVE_PHRASES.find((phrase) => reasoning.includes(phrase));
     if (hardMatch) {
@@ -167,7 +161,6 @@ function validatePropertyScore(prop: PropertyScore): PropertyScore {
     }
   }
 
-  // Hedging cap — applies when Claude scores confidently but hedges in language.
   if (prop.score >= CONTRADICTION_THRESHOLD) {
     const hedgeMatch = HEDGING_PHRASES.find((phrase) => reasoning.includes(phrase));
     if (hedgeMatch) {
@@ -183,24 +176,11 @@ function validatePropertyScore(prop: PropertyScore): PropertyScore {
   return prop;
 }
 
-// ─── applyNegativePhraseValidation ───────────────────────────────────────────
-
 export function applyNegativePhraseValidation(
   properties: PropertyScore[]
 ): { properties: PropertyScore[]; overallMatch: boolean } {
   const corrected = properties.map(validatePropertyScore);
-
-  // FIX v1.6.1: was `corrected.some(p => p.passes)` which made overallMatch=true
-  // whenever ANY property passed — causing the quest XP gate to fire on partial
-  // scans and making the `|| passingCount > 0` in xpAwarded unreachable dead code.
-  // Correct semantics: ALL required properties must pass for the quest to count.
-  // some() — not every(). Each scan evaluates only PENDING properties.
-  // A property passing in one scan is a genuine win; the quest tracks
-  // cumulative component.found flags, not overallMatch across all scans.
-  // Using every() here would require finding all remaining properties
-  // simultaneously in one frame, which is nearly impossible.
   const overallMatch = corrected.some((p) => p.passes);
-
   return { properties: corrected, overallMatch };
 }
 
@@ -247,12 +227,9 @@ ${formatMasteryProfile(masteryProfile)}
 
 HOW TO USE THE MASTERY PROFILE:
 - NOVICE words: Use the simplest language in your feedback. Be extra encouraging.
-  Celebrate even partial understanding. Keep sentences short.
 - DEVELOPING words: Normal age-appropriate language. Affirm progress explicitly.
 - PROFICIENT words: Use slightly richer vocabulary in your feedback.
-  Reference other words the child knows to build connections.
-- EXPERT words: The child is nearly done with this word. In your feedback, subtly
-  introduce richer synonyms or related concepts to prepare them for the next level.
+- EXPERT words: The child is nearly done with this word. Subtly introduce richer synonyms or related concepts.
 - If a quest word is NOVICE tier, your childFeedback MUST use simple vocabulary.
 `
     : "";
@@ -268,19 +245,16 @@ RULES:
 1. Score each property 0.0–1.0. A score >= 0.7 means the property passes.
 2. Be honest and precise — do NOT give benefit of the doubt if the match is weak.
 3. If the object clearly does NOT have a property, say so directly in your reasoning.
-   Do not soften rejections with hedging language and a high score.
 4. Set overallMatch to true if ANY of the listed properties pass.
-   (The quest tracks completion across multiple scans — each scan only
-   evaluates the properties still pending. One passing property is a win.)
 5. childFeedback must be 1 short sentence appropriate for age ${childAge}.
-   Name every property that passed. If none passed, give one gentle observation.
+   Name every property that passed — INCLUDING properties from the "Already evaluated" list if any are shown in the user message. If none passed, give one gentle observation.
 6. nudgeHint: only if failedAttempts >= 2. Guide without naming the answer.
 
 CONSISTENCY (critical — do not violate):
-- The "properties" array MUST contain one entry per word listed in the user message.
-- Use each property word with the EXACT spelling and case as listed — no capitalisation, pluralisation, or rewording.
-- Do NOT include any word that wasn't listed (especially not words from "Already won this quest").
-- childFeedback may ONLY reference property words that have passes:true in the JSON. Never claim a property passed in feedback while marking it passes:false in the JSON, or vice versa.
+- The "properties" array MUST contain one entry per word listed under "Properties to evaluate THIS scan" — no more, no fewer.
+- Use each property word with the EXACT spelling and case as listed.
+- Do NOT include any word that wasn't listed under "Properties to evaluate THIS scan" (especially not words from "Already won this quest" or "Already evaluated").
+- childFeedback may reference words from "Already evaluated" only if they passed there. Never claim a property passed that has passes:false in the JSON.
 
 Respond ONLY with valid JSON — no preamble, no markdown fences:
 {
@@ -296,12 +270,7 @@ Respond ONLY with valid JSON — no preamble, no markdown fences:
 
 // ─── User message builder ─────────────────────────────────────────────────────
 
-type TextBlock  = { type: "text";  text: string };
-type ImageBlock = { type: "image"; source: { type: "base64"; media_type: "image/jpeg"; data: string } };
-
-function buildUserMessage(
-  opts: EvaluateObjectOptions
-): Array<TextBlock | ImageBlock> {
+function buildUserText(opts: EvaluateObjectOptions): string {
   const propertyList = opts.requiredProperties
     .map(
       (p) =>
@@ -325,156 +294,137 @@ function buildUserMessage(
           .join("\n")
       : null;
 
-  // FIX (chip-stuck-grey): include already-found words so Claude doesn't
-  // pretend they're being re-evaluated, AND so feedback can naturally
-  // celebrate cumulative progress without referencing words off the list.
   const alreadyFoundContext =
     opts.alreadyFoundWords && opts.alreadyFoundWords.length > 0
       ? `\nAlready won this quest (do NOT include these in your "properties" array — they are off the table for this scan): ${opts.alreadyFoundWords.join(", ")}\n`
       : "";
 
-  const textBlock: TextBlock = {
-    type: "text",
-    text: `The child's camera detected: "${opts.detectedLabel}" (Vision confidence: ${(
-      opts.confidence * 100
-    ).toFixed(0)}%).
+  const previouslyEvaluatedContext =
+    opts.previouslyEvaluatedProperties && opts.previouslyEvaluatedProperties.length > 0
+      ? `\nAlready evaluated for THIS scan (per-property cache hits — do NOT include in your "properties" array, but DO mention any passing ones in childFeedback):\n${
+          opts.previouslyEvaluatedProperties
+            .map((p) => `  • "${p.word}" → score ${p.score.toFixed(2)}, passes=${p.passes} (reasoning: ${p.reasoning})`)
+            .join("\n")
+        }\n`
+      : "";
 
-These are the properties to evaluate for THIS scan (one or more is enough — the quest tracks completion across multiple scans):
+  const failedAttempts = opts.failedAttempts ?? 0;
+
+  return `The child's camera detected: "${opts.detectedLabel}" (Vision confidence: ${(
+    opts.confidence * 100
+  ).toFixed(0)}%).
+
+Properties to evaluate THIS scan (one or more is enough — the quest tracks completion across multiple scans):
 ${propertyList}
-${alreadyFoundContext}${
+${alreadyFoundContext}${previouslyEvaluatedContext}${
   propertyMasteryContext
     ? `\nMastery context for quest words:\n${propertyMasteryContext}\n`
     : ""
 }
-Failed attempts so far: ${opts.failedAttempts ?? 0}
+Failed attempts so far: ${failedAttempts}
 
-Evaluate whether "${opts.detectedLabel}" satisfies each of the listed properties. Return one entry per listed property, using the exact word as written above.
+Evaluate whether "${opts.detectedLabel}" satisfies each property listed under "Properties to evaluate THIS scan". Return one entry per such property, using the exact word as written above.
 ${
-  opts.failedAttempts && opts.failedAttempts >= 2
+  failedAttempts >= 2
     ? "The child has struggled. Include a gentle nudgeHint that guides without naming the object."
     : "Set nudgeHint to null."
-}`,
-  };
-
-  if (opts.frameBase64) {
-    const imageBlock: ImageBlock = {
-      type:   "image",
-      source: {
-        type:       "base64",
-        media_type: "image/jpeg",
-        data:       opts.frameBase64,
-      },
-    };
-    return [imageBlock, textBlock];
-  }
-
-  return [textBlock];
+}`;
 }
 
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 export async function evaluateObject(
-  opts: EvaluateObjectOptions
+  opts:    EvaluateObjectOptions,
+  adapter: ModelAdapter,
 ): Promise<EvaluationResult> {
 
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set in Edge Function environment");
-
-  const response = await fetch(ANTHROPIC_API_URL, {
-    method:  "POST",
-    headers: {
-      "Content-Type":      "application/json",
-      "x-api-key":         apiKey,
-      "anthropic-version": ANTHROPIC_VERSION,
-    },
-    body: JSON.stringify({
-      model:    MODEL,
-      max_tokens: MAX_TOKENS,
-      system:   buildSystemPrompt(opts.childAge, opts.questName, opts.masteryProfile),
-      messages: [
-        {
-          role:    "user",
-          content: buildUserMessage(opts),
-        },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "(unreadable)");
-    throw new Error(`Anthropic API error ${response.status}: ${errText}`);
+  if (opts.requiredProperties.length === 0) {
+    throw new Error(
+      "evaluateObject called with empty requiredProperties — caller should " +
+      "use composeResultFromCachedOnly when all properties hit per-property cache."
+    );
   }
 
-  const apiResponse = await response.json() as {
-    content: Array<{ type: string; text?: string }>;
-  };
+  // ── 1. Build prompts ─────────────────────────────────────────────────────
+  const systemPrompt = buildSystemPrompt(
+    opts.childAge,
+    opts.questName,
+    opts.masteryProfile,
+  );
+  const userText = buildUserText(opts);
 
-  const rawText = apiResponse.content
-    .filter((b) => b.type === "text")
-    .map((b)   => b.text ?? "")
-    .join("");
+  // ── 2. Call the model via adapter ────────────────────────────────────────
+  let rawText: string;
+  try {
+    const result = await adapter.call({
+      systemPrompt,
+      userText,
+      imageBase64: opts.frameBase64 ?? undefined,
+      maxTokens:   MAX_TOKENS,
+      jsonMode:    true,
+    });
+    rawText = result.rawText;
+  } catch (e) {
+    if (e instanceof ModelCallError) {
+      throw new Error(`${e.modelId} API error ${e.status ?? ""}: ${e.bodyExcerpt || e.message}`);
+    }
+    throw e;
+  }
 
+  // ── 3. Parse JSON ────────────────────────────────────────────────────────
   let parsed: Omit<EvaluationResult, "xpAwarded">;
   try {
     const clean = rawText.replace(/```json|```/g, "").trim();
     parsed = JSON.parse(clean);
   } catch {
-    throw new Error(`Claude returned non-JSON: ${rawText.slice(0, 200)}`);
+    throw new Error(`Model returned non-JSON: ${rawText.slice(0, 200)}`);
   }
 
   if ((parsed as Record<string, unknown>).error === "unable_to_evaluate") {
     throw new Error("Frame could not be evaluated safely.");
   }
 
-  // v1.6: Apply negative phrase + contradiction validation BEFORE computing XP
-  const { properties: validatedProperties, overallMatch: validatedMatch } =
-    applyNegativePhraseValidation(parsed.properties);
+  // ── 4. Negative-phrase + hedging validation on FRESH properties only ─────
+  const { properties: validatedFresh } = applyNegativePhraseValidation(parsed.properties);
 
-  const correctedResult = {
-    ...parsed,
-    properties:   validatedProperties,
-    overallMatch: validatedMatch,
-  };
+  // ── 5. Combine fresh + cached into the final property list ───────────────
+  const cached = opts.previouslyEvaluatedProperties ?? [];
+  const combinedProperties: PropertyScore[] = [...validatedFresh, ...cached];
+  const combinedOverallMatch = combinedProperties.some((p) => p.passes);
 
+  // ── 6. XP calculation against COMBINED count ─────────────────────────────
   const attempts = opts.failedAttempts ?? 0;
 
-  // Per-quest XP rates — fall back to module constants when not provided
   const rates = opts.xpRates ?? {
     firstTry:  XP_FIRST_TRY,
     secondTry: XP_SECOND_TRY,
     thirdPlus: XP_THIRD_PLUS,
   };
 
-  // ── XP v1.6.1: dead-code removal ────────────────────────────────────────────
-  // Old code: xpAwarded = (overallMatch || passingCount > 0) ? ...
-  // With some() semantics, passingCount>0 → overallMatch=true, so
-  // the OR branch was structurally unreachable. When overallMatch=false
-  // (nothing passed), baseXp=0, making the OR also compute 0. Dead either way.
-  // Removed the OR — overallMatch is the sole, readable gate.
-  // ─────────────────────────────────────────────────────────────────────────────
-
-  const passingCount = correctedResult.properties.filter((p) => p.passes).length;
+  const passingCount = combinedProperties.filter((p) => p.passes).length;
   const multiBonus   = passingCount >= 3 ? 2.0 : passingCount === 2 ? 1.5 : 1.0;
 
-  const baseXp = correctedResult.overallMatch
+  const baseXp = combinedOverallMatch
     ? attempts === 0 ? rates.firstTry
     : attempts === 1 ? rates.secondTry
     : rates.thirdPlus
     : 0;
 
-  // Dead-code fix (Issue 1): with some() above, overallMatch=true whenever
-  // passingCount>0, so the old `|| passingCount > 0` OR was never reached.
-  // Removed for clarity — overallMatch already encodes the gate.
-  const xpAwarded = correctedResult.overallMatch
+  const xpAwarded = combinedOverallMatch
     ? Math.round(baseXp * passingCount * multiBonus)
     : 0;
 
-  return { ...correctedResult, xpAwarded };
+  return {
+    resolvedObjectName: parsed.resolvedObjectName,
+    properties:         combinedProperties,
+    overallMatch:       combinedOverallMatch,
+    childFeedback:      parsed.childFeedback,
+    nudgeHint:          parsed.nudgeHint ?? null,
+    xpAwarded,
+  };
 }
 
 // ─── computeXp (exported for unit tests) ─────────────────────────────────────
-//
-// Mirrors the inline math in evaluateObject() exactly — keep in sync.
 
 export interface XpRates { firstTry: number; secondTry: number; thirdPlus: number; }
 
@@ -502,4 +452,54 @@ export function computeXp(opts: {
   return opts.overallMatch
     ? Math.round(baseXp * passingCount * multiBonus)
     : 0;
+}
+
+// ─── Templated childFeedback for full per-property cache hits ────────────────
+
+export function buildTemplatedFeedback(passingWords: string[]): string {
+  if (passingWords.length === 0) {
+    return "Hmm, that doesn't quite match — try a different angle!";
+  }
+  if (passingWords.length === 1) {
+    return `You found something ${passingWords[0]}!`;
+  }
+  if (passingWords.length === 2) {
+    return `Nice! You found something ${passingWords[0]} and ${passingWords[1]}!`;
+  }
+  const head = passingWords.slice(0, -1).join(", ");
+  const tail = passingWords[passingWords.length - 1];
+  return `Amazing! You found ${head}, and ${tail}!`;
+}
+
+// ─── Compose from cached only (no model call) ────────────────────────────────
+//
+// v5.2.1: now accepts an optional resolvedName from the per-label cache.
+// When supplied (per-label cache hit), the kid sees the model-corrected
+// name (e.g. "remote control" instead of ML Kit's "Mobile phone").
+// When undefined (per-label cache miss), falls back to detectedLabel.
+
+export function composeResultFromCachedOnly(
+  detectedLabel:    string,
+  cachedProperties: PropertyScore[],
+  failedAttempts:   number,
+  xpRates?:         XpRates,
+  resolvedName?:    string,
+): EvaluationResult {
+  const overallMatch = cachedProperties.some((p) => p.passes);
+  const passingWords = cachedProperties.filter((p) => p.passes).map((p) => p.word);
+  const xpAwarded    = computeXp({
+    overallMatch,
+    properties:     cachedProperties,
+    failedAttempts,
+    xpRates,
+  });
+
+  return {
+    resolvedObjectName: resolvedName && resolvedName.length > 0 ? resolvedName : detectedLabel,
+    properties:         cachedProperties,
+    overallMatch,
+    childFeedback:      buildTemplatedFeedback(passingWords),
+    nudgeHint:          null,
+    xpAwarded,
+  };
 }

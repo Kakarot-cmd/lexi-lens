@@ -2,99 +2,128 @@
  * supabase/functions/evaluate/index.ts
  * Lexi-Lens — Supabase Edge Function entry point.
  *
- * v4.7 update — Compliance polish: scan_attempt_id surfaced to client
- *   • logScanResult and logScanCacheHit now return the inserted row's id.
- *     The id is returned to the client as `_scanAttemptId` on the verdict
- *     response so the in-app "Report this verdict" button can link a
- *     report to a specific scan_attempts row via the new
- *     report-verdict Edge Function.
- *   • Both cache-hit and Claude-call paths return the id. The cache-hit
- *     path needed it because cached verdicts are equally reportable.
- *   • logScanBlocked is unchanged — blocked attempts are not reportable
- *     (no verdict was rendered to the child).
- *   • Behaviour change: the response shape gains one field. Older clients
- *     ignoring unknown keys are unaffected.
+ * v5.2.1 — Per-label resolved-name cache (Option B)
  *
- * v4.5 update (this file): cache_hit observability
- *   • Cache hits now write a lightweight row to scan_attempts with
- *     cache_hit=true and claude_latency_ms=null. Previously cache hits were
- *     invisible to product analytics — we couldn't measure hit rate, couldn't
- *     correlate cache effectiveness to retention, and the SQL queries we
- *     wrote against claude_latency_ms returned only Claude-call rows by
- *     accident.
- *   • The Claude-success path now sets cache_hit=false explicitly (was
- *     relying on the column DEFAULT — fine, but explicit is cheaper to
- *     read).
- *   • Cache-hit responses now include _rateLimit so the client UI's
- *     scansToday counter stays consistent (cache hits don't increment it,
- *     but the client should see a fresh value rather than a stale one).
- *   • REQUIRED COMPANION MIGRATION: 20260506_add_cache_hit_observability.sql
- *     adds the cache_hit column AND updates get_daily_scan_count to exclude
- *     cache_hit=true rows so re-scans don't burn quota slots. Deploy the
- *     migration BEFORE this file.
+ *   Targets one specific user-facing degradation that landed in v5.2:
+ *   on FULL per-property cache hit, the kid was seeing ML Kit's raw label
+ *   ("Mobile phone") instead of the model-corrected name ("remote
+ *   control") that the bundle cache used to preserve.
  *
- * v4.4 fix: iOS cross-scan property bleed
- *   • Symptom: scanning a matchstick on iOS returned a cached "gold ring"
- *     verdict from a previous scan — instant (<200 ms), wrong identification.
- *   • Cause: useObjectScanner.ts iOS path falls back to detectedLabel="object"
- *     because there is no ML Kit on iOS. Cache key = (label, questId,
- *     pendingWords) — so within any (questId, pendingWords) tuple, every
- *     distinct physical object scanned on iOS produces the IDENTICAL cache
- *     key. Cache hit returns whatever was last stored for that key.
- *   • Fix: skip cache GET (Section 4) and SET (Section 7) when detectedLabel
- *     is too generic to distinguish physical objects. Android scans (real
- *     ML Kit labels) are unaffected.
+ *   Mechanism:
  *
- * Phase 3.5 — Rate Limiting + Abuse Prevention:
- *   • IP-level rate limit: max 20 requests/IP/minute (brute-force shield)
- *   • Daily child quota: max 50 Claude calls/child/day (get_daily_scan_count RPC)
- *   • All calls logged to scan_attempts (existing table — real column names)
- *   • Parent alert flag in response when child hits 80% / 100% of daily quota
- *   • HTTP 429 with structured body for quota + IP limit errors
+ *     • New per-label cache:  <env>:lexi:eval:resolved:<hash(label)>
+ *       Value: { name: string, _modelId: string }
  *
- * Phase 3.4 — Redis Response Caching:
- *   • Cache check/set via Upstash Redis (key = hash(label+questId), TTL 7d)
+ *     • Read path: on FULL per-property hit only, look up the resolved
+ *       name. If found, pass it to composeResultFromCachedOnly so the kid
+ *       sees the corrected label. If not found, fall back to the raw
+ *       detectedLabel (v5.2.0 behaviour).
+ *
+ *     • Write path: every successful model response (full miss OR partial
+ *       hit) writes the model's resolvedObjectName to this cache, fire-
+ *       and-forget. Cache builds up organically — no backfill needed.
+ *
+ *   Cost: zero additional model calls. The corrected name comes from
+ *   responses you're already paying for.
+ *
+ *   Latency:
+ *     • Full-hit path:    +10-30ms (one extra Upstash GET on a path that
+ *                                   was already ~300ms — imperceptible).
+ *     • Partial-hit path: +0ms perceived (one extra fire-and-forget SET).
+ *     • Full-miss path:   +0ms perceived (same fire-and-forget SET).
+ *
+ *   Recovers: model-corrected resolvedObjectName on full hits.
+ *   Still templated on full hit: childFeedback. Defer to Option C if/when
+ *   real-user data shows kids notice template repetition.
+ *
+ * v5.2 — Per-property cache refactor (Phase 4.8)
+ * v5.1 — Model provider abstraction + shared cache namespace
+ * v4.7 — scan_attempt_id on response (verdict reporting)
+ * v4.5 — cache_hit observability
+ * v4.4 — iOS cross-scan property bleed (generic-label cache bypass)
  *
  * scan_attempts columns used here:
  *   child_id, quest_id, detected_label, vision_confidence,
  *   resolved_name, overall_match, property_scores, child_feedback,
  *   xp_awarded, claude_latency_ms, ip_hash, rate_limited, cache_hit
- *
- * Execution order:
- *   1. CORS preflight + body parse
- *   2. IP rate limit check  (ip_rate_limits table, 20 req/min)
- *   3. Daily quota check    (get_daily_scan_count RPC, 50/day)
- *   4. Redis cache check    (skipped for generic labels — iOS bleed fix)
- *                           ↪ on hit: log cache row, return with _rateLimit
- *   5. Claude evaluation
- *   6. INSERT scan_attempts (cache_hit=false)
- *   7. Cache the successful result (cacheSet)
- *   8. Return result + alert flags
  */
 
 import { serve }        from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { evaluateObject } from "./evaluateObject.ts";
+
+import {
+  evaluateObject,
+  composeResultFromCachedOnly,
+  type PropertyRequirement,
+  type PropertyScore,
+} from "./evaluateObject.ts";
+import { getModelAdapter } from "../_shared/models/index.ts";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DAILY_SCAN_LIMIT    = 50;
-const ALERT_THRESHOLD_PCT = 0.80;   // 80% → warn parent
+const ALERT_THRESHOLD_PCT = 0.80;
 const IP_LIMIT_PER_MINUTE = 20;
 const IP_WINDOW_MS        = 60_000;
 
-// v4.4 — labels too generic to safely identify a physical object.
-// On iOS there is no ML Kit, so detectedLabel is always one of these.
-// Caching against these labels causes cross-scan bleed — see Section 4.
 const GENERIC_LABELS = new Set(["", "object", "unknown", "thing", "item"]);
 
-// ─── Redis helpers (Upstash — Phase 3.4) ─────────────────────────────────────
+// ─── Redis helpers (Upstash) ─────────────────────────────────────────────────
 
 const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL")   ?? "";
 const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
 const CACHE_TTL_S = 14 * 24 * 60 * 60; // 14 days
 
-async function cacheGet(key: string): Promise<unknown | null> {
+// ─── Cache env namespace (per-Supabase-project) ──────────────────────────────
+
+const ENV_NAME: string = (() => {
+  const fromEnv = Deno.env.get("CACHE_ENV_NAMESPACE")?.trim().toLowerCase();
+  if (fromEnv && /^[a-z0-9_-]+$/.test(fromEnv)) return fromEnv;
+  console.warn(
+    "[evaluate] CACHE_ENV_NAMESPACE not set or invalid — using 'default'."
+  );
+  return "default";
+})();
+
+// ─── Normalisation (shared by both cache key builders) ───────────────────────
+
+function normalize(s: string): string {
+  return s.toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/([a-z]{2,})([^se])s\b/g, "$1$2");
+}
+
+// ─── Per-property cache key (v5.2) ───────────────────────────────────────────
+//
+// Format: <env>:lexi:eval:prop:<base64(normalize(label) :: normalize(word))>
+
+function buildPerPropCacheKey(label: string, word: string): string {
+  const raw = `${normalize(label)}::${normalize(word)}`;
+  return `${ENV_NAME}:lexi:eval:prop:${btoa(raw).replace(/=/g, "")}`;
+}
+
+// ─── Per-label resolved-name cache key (v5.2.1) ──────────────────────────────
+//
+// Format: <env>:lexi:eval:resolved:<base64(normalize(label))>
+//
+// Different namespace from per-property cache (`:resolved:` vs `:prop:`),
+// so they coexist cleanly. Same normalisation rules — case insensitive,
+// plural-aware — so "Apple" and "apples" share the same cached resolved
+// name. Same TTL.
+
+function buildResolvedNameCacheKey(label: string): string {
+  const raw = normalize(label);
+  return `${ENV_NAME}:lexi:eval:resolved:${btoa(raw).replace(/=/g, "")}`;
+}
+
+// ─── Per-property cache GET ──────────────────────────────────────────────────
+
+interface CachedPropertyScore extends PropertyScore {
+  _modelId?: string;
+}
+
+async function cacheGetProp(key: string): Promise<CachedPropertyScore | null> {
   if (!REDIS_URL) return null;
   try {
     const res  = await fetch(`${REDIS_URL}/get/${key}`, {
@@ -105,45 +134,32 @@ async function cacheGet(key: string): Promise<unknown | null> {
 
     const parsed = JSON.parse(json.result);
 
-    // Shape validation — guard against old broken-format cache entries.
-    //
-    // The previous cacheSet sent { value: JSON.stringify(result), ex: TTL }
-    // as a JSON object body to POST /set/{key}. Upstash stored that entire
-    // object as the Redis string value. cacheGet then returned:
-    //   { value: "{...}", ex: 604800 }
-    // — an object with no resolvedObjectName / properties / childFeedback.
-    // VerdictCard spread it, got blank fields, rendered an empty card
-    // with only "Almost..." and the ⚡ Instant badge visible.
-    //
-    // Fix: require the three fields that every valid EvaluationResult must
-    // have. Any entry missing them (old format, corruption, schema change)
-    // is treated as a cache miss — Claude runs fresh and stores correctly.
     if (
       !parsed ||
       typeof parsed !== "object" ||
-      typeof parsed.resolvedObjectName !== "string" ||
-      !Array.isArray(parsed.properties) ||
-      typeof parsed.childFeedback !== "string"
+      typeof parsed.word      !== "string" ||
+      typeof parsed.score     !== "number" ||
+      typeof parsed.reasoning !== "string" ||
+      typeof parsed.passes    !== "boolean"
     ) {
-      console.warn("[cacheGet] Stale/invalid cache entry — treating as miss");
+      console.warn("[cacheGetProp] Stale/invalid entry — treating as miss");
       return null;
     }
 
-    return parsed;
+    return parsed as CachedPropertyScore;
   } catch {
     return null;
   }
 }
 
-async function cacheSet(key: string, value: unknown): Promise<void> {
+// ─── Per-property cache SET ──────────────────────────────────────────────────
+
+async function cacheSetProp(
+  key:     string,
+  prop:    PropertyScore,
+  modelId: string,
+): Promise<void> {
   if (!REDIS_URL) return;
-  // BUG FIX: previous implementation sent { value, ex } as a JSON object in the
-  // body to POST /set/{key} — that is NOT the Upstash REST API format.
-  // Upstash expects a Redis command array sent to the base URL:
-  //   POST {REDIS_URL}
-  //   Body: ["SET", "key", "serialized_value", "EX", ttl_seconds]
-  // The previous format was silently accepted (HTTP 200) but stored nothing,
-  // so every subsequent GET returned null and the cache never hit.
   try {
     await fetch(REDIS_URL, {
       method:  "POST",
@@ -151,59 +167,84 @@ async function cacheSet(key: string, value: unknown): Promise<void> {
         Authorization:  `Bearer ${REDIS_TOKEN}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(["SET", key, JSON.stringify(value), "EX", CACHE_TTL_S]),
+      body: JSON.stringify([
+        "SET",
+        key,
+        JSON.stringify({ ...prop, _modelId: modelId }),
+        "EX",
+        CACHE_TTL_S,
+      ]),
     });
   } catch { /* non-fatal */ }
 }
 
+// ─── Per-label resolved-name cache GET (v5.2.1) ──────────────────────────────
+//
+// Returns null when the cache has nothing for this label, when the entry
+// is malformed, or when Upstash is unreachable. Caller treats null as
+// "use detectedLabel as the resolved name" — the v5.2.0 behaviour.
 
+interface CachedResolvedName {
+  name:      string;
+  _modelId?: string;
+}
 
-const ENV_NAME: string = (() => {
-  const fromEnv = Deno.env.get("CACHE_ENV_NAMESPACE")?.trim().toLowerCase();
-  if (fromEnv && /^[a-z0-9_-]+$/.test(fromEnv)) return fromEnv;
-  // Fail-safe: don't silently collide. "default" is distinct from both
-  // "staging" and "prod", so a misconfigured project at least lands in its
-  // own keyspace, and the warning surfaces in Edge Function logs.
-  console.warn(
-    "[buildCacheKey] CACHE_ENV_NAMESPACE not set or invalid — using 'default'. " +
-    "Set this secret on each Supabase project to avoid cross-env cache collision."
-  );
-  return "default";
-})();
+async function cacheGetResolvedName(key: string): Promise<CachedResolvedName | null> {
+  if (!REDIS_URL) return null;
+  try {
+    const res  = await fetch(`${REDIS_URL}/get/${key}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+    const json = await res.json();
+    if (!json.result) return null;
 
-// ─── REPLACE the existing buildCacheKey function with this version ───────────
+    const parsed = JSON.parse(json.result);
+    if (!parsed || typeof parsed !== "object" || typeof parsed.name !== "string") {
+      console.warn("[cacheGetResolvedName] Stale/invalid entry — treating as miss");
+      return null;
+    }
 
-function buildCacheKey(
+    return parsed as CachedResolvedName;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Per-label resolved-name cache SET (v5.2.1) ──────────────────────────────
+//
+// Called fire-and-forget after every successful model response. Stamps the
+// model id alongside the name so we have lineage — useful if you ever need
+// to selectively purge by model. We skip writes when the corrected name
+// equals the raw label (no signal worth caching) and when the label was
+// generic ("object", "thing", etc.) where ML Kit gave us nothing useful
+// to correct in the first place.
+
+async function cacheSetResolvedName(
+  key:           string,
+  name:          string,
+  modelId:       string,
   detectedLabel: string,
-  questId:       string,
-  pendingWords:  string[]
-): string {
-  // v4.5: Tier 1 normalisation — collapse case, internal whitespace, and
-  // simple English plurals so "Gold Ring" / "gold ring" / "Gold Rings" all
-  // hit the same cache entry.
-  //
-  // Plural rule is conservative: only strips trailing 's' when preceded by
-  // a letter that is NOT 's' and NOT 'e'. So:
-  //   "rings"    → "ring"     ✓ (g before s)
-  //   "books"    → "book"     ✓ (k before s)
-  //   "glass"    → "glass"    ✓ (ss preserved — second s before s blocks)
-  //   "glasses"  → "glasses"  ✓ (es preserved — e before s blocks)
-  //   "boxes"    → "boxes"    ✓ (es preserved — suboptimal but safe)
-  //   "phones"   → "phones"   ✓ (e before s blocks — miss, accepted cost)
-  //
-  // Trade-off: we miss vowel+s plurals (apples, phones, shoes) to guarantee
-  // we never wrong-collapse glass↔glasses or similar.
-  //
-  // v4.7: env-prefix added to the returned key (see ENV_NAME above).
-  const normalize = (s: string) =>
-    s.toLowerCase()
-     .trim()
-     .replace(/\s+/g, " ")
-     .replace(/([a-z]{2,})([^se])s\b/g, "$1$2");
+): Promise<void> {
+  if (!REDIS_URL)                                          return;
+  if (!name || name.trim().length === 0)                   return;
+  if (normalize(name) === normalize(detectedLabel))        return;
 
-  const sortedWords = [...pendingWords].map(normalize).sort().join(",");
-  const raw         = `${normalize(detectedLabel)}::${questId}::${sortedWords}`;
-  return `${ENV_NAME}:lexi:eval:${btoa(raw).replace(/=/g, "")}`;
+  try {
+    await fetch(REDIS_URL, {
+      method:  "POST",
+      headers: {
+        Authorization:  `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify([
+        "SET",
+        key,
+        JSON.stringify({ name, _modelId: modelId }),
+        "EX",
+        CACHE_TTL_S,
+      ]),
+    });
+  } catch { /* non-fatal */ }
 }
 
 // ─── IP rate limit ────────────────────────────────────────────────────────────
@@ -250,26 +291,6 @@ async function checkIpRateLimit(
 }
 
 // ─── scan_attempts loggers ────────────────────────────────────────────────────
-//
-// Three writers, three semantics:
-//   logScanBlocked   — call was blocked before Claude ran (rate limit / error)
-//   logScanResult    — Claude ran and returned a full evaluation (cache_hit=false)
-//   logScanCacheHit  — served from Redis cache (cache_hit=true, no Claude)
-//
-// Column mapping against scan_attempts schema:
-//   child_id          ← childId
-//   quest_id          ← questId
-//   detected_label    ← detectedLabel
-//   vision_confidence ← confidence
-//   ip_hash           ← ipHash             (Phase 3.5)
-//   rate_limited      ← isRateLimited      (Phase 3.5)
-//   resolved_name     ← result.resolvedObjectName
-//   overall_match     ← result.overallMatch
-//   property_scores   ← result.properties  (jsonb)
-//   child_feedback    ← result.childFeedback
-//   xp_awarded        ← result.xpAwarded
-//   claude_latency_ms ← claudeLatencyMs    (null on cache hit)
-//   cache_hit         ← cacheHit           (v4.5 — observability)
 
 async function logScanBlocked(
   supabase: ReturnType<typeof createClient>,
@@ -337,21 +358,6 @@ async function logScanResult(
   }
 }
 
-// v4.5 — NEW: log a row for a Redis cache hit so we can measure hit rate
-// from data instead of inferring from latency. claude_latency_ms is left
-// null deliberately — that's the unambiguous "no Claude call" signal.
-//
-// IMPORTANT: companion migration updates get_daily_scan_count to exclude
-// cache_hit=true rows, so this insert does NOT cause re-scans to burn
-// quota. Deploy the migration before this file.
-interface CachedEvaluation {
-  resolvedObjectName: string;
-  properties:         unknown;
-  overallMatch:       boolean;
-  childFeedback:      string;
-  xpAwarded:          number;
-}
-
 async function logScanCacheHit(
   supabase: ReturnType<typeof createClient>,
   opts: {
@@ -360,7 +366,7 @@ async function logScanCacheHit(
     detectedLabel: string;
     confidence?:   number;
     ipHash?:       string;
-    cachedResult:  CachedEvaluation;
+    result:        Awaited<ReturnType<typeof evaluateObject>>;
   }
 ): Promise<string | null> {
   try {
@@ -371,12 +377,12 @@ async function logScanCacheHit(
       vision_confidence: opts.confidence     ?? null,
       ip_hash:           opts.ipHash         ?? null,
       rate_limited:      false,
-      resolved_name:     opts.cachedResult.resolvedObjectName,
-      overall_match:     opts.cachedResult.overallMatch,
-      property_scores:   opts.cachedResult.properties,
-      child_feedback:    opts.cachedResult.childFeedback,
-      xp_awarded:        opts.cachedResult.xpAwarded,
-      claude_latency_ms: null,   // signal: no Claude call
+      resolved_name:     opts.result.resolvedObjectName,
+      overall_match:     opts.result.overallMatch,
+      property_scores:   opts.result.properties,
+      child_feedback:    opts.result.childFeedback,
+      xp_awarded:        opts.result.xpAwarded,
+      claude_latency_ms: null,   // signal: no model call
       cache_hit:         true,
     }).select("id").single();
     if (error) {
@@ -410,10 +416,6 @@ function utcMidnight(): string {
   return d.toISOString();
 }
 
-// Helper — alert flags shape used by both the cache-hit and Claude-call
-// response paths. Extracted so the two paths produce identical _rateLimit
-// envelopes; the only difference is the scansToday value (cache hits don't
-// increment, Claude calls do).
 function buildAlertFlags(scansToday: number) {
   return {
     scansToday,
@@ -456,13 +458,11 @@ serve(async (req: Request) => {
     failedAttempts,
     masteryProfile,
     alreadyFoundWords,
-    // XP FIX: per-quest XP rates sent by useLexiEvaluate from the quest DB row
     xp_reward_first_try,
     xp_reward_retry,
     xp_reward_third_plus,
   } = body as Record<string, unknown>;
 
-  // Build xpRates — use quest DB values so awarded XP matches what the card shows.
   const xpRates = {
     firstTry:  typeof xp_reward_first_try  === "number" ? xp_reward_first_try  : 40,
     secondTry: typeof xp_reward_retry      === "number" ? xp_reward_retry      : 25,
@@ -476,7 +476,10 @@ serve(async (req: Request) => {
     return jsonResponse({ error: "detectedLabel is required" }, 400);
   }
 
-  // ── 2. IP rate limit ──────────────────────────────────────────────────────
+  // ── 2. Resolve model adapter ──────────────────────────────────────────────
+  const adapter = await getModelAdapter("evaluate", supabase);
+
+  // ── 3. IP rate limit ──────────────────────────────────────────────────────
   const rawIp  = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim()
               ?? req.headers.get("cf-connecting-ip")
               ?? "unknown";
@@ -506,14 +509,13 @@ serve(async (req: Request) => {
     );
   }
 
-  // ── 3. Daily child quota ──────────────────────────────────────────────────
+  // ── 4. Daily child quota ──────────────────────────────────────────────────
   const { data: scanCount, error: rpcError } = await supabase.rpc(
     "get_daily_scan_count",
     { p_child_id: childId }
   );
 
   if (rpcError) {
-    // Fail open — let the scan through rather than blocking on a DB hiccup
     console.error("[evaluate] get_daily_scan_count RPC error:", rpcError);
   }
 
@@ -542,106 +544,132 @@ serve(async (req: Request) => {
     );
   }
 
-  // ── 4. Redis cache check ──────────────────────────────────────────────────
-  // Pending words from this scan are baked into the cache key — see
-  // buildCacheKey for the rationale.
-  //
-  // iOS BLEED FIX (v4.4): on iOS there is no ML Kit, so detectedLabel is
-  // always the constant fallback "object" (see useObjectScanner.ts iOS path).
-  // Within the same (questId, pendingWords) tuple, every distinct physical
-  // object scanned on iOS would otherwise produce the SAME cache key — so a
-  // cache hit returns whatever was last cached for that key, regardless of
-  // what the camera is actually pointing at.
-  //
-  // Fix: skip cache GET (and SET — see Section 7 below) entirely when
-  // detectedLabel is too generic to distinguish physical objects. Android
-  // scans (real ML Kit labels) still cache normally.
+  // ── 5. Per-property cache lookup ──────────────────────────────────────────
   const labelTrimmed   = ((detectedLabel as string) ?? "").toLowerCase().trim();
   const isGenericLabel = GENERIC_LABELS.has(labelTrimmed);
+  const attempts       = (failedAttempts as number | undefined) ?? 0;
+  const shouldUseCache = !isGenericLabel && attempts === 0;
 
-  const pendingWords = Array.isArray(requiredProperties)
-    ? (requiredProperties as Array<{ word?: unknown }>)
-        .map((p) => (typeof p?.word === "string" ? p.word : ""))
-        .filter((w) => w.length > 0)
+  const pendingProperties: PropertyRequirement[] = Array.isArray(requiredProperties)
+    ? (requiredProperties as Array<Record<string, unknown>>).map((p) => ({
+        word:            typeof p.word            === "string" ? p.word            : "",
+        definition:      typeof p.definition      === "string" ? p.definition      : "",
+        evaluationHints: typeof p.evaluationHints === "string" ? p.evaluationHints : undefined,
+      })).filter((p) => p.word.length > 0)
     : [];
-  const cacheKey         = buildCacheKey(detectedLabel as string, (questId as string) ?? "", pendingWords);
-  const shouldCheckCache = !isGenericLabel && (failedAttempts as number ?? 0) === 0;
-  const cachedResult     = shouldCheckCache ? await cacheGet(cacheKey) : null;
 
-  if (isGenericLabel) {
-    // Observable signal — bypassing cache for an iOS-pattern scan. Useful in
-    // Edge Function logs to confirm the fix is firing on the expected platform
-    // mix. Should appear once per iOS scan, never on Android.
+  let cachedProperties:  PropertyScore[]        = [];
+  let missingProperties: PropertyRequirement[]  = pendingProperties;
+
+  if (shouldUseCache && pendingProperties.length > 0) {
+    const lookups = await Promise.all(
+      pendingProperties.map(async (prop) => {
+        const key = buildPerPropCacheKey(detectedLabel as string, prop.word);
+        const hit = await cacheGetProp(key);
+        return { prop, hit };
+      })
+    );
+
+    cachedProperties = lookups
+      .filter((l) => l.hit !== null)
+      .map((l) => ({
+        word:      l.hit!.word,
+        score:     l.hit!.score,
+        reasoning: l.hit!.reasoning,
+        passes:    l.hit!.passes,
+      }));
+
+    missingProperties = lookups
+      .filter((l) => l.hit === null)
+      .map((l) => l.prop);
+
+    console.log(
+      `[evaluate] per-property: cached=${cachedProperties.length} ` +
+      `missing=${missingProperties.length} ` +
+      `(${cachedProperties.length === pendingProperties.length ? "FULL HIT" : missingProperties.length === pendingProperties.length ? "FULL MISS" : "PARTIAL HIT"}) ` +
+      `childId=${childId}`
+    );
+  } else if (isGenericLabel) {
     console.log(`[evaluate] Skipping cache (generic label="${labelTrimmed}"): childId=${childId} questId=${questId ?? "n/a"}`);
   }
 
-  if (cachedResult) {
-    // v4.5: log the cache hit so it's visible to product analytics.
-    // claude_latency_ms is null (no Claude call); cache_hit is true.
-    // The companion migration's RPC update ensures this row does NOT
-    // count toward the daily 50/child quota.
-    //
-    // v4.7: capture the inserted row's id and surface it as
-    // _scanAttemptId on the response so the client's "Report this
-    // verdict" button can link a report to this exact scan.
-    const cached = cachedResult as CachedEvaluation;
+  // ── 6. FULL CACHE HIT — skip model entirely ───────────────────────────────
+  // v5.2.1: also check the per-label resolved-name cache. If hit, the kid
+  // sees the model-corrected name. If miss, fall back to detectedLabel.
+  if (shouldUseCache && missingProperties.length === 0 && cachedProperties.length > 0) {
+    const resolvedNameKey   = buildResolvedNameCacheKey(detectedLabel as string);
+    const cachedResolvedRow = await cacheGetResolvedName(resolvedNameKey);
+    const resolvedName      = cachedResolvedRow?.name;
+
+    console.log(
+      `[evaluate] resolved-name cache: ${cachedResolvedRow ? `HIT (producedBy=${cachedResolvedRow._modelId ?? "unknown"}, name="${resolvedName}")` : "MISS — using detectedLabel"} ` +
+      `childId=${childId}`
+    );
+
+    const composed = composeResultFromCachedOnly(
+      detectedLabel as string,
+      cachedProperties,
+      attempts,
+      xpRates,
+      resolvedName,
+    );
+
     const scanAttemptId = await logScanCacheHit(supabase, {
       childId,
       questId:       questId as string | undefined,
       detectedLabel: detectedLabel as string,
       confidence:    confidence as number | undefined,
       ipHash,
-      cachedResult:  cached,
+      result:        composed,
     });
 
-    // scansToday is unchanged on cache hit (cache hits don't burn quota).
-    // Including _rateLimit on the response keeps the client UI in sync —
-    // it won't show stale "scans today" numbers while the user is mid-quest.
     return jsonResponse({
-      ...(cachedResult as object),
-      _cacheHit:       true,
-      _scanAttemptId:  scanAttemptId,
-      _rateLimit:      buildAlertFlags(scansToday),
+      ...composed,
+      _cacheHit:      true,
+      _scanAttemptId: scanAttemptId,
+      _rateLimit:     buildAlertFlags(scansToday),
     });
   }
 
-  // ── 5. Call Claude ────────────────────────────────────────────────────────
+  // ── 7. Call the model (full miss or partial hit) ──────────────────────────
   const claudeStart = Date.now();
   let evaluationResult: Awaited<ReturnType<typeof evaluateObject>>;
 
   try {
-    evaluationResult = await evaluateObject({
-      detectedLabel:      detectedLabel as string,
-      confidence:         confidence as number,
-      frameBase64:        frameBase64 as string | null | undefined,
-      requiredProperties: requiredProperties as Parameters<typeof evaluateObject>[0]["requiredProperties"],
-      childAge:           childAge as number,
-      failedAttempts:     failedAttempts as number | undefined,
-      questName:          questName as string | undefined,
-      masteryProfile:     masteryProfile as Parameters<typeof evaluateObject>[0]["masteryProfile"],
-      // FIX: alreadyFoundWords was being received but never forwarded —
-      // Claude couldn't acknowledge prior progress in feedback, which made
-      // multi-scan verdicts feel disconnected from earlier wins.
-      alreadyFoundWords:  Array.isArray(alreadyFoundWords)
-        ? (alreadyFoundWords as unknown[]).filter((w): w is string => typeof w === "string")
-        : [],
-      xpRates,   // XP FIX: pass per-quest rates through to evaluateObject
-    });
+    evaluationResult = await evaluateObject(
+      {
+        detectedLabel:                 detectedLabel as string,
+        confidence:                    confidence as number,
+        frameBase64:                   frameBase64 as string | null | undefined,
+        requiredProperties:            missingProperties,
+        previouslyEvaluatedProperties: cachedProperties.length > 0 ? cachedProperties : undefined,
+        childAge:                      childAge as number,
+        failedAttempts:                attempts,
+        questName:                     questName as string | undefined,
+        masteryProfile:                masteryProfile as Parameters<typeof evaluateObject>[0]["masteryProfile"],
+        alreadyFoundWords:             Array.isArray(alreadyFoundWords)
+          ? (alreadyFoundWords as unknown[]).filter((w): w is string => typeof w === "string")
+          : [],
+        xpRates,
+      },
+      adapter,
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Evaluation failed";
+    console.error(`[evaluate] model call failed (modelId=${adapter.id}):`, msg);
     await logScanBlocked(supabase, {
       childId,
       questId:       questId as string | undefined,
       detectedLabel: detectedLabel as string,
       confidence:    confidence as number | undefined,
       ipHash,
-      isRateLimited: false, // Claude errored — not a rate limit
+      isRateLimited: false,
     });
     return jsonResponse({ error: msg }, 500);
   }
 
-  // ── 6. Log full result to scan_attempts (cache_hit=false) ─────────────────
-  await logScanResult(supabase, {
+  // ── 8. Log full result (cache_hit=false; model ran) ───────────────────────
+  const scanAttemptId = await logScanResult(supabase, {
     childId,
     questId:         questId as string | undefined,
     detectedLabel:   detectedLabel as string,
@@ -651,21 +679,42 @@ serve(async (req: Request) => {
     result:          evaluationResult,
   });
 
-  // ── 7. Cache successful result ────────────────────────────────────────────
-  // iOS BLEED FIX (v4.4): same guard as Section 4 — never write a cache entry
-  // that uses a generic label as part of its key. If we did, a future call
-  // for a DIFFERENT physical object that happens to share (questId, pendingWords)
-  // would hit this entry and get back the wrong object's verdict. Better to
-  // recompute every iOS scan than to seed permanent cache pollution.
-  if (!isGenericLabel && (failedAttempts as number | undefined ?? 0) === 0) {
-    await cacheSet(cacheKey, { ...evaluationResult, _cacheHit: false });
+  // ── 9. Cache writes (per-property + per-label resolved name) ──────────────
+  // Generic-label and retry bypasses extend to writes. We only write fresh
+  // properties (the ones we just got from the model) — cached properties
+  // were already in cache.
+  //
+  // v5.2.1: also write the resolved name to the per-label cache. Done as
+  // fire-and-forget alongside the per-property writes — they run in parallel
+  // via Promise.all and we don't await each individually.
+  if (shouldUseCache) {
+    const missingWords = new Set(missingProperties.map((p) => p.word));
+    const freshScores  = evaluationResult.properties.filter((p) => missingWords.has(p.word));
+
+    const writes: Promise<unknown>[] = freshScores.map((score) => {
+      const key = buildPerPropCacheKey(detectedLabel as string, score.word);
+      return cacheSetProp(key, score, adapter.id);
+    });
+
+    // Resolved-name write — model just produced a (potentially corrected)
+    // name; remember it so future full-hits don't fall back to detectedLabel.
+    // The helper itself skips writes when name === detectedLabel (no signal).
+    writes.push(cacheSetResolvedName(
+      buildResolvedNameCacheKey(detectedLabel as string),
+      evaluationResult.resolvedObjectName,
+      adapter.id,
+      detectedLabel as string,
+    ));
+
+    await Promise.all(writes);
   }
 
-  // ── 8. Parent alert flags + return ────────────────────────────────────────
+  // ── 10. Parent alert flags + return ───────────────────────────────────────
   const newScansToday = scansToday + 1;
   return jsonResponse({
     ...evaluationResult,
-    _cacheHit:  false,
-    _rateLimit: buildAlertFlags(newScansToday),
+    _cacheHit:      false,
+    _scanAttemptId: scanAttemptId,
+    _rateLimit:     buildAlertFlags(newScansToday),
   });
 });
