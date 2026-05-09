@@ -275,7 +275,7 @@ async function runOne(
 
   const start = Date.now();
   try {
-    const result = await evaluateObject(
+    const { result } = await evaluateObject(
       {
         detectedLabel:      normalized.label,
         confidence:         0.85,

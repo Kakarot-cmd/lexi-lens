@@ -135,8 +135,8 @@ export const anthropicHaikuAdapter: ModelAdapter = {
       modelId:   "claude-haiku-4-5" as ModelId,
       latencyMs: Date.now() - startedAt,
       usage: {
-        inputTokens:  apiResponse.usage?.input_tokens  ?? null,
-        outputTokens: apiResponse.usage?.output_tokens ?? null,
+        inputTokens:  apiResponse.usage?.input_tokens,
+        outputTokens: apiResponse.usage?.output_tokens,
       },
     };
   },

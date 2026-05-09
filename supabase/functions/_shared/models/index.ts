@@ -1,16 +1,17 @@
 /**
  * supabase/functions/_shared/models/index.ts
- * Lexi-Lens — Model Provider Factory (v5.4-eval, 2026-05-09)
+ * Lexi-Lens — Model Provider Factory (v6.0)
  *
- * v5.4-eval — Adds openai and mistral adapters to ADAPTERS map for the
- *   Phase 4.10b model evaluation. Both are wired through the same
- *   feature_flags + env-var resolution chain as anthropic/gemini.
- *   Production routing in tierRouting.ts still only knows about anthropic
- *   and gemini for now — flipping evaluate to OpenAI or Mistral as primary
- *   requires updating tierRouting.ts and is intentionally NOT wired here
- *   until the eval results justify it.
+ * Returns a configured ModelAdapter for a given Edge Function scope.
  *
- * v5.1 — Initial provider abstraction with Anthropic + Gemini.
+ * v6.0 changes vs v5.4-eval:
+ *   • Hardcoded default flipped: 'anthropic' → 'mistral' (Mistral primary)
+ *   • Production fallback chain (mistral → gemini → anthropic) preferred
+ *     over always-anthropic when picked adapter is unconfigured
+ *   • ADAPTERS exported (eval harness in scripts/eval-adapters.ts imports it)
+ *   • OpenAI kept in ProviderKey + ADAPTERS for eval harness use even though
+ *     production routing never picks it (the kill-switch values written by
+ *     the runbook are only 'mistral' | 'gemini' | 'anthropic')
  *
  * ─── Flag resolution order (first hit wins) ──────────────────────────────────
  *
@@ -21,67 +22,87 @@
  *   2. Environment variable
  *      EVALUATE_MODEL_PROVIDER (per scope) or MODEL_PROVIDER (global).
  *
- *   3. Hardcoded default: "anthropic"
+ *   3. Hardcoded default: "mistral"
+ *
+ * ─── How this differs from tierRouting.ts ───────────────────────────────────
+ *
+ *   This factory returns a single adapter for a whole cold-container's
+ *   lifetime. Right for scopes that don't need per-request budgeting
+ *   (generate-quest, classify-words, retire-word, export-word-tome).
+ *
+ *   The evaluate Edge Function uses tierRouting.pickAdapterForRequest()
+ *   instead, which makes a fresh routing decision per scan based on the
+ *   parent's tier and today's primary-call count.
  */
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 import { anthropicHaikuAdapter } from "./anthropic.ts";
 import { geminiAdapter }         from "./gemini.ts";
-import { openaiAdapter }         from "./openai.ts";
 import { mistralAdapter }        from "./mistral.ts";
+import { openaiAdapter }         from "./openai.ts";
 import type { ModelAdapter }     from "./types.ts";
 
 // ─── Provider keys ───────────────────────────────────────────────────────────
 
-export type ProviderKey = "anthropic" | "gemini" | "openai" | "mistral";
+export type ProviderKey = "mistral" | "anthropic" | "gemini" | "openai";
 
-const ADAPTERS: Record<ProviderKey, ModelAdapter> = {
+// EXPORTED so scripts/eval-adapters.ts can iterate the full adapter set.
+// Production routing never reads this map directly — it goes through
+// pickAdapterForRequest() in tierRouting.ts, which knows about the
+// production-validated subset.
+export const ADAPTERS: Record<ProviderKey, ModelAdapter> = {
+  mistral:   mistralAdapter,
   anthropic: anthropicHaikuAdapter,
   gemini:    geminiAdapter,
   openai:    openaiAdapter,
-  mistral:   mistralAdapter,
 };
 
-// Functions that may have their own provider override.
+// Production fallback order — mirror this in tierRouting.ts. Note that
+// openai is intentionally NOT in the fallback chain. It was eval'd but not
+// validated against the production prompt + corpus the way mistral/gemini
+// were, so we don't fall to it when the picked adapter is unconfigured.
+const FALLBACK_ORDER: readonly ProviderKey[] = ["mistral", "gemini", "anthropic"];
+
+function isProviderKey(value: string): value is ProviderKey {
+  return value === "mistral"
+      || value === "anthropic"
+      || value === "gemini"
+      || value === "openai";
+}
+
+// ─── Function scopes ─────────────────────────────────────────────────────────
+
 export type FunctionScope =
   | "evaluate"
-  | "classify"
   | "generate-quest"
+  | "classify-words"
   | "retire-word"
   | "export-word-tome";
 
 const SCOPE_ENV_VAR: Record<FunctionScope, string> = {
   "evaluate":         "EVALUATE_MODEL_PROVIDER",
-  "classify":         "CLASSIFY_MODEL_PROVIDER",
   "generate-quest":   "GENERATE_QUEST_MODEL_PROVIDER",
+  "classify-words":   "CLASSIFY_WORDS_MODEL_PROVIDER",
   "retire-word":      "RETIRE_WORD_MODEL_PROVIDER",
   "export-word-tome": "EXPORT_WORD_TOME_MODEL_PROVIDER",
 };
 
-// Map scope → DB feature_flags.key.
 function flagKey(scope: FunctionScope): string {
   return `${scope.replace(/-/g, "_")}_model_provider`;
 }
 
-// ─── In-process flag cache ───────────────────────────────────────────────────
+// ─── In-process cache ────────────────────────────────────────────────────────
 
 const FLAG_CACHE_TTL_MS = 60_000;
+const flagCache         = new Map<FunctionScope, { value: ProviderKey | null; expiresAt: number }>();
+const loggedScopes      = new Set<FunctionScope>();
 
-interface CachedFlag {
-  value:     ProviderKey | null;
-  expiresAt: number;
-}
+// ─── Env-var reader ──────────────────────────────────────────────────────────
 
-const flagCache = new Map<FunctionScope, CachedFlag>();
-const loggedScopes = new Set<FunctionScope>();
-
-function isProviderKey(v: unknown): v is ProviderKey {
-  return v === "anthropic" || v === "gemini" || v === "openai" || v === "mistral";
-}
-
-function readProviderEnv(name: string): ProviderKey | null {
-  const raw = Deno.env.get(name)?.trim().toLowerCase();
+function readProviderEnv(varName: string): ProviderKey | null {
+  const raw = Deno.env.get(varName)?.trim().toLowerCase();
+  if (!raw) return null;
   return isProviderKey(raw) ? raw : null;
 }
 
@@ -119,10 +140,19 @@ async function readFlagFromDb(
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
+/**
+ * Returns a configured ModelAdapter for the given scope.
+ *
+ * `supabase` is required so the factory can read the live feature_flags row.
+ * Pass the same service-role client the Edge Function already uses for
+ * scan_attempts inserts — service role bypasses RLS, so no policy work is
+ * needed.
+ */
 export async function getModelAdapter(
   scope:    FunctionScope,
   supabase: SupabaseClient,
 ): Promise<ModelAdapter> {
+  // 1. DB row (cached in process)
   const now    = Date.now();
   const cached = flagCache.get(scope);
   let dbValue: ProviderKey | null;
@@ -134,42 +164,58 @@ export async function getModelAdapter(
     flagCache.set(scope, { value: dbValue, expiresAt: now + FLAG_CACHE_TTL_MS });
   }
 
+  // 2. Env-var fallback chain
   const envScoped = readProviderEnv(SCOPE_ENV_VAR[scope]);
   const envGlobal = readProviderEnv("MODEL_PROVIDER");
 
-  const chosen: ProviderKey = dbValue ?? envScoped ?? envGlobal ?? "anthropic";
+  // 3. Final default (v6.0: mistral, was anthropic)
+  const chosen: ProviderKey = dbValue ?? envScoped ?? envGlobal ?? "mistral";
   const source: string =
       dbValue   !== null ? "feature_flags"
     : envScoped !== null ? `env:${SCOPE_ENV_VAR[scope]}`
     : envGlobal !== null ? "env:MODEL_PROVIDER"
     : "default";
 
-  let adapter = ADAPTERS[chosen];
+  let adapter      = ADAPTERS[chosen];
+  let usedFallback = false;
 
   if (!adapter.isConfigured()) {
-    console.warn(
-      `[models] Adapter "${chosen}" (source=${source}) is selected for scope ` +
-      `"${scope}" but its API key is missing. Falling back to anthropic.`,
-    );
-    adapter = ADAPTERS.anthropic;
+    // Walk fallback order, skip the broken pick.
+    for (const candidate of FALLBACK_ORDER) {
+      if (candidate === chosen) continue;
+      const candidateAdapter = ADAPTERS[candidate];
+      if (candidateAdapter.isConfigured()) {
+        console.warn(
+          `[models] Adapter "${chosen}" (source=${source}) is selected for scope ` +
+          `"${scope}" but its API key is missing. Falling back to "${candidate}".`,
+        );
+        adapter      = candidateAdapter;
+        usedFallback = true;
+        break;
+      }
+    }
+    if (!usedFallback) {
+      console.error(
+        `[models] No adapter is configured for scope "${scope}". ` +
+        `Set at least one of MISTRAL_API_KEY, GOOGLE_AI_STUDIO_KEY, ANTHROPIC_API_KEY.`,
+      );
+    }
   }
 
+  // One log line per cold start per scope.
   if (!loggedScopes.has(scope)) {
-    console.log(`[models] scope=${scope} provider=${chosen} model=${adapter.id} source=${source}`);
+    console.log(
+      `[models] scope=${scope} provider=${chosen} model=${adapter.id} ` +
+      `source=${source}${usedFallback ? " (via fallback)" : ""}`,
+    );
     loggedScopes.add(scope);
   }
 
   return adapter;
 }
 
+/** Test-only helper: clear the in-process flag cache. */
 export function _resetFlagCacheForTests(): void {
   flagCache.clear();
   loggedScopes.clear();
 }
-
-// ─── Adapter registry export ─────────────────────────────────────────────────
-// Exposed for the eval harness, which needs direct access to all adapters
-// regardless of feature_flags state. Production code should use
-// getModelAdapter() instead.
-
-export { ADAPTERS };

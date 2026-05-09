@@ -219,8 +219,8 @@ export const geminiAdapter: ModelAdapter = {
       modelId,
       latencyMs: Date.now() - startedAt,
       usage: {
-        inputTokens:  apiResponse.usageMetadata?.promptTokenCount     ?? null,
-        outputTokens: apiResponse.usageMetadata?.candidatesTokenCount ?? null,
+        inputTokens:  apiResponse.usageMetadata?.promptTokenCount,
+        outputTokens: apiResponse.usageMetadata?.candidatesTokenCount,
       },
     };
   },

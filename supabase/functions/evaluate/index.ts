@@ -1,40 +1,45 @@
 /**
  * supabase/functions/evaluate/index.ts
- * Lexi-Lens — Supabase Edge Function entry point.
+ * Lexi-Lens — Supabase Edge Function entry point (v6.0)
  *
- * v5.4 — Phase 4.10b: Tier-aware Haiku→Gemini routing + quest tier validation
+ * v6.0 (2026-05-10) — Mistral primary + cache v6
  *
- *   Three changes layered on the v5.2.2 base:
+ *   1. Mistral as primary model. Routing rewritten around Mistral →
+ *      Gemini → Haiku hierarchy. Old Haiku-budget log lines replaced
+ *      with primary-budget shape. See _shared/tierRouting.ts.
  *
- *   1. Per-request adapter routing (was: per-container).
- *      The adapter for this scan is chosen by pickAdapterForRequest in
- *      _shared/tierRouting.ts based on (parent_tier, today_haiku_count,
- *      tier_config.haiku_calls_per_day, global kill switch). Cache hits
- *      do NOT count toward Haiku budget. Decision logged on every miss.
+ *   2. Cache v6 redesign. Two changes coupled:
+ *      • Readable, greppable key format — no btoa on the common path.
+ *        New: "{env}:lexi:v6:verdict:{label}:{word}" / "...:resolved:{label}"
+ *      • Stratified value shape with kid_msg.young, kid_msg.older, optional
+ *        nudge.young/older. Cache hits now produce real kid voice instead
+ *        of being reconstructed from reasoning.
  *
- *   2. Quest tier validation closing the security gap.
- *      Pre-v5.4, the Edge Function bypassed RLS via service_role and did
- *      not check the requested quest's min_subscription_tier. A free
- *      child constructing a request with a paid quest_id directly would
- *      get a model call against that quest. Now: get_evaluate_context
- *      returns quest_min_tier; the function returns 403 if the parent's
- *      tier doesn't qualify.
+ *      The old btoa-encoded v5 namespace ("lexi:eval:prop:..." and
+ *      "lexi:eval:resolved:...") is NOT read on this version. Operator
+ *      MUST FLUSH the v5 namespace before this code goes live, or wait
+ *      14 days for v5 entries to expire. Mixed-schema reads are a defense
+ *      against future migrations, not legacy compatibility.
  *
- *   3. scan_attempts.model_id population.
- *      Every cache_hit=false row now stamps the producing model id so
- *      future Haiku-count queries (and the per-tier model split monitor
- *      query) can attribute scans correctly. Cache hits leave model_id
- *      NULL by design — they didn't consume a model call.
+ *   3. Quest flavor template. quests.feedback_flavor_template (nullable
+ *      TEXT, added in 20260510 migration) appended to passing
+ *      childFeedback at compose time. Replaces the v5 attempt to put
+ *      questId in the cache key.
  *
- *   New single-round-trip RPC: get_evaluate_context(child_id, quest_id)
- *   returns scans_today, haiku_calls_today, subscription_tier,
- *   quest_min_tier, quest_exists. Replaces the v5.2.2 get_daily_scan_status
- *   call. The old RPC stays in place for safety during the deploy window.
+ *   4. Strict shape validation. Cache entries that fail v6 shape are
+ *      treated as miss AND logged with a distinctive prefix
+ *      ([evaluate] CACHE_SHAPE_INVALID ...) so silent corruption surfaces
+ *      in log queries instead of degrading the kid-facing UX.
  *
- * v5.2.2 — Tier-aware daily scan cap (Phase 4.10) — preserved
- * v5.2.1 — Per-label resolved-name cache — preserved
- * v5.2   — Per-property cache refactor — preserved
- * v5.1   — Model provider abstraction — preserved
+ *   All v5.x defenses preserved verbatim:
+ *     • GENERIC_LABELS guard (iOS "object" cross-scan bleed)
+ *     • failedAttempts > 0 → skip cache entirely (retry nudges)
+ *     • Per-property partial-hit composition (only fresh props go to model)
+ *     • Quest tier validation (free child can't request a paid quest)
+ *     • Daily scan cap, IP rate limit, scan_attempts logging
+ *
+ * v5.4 — Phase 4.10b tier-aware Haiku→Gemini routing (superseded)
+ * v5.2.x — Per-property + per-label cache (superseded by v6 schema)
  */
 
 import { serve }        from "https://deno.land/std@0.208.0/http/server.ts";
@@ -42,14 +47,15 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 import {
   evaluateObject,
-  composeResultFromCachedOnly,
+  composeFinalResult,
   type EvaluationResult,
   type PropertyRequirement,
-  type PropertyScore,
+  type PropertyScoreV6,
+  type AgeBandedString,
+  type XpRates,
 } from "./evaluateObject.ts";
 
 import { pickAdapterForRequest } from "../_shared/tierRouting.ts";
-import { getTierLimits }         from "../_shared/tierConfig.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -59,11 +65,11 @@ const IP_WINDOW_MS        = 60_000;
 
 const GENERIC_LABELS = new Set(["", "object", "unknown", "thing", "item"]);
 
-// ─── Redis / Upstash setup ───────────────────────────────────────────────────
+// ─── Redis / Upstash ─────────────────────────────────────────────────────────
 
 const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL")   ?? "";
 const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
-const CACHE_TTL_S = 14 * 24 * 60 * 60; // 14 days, user-write path
+const CACHE_TTL_S = 14 * 24 * 60 * 60; // 14 days, organic-write path
 
 const ENV_NAME: string = (() => {
   const fromEnv = Deno.env.get("CACHE_ENV_NAMESPACE")?.trim().toLowerCase();
@@ -72,76 +78,210 @@ const ENV_NAME: string = (() => {
   return "default";
 })();
 
-// ─── Cache key normalisation (must match prewarm-cache.ts byte-for-byte) ─────
+// ─── Cache key builders (v6 — readable, no btoa on common path) ──────────────
 
-function normalize(s: string): string {
-  return s.toLowerCase()
+const KEY_SEGMENT_MAX = 80;
+const FULL_KEY_MAX    = 200;
+
+/**
+ * Normalize a label or property word for use in a Redis key. Keeps the
+ * output human-readable so `redis-cli SCAN MATCH lexi:v6:verdict:apple:*`
+ * works without script gymnastics.
+ *
+ * Steps (in order):
+ *   1. lowercase, trim, collapse internal whitespace
+ *   2. conservative depluralization (matches production v5 normalize)
+ *   3. replace any non-[a-z0-9_-] sequence with single dash
+ *   4. trim leading/trailing dashes
+ *   5. cap to KEY_SEGMENT_MAX
+ *
+ * Pathological inputs (empty, all-special-chars, way too long) trigger
+ * a fallback btoa hash in buildPerPropCacheKey — see there.
+ */
+function normalizeForKey(s: string): string {
+  return s
+    .toLowerCase()
     .trim()
     .replace(/\s+/g, " ")
-    .replace(/([a-z]{2,})([^se])s\b/g, "$1$2");
+    .replace(/([a-z]{2,})([^se])s\b/g, "$1$2")
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, KEY_SEGMENT_MAX);
 }
 
 function buildPerPropCacheKey(label: string, word: string): string {
-  const raw = `${normalize(label)}::${normalize(word)}`;
-  return `${ENV_NAME}:lexi:eval:prop:${btoa(raw).replace(/=/g, "")}`;
+  const nl = normalizeForKey(label);
+  const nw = normalizeForKey(word);
+
+  if (nl.length === 0 || nw.length === 0) {
+    return `${ENV_NAME}:lexi:v6:verdict:_h:${btoa(`${label}::${word}`).replace(/=/g, "")}`;
+  }
+
+  const key = `${ENV_NAME}:lexi:v6:verdict:${nl}:${nw}`;
+  if (key.length > FULL_KEY_MAX) {
+    return `${ENV_NAME}:lexi:v6:verdict:_h:${btoa(`${label}::${word}`).replace(/=/g, "")}`;
+  }
+  return key;
 }
 
 function buildResolvedNameCacheKey(label: string): string {
-  const raw = normalize(label);
-  return `${ENV_NAME}:lexi:eval:resolved:${btoa(raw).replace(/=/g, "")}`;
+  const nl = normalizeForKey(label);
+  if (nl.length === 0) {
+    return `${ENV_NAME}:lexi:v6:resolved:_h:${btoa(label).replace(/=/g, "")}`;
+  }
+  const key = `${ENV_NAME}:lexi:v6:resolved:${nl}`;
+  if (key.length > FULL_KEY_MAX) {
+    return `${ENV_NAME}:lexi:v6:resolved:_h:${btoa(label).replace(/=/g, "")}`;
+  }
+  return key;
 }
 
-// ─── Cache GET/SET helpers ───────────────────────────────────────────────────
+// ─── Cache value shapes (v6) ────────────────────────────────────────────────
 
-interface CachedPropertyScore extends PropertyScore { _modelId?: string; }
-interface CachedResolvedName  { name: string; _modelId?: string; }
+type WriteSource = "organic" | "prewarm" | "manual";
 
-async function cacheGetProp(key: string): Promise<CachedPropertyScore | null> {
+interface CacheMetaV6 {
+  model_id:   string;
+  schema:     6;
+  written_at: string; // ISO timestamp
+  source:     WriteSource;
+}
+
+interface CachedVerdictV6 {
+  v:       6;
+  verdict: { score: number; passes: boolean; reasoning: string };
+  kid_msg: AgeBandedString;
+  nudge:   AgeBandedString | null;
+  meta:    CacheMetaV6;
+}
+
+interface CachedResolvedNameV6 {
+  v:    6;
+  name: string;
+  meta: CacheMetaV6;
+}
+
+// ─── Cache shape validators ──────────────────────────────────────────────────
+//
+// Strict. Anything failing returns null and emits a CACHE_SHAPE_INVALID
+// log line so silent corruption surfaces in operator queries.
+
+function isAgeBandedString(v: unknown): v is AgeBandedString {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return typeof o.young === "string" && o.young.trim().length > 0
+      && typeof o.older === "string" && o.older.trim().length > 0;
+}
+
+function isCacheMetaV6(v: unknown): v is CacheMetaV6 {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  return typeof o.model_id   === "string"
+      && o.schema === 6
+      && typeof o.written_at === "string"
+      && (o.source === "organic" || o.source === "prewarm" || o.source === "manual");
+}
+
+function isCachedVerdictV6(v: unknown): v is CachedVerdictV6 {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  if (o.v !== 6) return false;
+  const verdict = o.verdict as Record<string, unknown> | undefined;
+  if (!verdict || typeof verdict !== "object") return false;
+  if (typeof verdict.score     !== "number")  return false;
+  if (typeof verdict.passes    !== "boolean") return false;
+  if (typeof verdict.reasoning !== "string")  return false;
+  if (!isAgeBandedString(o.kid_msg)) return false;
+  if (o.nudge !== null && !isAgeBandedString(o.nudge)) return false;
+  if (!isCacheMetaV6(o.meta)) return false;
+  return true;
+}
+
+function isCachedResolvedNameV6(v: unknown): v is CachedResolvedNameV6 {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  if (o.v !== 6) return false;
+  if (typeof o.name !== "string" || o.name.trim().length === 0) return false;
+  if (!isCacheMetaV6(o.meta)) return false;
+  return true;
+}
+
+function logCacheShapeInvalid(key: string, raw: string, reason: string): void {
+  // Distinctive prefix for log queries. If this fires regularly, a writer
+  // is shipping malformed entries — investigate immediately.
+  console.warn(
+    `[evaluate] CACHE_SHAPE_INVALID key=${key} reason=${reason} ` +
+    `raw_excerpt="${raw.slice(0, 120).replace(/\n/g, " ")}"`,
+  );
+}
+
+// ─── Cache I/O ───────────────────────────────────────────────────────────────
+
+async function cacheGetVerdict(key: string): Promise<CachedVerdictV6 | null> {
   if (!REDIS_URL) return null;
   try {
-    const res  = await fetch(`${REDIS_URL}/get/${key}`, {
+    const res  = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
     });
-    const json = await res.json();
+    const json = await res.json() as { result?: string | null };
     if (!json.result) return null;
-    const parsed = JSON.parse(json.result);
-    if (
-      !parsed || typeof parsed !== "object" ||
-      typeof parsed.word      !== "string" ||
-      typeof parsed.score     !== "number" ||
-      typeof parsed.reasoning !== "string" ||
-      typeof parsed.passes    !== "boolean"
-    ) {
-      console.warn("[cacheGetProp] Stale/invalid entry — treating as miss");
+
+    let parsed: unknown;
+    try { parsed = JSON.parse(json.result); }
+    catch { logCacheShapeInvalid(key, json.result, "json-parse-failed"); return null; }
+
+    if (!isCachedVerdictV6(parsed)) {
+      logCacheShapeInvalid(key, json.result, "shape-validation-failed");
       return null;
     }
-    return parsed as CachedPropertyScore;
-  } catch { return null; }
+    return parsed;
+  } catch (e) {
+    console.error(`[evaluate] cacheGetVerdict threw key=${key}:`, e);
+    return null;
+  }
 }
 
-async function cacheSetProp(key: string, prop: PropertyScore, modelId: string): Promise<void> {
+async function cacheSetVerdict(
+  key:      string,
+  payload:  CachedVerdictV6,
+): Promise<void> {
   if (!REDIS_URL) return;
   try {
     await fetch(REDIS_URL, {
       method:  "POST",
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify(["SET", key, JSON.stringify({ ...prop, _modelId: modelId }), "EX", CACHE_TTL_S]),
+      headers: {
+        Authorization:  `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["SET", key, JSON.stringify(payload), "EX", CACHE_TTL_S]),
     });
-  } catch { /* non-fatal */ }
+  } catch (e) {
+    console.error(`[evaluate] cacheSetVerdict threw key=${key}:`, e);
+  }
 }
 
-async function cacheGetResolvedName(key: string): Promise<CachedResolvedName | null> {
+async function cacheGetResolvedName(key: string): Promise<CachedResolvedNameV6 | null> {
   if (!REDIS_URL) return null;
   try {
-    const res  = await fetch(`${REDIS_URL}/get/${key}`, {
+    const res  = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
     });
-    const json = await res.json();
+    const json = await res.json() as { result?: string | null };
     if (!json.result) return null;
-    const parsed = JSON.parse(json.result);
-    if (!parsed || typeof parsed.name !== "string") return null;
-    return parsed as CachedResolvedName;
-  } catch { return null; }
+
+    let parsed: unknown;
+    try { parsed = JSON.parse(json.result); }
+    catch { logCacheShapeInvalid(key, json.result, "json-parse-failed"); return null; }
+
+    if (!isCachedResolvedNameV6(parsed)) {
+      logCacheShapeInvalid(key, json.result, "shape-validation-failed");
+      return null;
+    }
+    return parsed;
+  } catch (e) {
+    console.error(`[evaluate] cacheGetResolvedName threw key=${key}:`, e);
+    return null;
+  }
 }
 
 async function cacheSetResolvedName(
@@ -151,127 +291,80 @@ async function cacheSetResolvedName(
   detectedLabel: string,
 ): Promise<void> {
   if (!REDIS_URL) return;
-  // Skip the write when the model didn't actually correct anything —
-  // keeps the resolved-name cache focused on "real corrections".
-  if (normalize(resolvedName) === normalize(detectedLabel)) return;
+
+  // Skip the write when the model didn't correct anything — keeps the
+  // resolved-name cache focused on real corrections.
+  const a = normalizeForKey(detectedLabel);
+  const b = normalizeForKey(resolvedName);
+  if (a === b) return;
+
+  const payload: CachedResolvedNameV6 = {
+    v:    6,
+    name: resolvedName,
+    meta: {
+      model_id:   modelId,
+      schema:     6,
+      written_at: new Date().toISOString(),
+      source:     "organic",
+    },
+  };
+
   try {
     await fetch(REDIS_URL, {
       method:  "POST",
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify([
-        "SET", key, JSON.stringify({ name: resolvedName, _modelId: modelId }), "EX", CACHE_TTL_S,
-      ]),
+      headers: {
+        Authorization:  `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["SET", key, JSON.stringify(payload), "EX", CACHE_TTL_S]),
     });
-  } catch { /* non-fatal */ }
-}
-
-// ─── IP rate limit (verbatim from v5.2.2) ────────────────────────────────────
-
-async function checkIpRateLimit(
-  supabase: ReturnType<typeof createClient>,
-  ipHash:   string,
-): Promise<{ allowed: boolean; requestCount: number }> {
-  const now = new Date();
-  const { data: existing } = await supabase
-    .from("ip_rate_limits")
-    .select("request_count, window_start")
-    .eq("ip_hash", ipHash)
-    .maybeSingle();
-
-  if (!existing) {
-    await supabase.from("ip_rate_limits").upsert({
-      ip_hash: ipHash, request_count: 1, window_start: now.toISOString(),
-    });
-    return { allowed: true, requestCount: 1 };
-  }
-
-  const row = existing as { request_count: number; window_start: string };
-  const windowStart = new Date(row.window_start).getTime();
-  if (now.getTime() - windowStart > IP_WINDOW_MS) {
-    await supabase.from("ip_rate_limits").upsert({
-      ip_hash: ipHash, request_count: 1, window_start: now.toISOString(),
-    });
-    return { allowed: true, requestCount: 1 };
-  }
-
-  const newCount = row.request_count + 1;
-  await supabase.from("ip_rate_limits").update({ request_count: newCount }).eq("ip_hash", ipHash);
-  return { allowed: newCount <= IP_LIMIT_PER_MINUTE, requestCount: newCount };
-}
-
-async function hashIp(ip: string): Promise<string> {
-  const encoded = new TextEncoder().encode(ip + (Deno.env.get("IP_HASH_SALT") ?? "lexi-lens"));
-  const buf = await globalThis.crypto.subtle.digest("SHA-256", encoded);
-  return Array.from(new Uint8Array(buf))
-    .map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
-}
-
-// ─── New v5.4: get_evaluate_context RPC wrapper ──────────────────────────────
-
-interface EvaluateContext {
-  scansToday:       number;
-  haikuCallsToday:  number;
-  subscriptionTier: string;
-  questMinTier:     string;
-  questExists:      boolean;
-}
-
-async function getEvaluateContext(
-  supabase: ReturnType<typeof createClient>,
-  childId:  string,
-  questId:  string,
-): Promise<EvaluateContext> {
-  try {
-    const { data, error } = await supabase.rpc("get_evaluate_context", {
-      p_child_id: childId,
-      p_quest_id: questId,
-    });
-    if (error) {
-      console.error("[evaluate] get_evaluate_context error:", error.message);
-      return defaultContext();
-    }
-    const row = Array.isArray(data) ? data[0] : data;
-    if (!row) return defaultContext();
-    return {
-      scansToday:       typeof row.scans_today        === "number" ? row.scans_today        : 0,
-      haikuCallsToday:  typeof row.haiku_calls_today  === "number" ? row.haiku_calls_today  : 0,
-      subscriptionTier: typeof row.subscription_tier  === "string" ? row.subscription_tier  : "free",
-      questMinTier:     typeof row.quest_min_tier     === "string" ? row.quest_min_tier     : "free",
-      questExists:      Boolean(row.quest_exists),
-    };
   } catch (e) {
-    console.error("[evaluate] get_evaluate_context threw:", e);
-    return defaultContext();
+    console.error(`[evaluate] cacheSetResolvedName threw key=${key}:`, e);
   }
 }
 
-function defaultContext(): EvaluateContext {
-  // Conservative defaults: free tier, restrictive caps. Erring free here is
-  // the safe direction — a paid customer briefly seeing free limits is
-  // recoverable; the inverse is a cost incident.
-  return {
-    scansToday:       0,
-    haikuCallsToday:  0,
-    subscriptionTier: "free",
-    questMinTier:     "free",
-    questExists:      true, // assume exists on RPC failure to avoid false 404s
-  };
-}
-
-// ─── Quest tier gate ─────────────────────────────────────────────────────────
+// ─── Quest flavor template fetch ─────────────────────────────────────────────
 //
-// True if a parent on `parentTier` is allowed to scan a quest with
-// `questMinTier`. Free quests are open to everyone; paid quests require
-// the parent's tier to be anything other than 'free'.
+// Small in-process cache (60s TTL) keyed by quest_id so a parent doing a
+// 5-scan session pays one DB hit total. Same pattern as feature_flags.
 
-function parentCanAccessQuest(parentTier: string, questMinTier: string): boolean {
-  if (questMinTier === "free") return true;
-  if (questMinTier === "paid") return parentTier !== "free";
-  // Defensive default: treat unknown min-tier values as 'paid' (closed).
-  return parentTier !== "free";
+interface CachedFlavor { template: string | null; expiresAt: number }
+const FLAVOR_TTL_MS    = 60_000;
+const flavorCache      = new Map<string, CachedFlavor>();
+
+async function fetchQuestFlavorTemplate(
+  supabase: ReturnType<typeof createClient>,
+  questId:  string | undefined,
+): Promise<string | null> {
+  if (!questId) return null;
+  const now = Date.now();
+  const c   = flavorCache.get(questId);
+  if (c && c.expiresAt > now) return c.template;
+
+  try {
+    const { data, error } = await supabase
+      .from("quests")
+      .select("feedback_flavor_template")
+      .eq("id", questId)
+      .maybeSingle();
+
+    if (error) {
+      console.error(`[evaluate] fetchQuestFlavorTemplate error questId=${questId}:`, error.message);
+      flavorCache.set(questId, { template: null, expiresAt: now + FLAVOR_TTL_MS });
+      return null;
+    }
+
+    const raw      = (data as { feedback_flavor_template?: unknown } | null)?.feedback_flavor_template;
+    const template = typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : null;
+    flavorCache.set(questId, { template, expiresAt: now + FLAVOR_TTL_MS });
+    return template;
+  } catch (e) {
+    console.error(`[evaluate] fetchQuestFlavorTemplate threw questId=${questId}:`, e);
+    return null;
+  }
 }
 
-// ─── scan_attempts logging (v5.4: includes model_id) ─────────────────────────
+// ─── scan_attempts logging ────────────────────────────────────────────────────
 
 interface LogScanArgs {
   childId:       string;
@@ -301,7 +394,7 @@ async function logScanResult(
       xp_awarded:        opts.result.xpAwarded,
       claude_latency_ms: opts.claudeLatencyMs,
       cache_hit:         false,
-      model_id:          opts.modelId,           // NEW v5.4
+      model_id:          opts.modelId,
     }).select("id").single();
     if (error) {
       console.error("[evaluate] logScanResult INSERT error:", error.message);
@@ -331,9 +424,9 @@ async function logScanCacheHit(
       property_scores:   opts.result.properties,
       child_feedback:    opts.result.childFeedback,
       xp_awarded:        opts.result.xpAwarded,
-      claude_latency_ms: null,                   // signal: no model call
+      claude_latency_ms: null,
       cache_hit:         true,
-      model_id:          null,                   // NEW v5.4: NULL for cache hits
+      model_id:          null,
     }).select("id").single();
     if (error) {
       console.error("[evaluate] logScanCacheHit INSERT error:", error.message);
@@ -355,7 +448,7 @@ async function logScanBlocked(
     confidence?:   number;
     ipHash?:       string;
     isRateLimited: boolean;
-  }
+  },
 ): Promise<void> {
   try {
     await supabase.from("scan_attempts").insert({
@@ -372,14 +465,14 @@ async function logScanBlocked(
       xp_awarded:        0,
       claude_latency_ms: null,
       cache_hit:         false,
-      model_id:          null,                   // NEW v5.4: nothing produced
+      model_id:          null,
     });
   } catch (e) {
     console.error("[evaluate] logScanBlocked INSERT failed:", e);
   }
 }
 
-// ─── Response helpers ────────────────────────────────────────────────────────
+// ─── HTTP helpers ────────────────────────────────────────────────────────────
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin":  "*",
@@ -409,6 +502,48 @@ function buildAlertFlags(scansToday: number, dailyLimit: number, tier: string) {
   };
 }
 
+async function hashIp(ip: string): Promise<string> {
+  const encoded = new TextEncoder().encode(ip + (Deno.env.get("IP_HASH_SALT") ?? "lexi-lens"));
+  const buf     = await crypto.subtle.digest("SHA-256", encoded);
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 16);
+}
+
+function extractIp(headers: Headers): string {
+  const xff = headers.get("x-forwarded-for");
+  if (xff) return xff.split(",")[0]?.trim() || "unknown";
+  const cf = headers.get("cf-connecting-ip");
+  if (cf) return cf;
+  return "unknown";
+}
+
+async function checkIpRateLimit(
+  supabase: ReturnType<typeof createClient>,
+  ipHash:   string,
+): Promise<{ allowed: boolean; requestCount: number }> {
+  const windowStart = new Date(Date.now() - IP_WINDOW_MS).toISOString();
+  const { data: existing } = await supabase
+    .from("ip_rate_limits")
+    .select("request_count, window_start")
+    .eq("ip_hash", ipHash)
+    .maybeSingle();
+
+  if (!existing || (existing as { window_start: string }).window_start < windowStart) {
+    await supabase.from("ip_rate_limits").upsert({
+      ip_hash:       ipHash,
+      request_count: 1,
+      window_start:  new Date().toISOString(),
+    });
+    return { allowed: true, requestCount: 1 };
+  }
+
+  const newCount = (existing as { request_count: number }).request_count + 1;
+  await supabase.from("ip_rate_limits").update({ request_count: newCount }).eq("ip_hash", ipHash);
+  return { allowed: newCount <= IP_LIMIT_PER_MINUTE, requestCount: newCount };
+}
+
 // ─── Main handler ────────────────────────────────────────────────────────────
 
 serve(async (req: Request) => {
@@ -417,7 +552,7 @@ serve(async (req: Request) => {
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    { auth: { persistSession: false } }
+    { auth: { persistSession: false } },
   );
 
   // ── 1. Parse + validate body ──────────────────────────────────────────────
@@ -432,74 +567,72 @@ serve(async (req: Request) => {
     xp_reward_first_try, xp_reward_retry, xp_reward_third_plus,
   } = body as Record<string, unknown>;
 
-  const xpRates = {
-    firstTry:  typeof xp_reward_first_try  === "number" ? xp_reward_first_try  : 40,
-    secondTry: typeof xp_reward_retry      === "number" ? xp_reward_retry      : 25,
-    thirdPlus: typeof xp_reward_third_plus === "number" ? xp_reward_third_plus : 10,
+  const xpRates: XpRates = {
+    firstTry:  typeof xp_reward_first_try   === "number" ? xp_reward_first_try   : 40,
+    secondTry: typeof xp_reward_retry       === "number" ? xp_reward_retry       : 25,
+    thirdPlus: typeof xp_reward_third_plus  === "number" ? xp_reward_third_plus  : 10,
   };
 
-  if (typeof childId !== "string" || typeof questId !== "string" || typeof detectedLabel !== "string") {
-    return jsonResponse({ error: "Missing required fields: childId, questId, detectedLabel" }, 400);
+  if (typeof childId !== "string" || typeof detectedLabel !== "string" || typeof childAge !== "number") {
+    return jsonResponse({ error: "Missing required fields" }, 400);
   }
 
-  // ── 2. IP rate limit ──────────────────────────────────────────────────────
-  const fwdFor = req.headers.get("x-forwarded-for") ?? req.headers.get("cf-connecting-ip") ?? "0.0.0.0";
-  const ipHash = await hashIp(fwdFor.split(",")[0].trim());
-  const ipCheck = await checkIpRateLimit(supabase, ipHash);
-  if (!ipCheck.allowed) {
-    await logScanBlocked(supabase, {
-      childId, questId, detectedLabel, confidence: confidence as number | undefined,
-      ipHash, isRateLimited: true,
-    });
+  // ── 2. IP rate limit ─────────────────────────────────────────────────────
+  const ip     = extractIp(req.headers);
+  const ipHash = await hashIp(ip);
+  const ipRl   = await checkIpRateLimit(supabase, ipHash);
+  if (!ipRl.allowed) {
     return jsonResponse({
-      error:      "rate_limit_exceeded",
-      code:       "IP_LIMIT",
-      message:    "Too many requests. Please wait a moment before scanning again.",
-      retryAfter: 60,
+      error:  "rate_limited_ip",
+      childFriendly: "Whoa! Too many quick scans. Take a breath and try again in a minute.",
     }, 429);
   }
 
-  // ── 3. Single round-trip context fetch (v5.4) ─────────────────────────────
-  const ctx = await getEvaluateContext(supabase, childId, questId);
+  // ── 3. Get evaluate context (scans today, primary calls today, tier, quest) ─
+  const { data: ctxData, error: ctxError } = await supabase
+    .rpc("get_evaluate_context", { p_child_id: childId, p_quest_id: questId ?? null });
 
-  // ── 3a. Quest existence check (404) ───────────────────────────────────────
-  if (!ctx.questExists) {
-    return jsonResponse({ error: "quest_not_found", message: "Quest not found or inactive." }, 404);
+  if (ctxError || !ctxData) {
+    console.error("[evaluate] get_evaluate_context failed:", ctxError?.message);
+    return jsonResponse({ error: "context_load_failed" }, 500);
   }
 
-  // ── 3b. Quest tier gate (403) — closes the v5.3 security gap ─────────────
-  if (!parentCanAccessQuest(ctx.subscriptionTier, ctx.questMinTier)) {
-    console.warn(
-      `[evaluate] quest tier gate: blocked. ` +
-      `parent_tier=${ctx.subscriptionTier} quest_min_tier=${ctx.questMinTier} ` +
-      `childId=${childId} questId=${questId}`
-    );
-    return jsonResponse({
-      error:    "quest_not_available",
-      code:     "TIER_GATE",
-      message:  "This quest is not available on your current plan.",
-      tier:     ctx.subscriptionTier,
-      minTier:  ctx.questMinTier,
-    }, 403);
+  const ctx = ctxData as {
+    scans_today:        number;
+    haiku_calls_today:  number;  // RPC field name retained from v5; semantically "primary_calls_today"
+    subscription_tier:  string;
+    quest_min_tier:     string | null;
+    quest_exists:       boolean;
+  };
+
+  const primaryCallsToday = ctx.haiku_calls_today; // local rename, see file header
+
+  // Quest tier validation (preserved from v5.4)
+  if (questId && ctx.quest_exists && ctx.quest_min_tier) {
+    const tierRank = (t: string) => t === "free" ? 0
+                                  : t === "tier1" || t === "paid" ? 1
+                                  : t === "tier2" ? 2
+                                  : t === "family" ? 3 : 0;
+    if (tierRank(ctx.subscription_tier) < tierRank(ctx.quest_min_tier)) {
+      console.warn(
+        `[evaluate] tier_violation child_tier=${ctx.subscription_tier} ` +
+        `quest_min_tier=${ctx.quest_min_tier} childId=${childId}`,
+      );
+      return jsonResponse({ error: "tier_required", required: ctx.quest_min_tier }, 403);
+    }
   }
 
-  // ── 3c. Daily scan cap (429) ──────────────────────────────────────────────
-  const tierLimits = await getTierLimits(supabase, ctx.subscriptionTier);
-  const dailyLimit = tierLimits.capScansPerDay;
-
-  if (ctx.scansToday >= dailyLimit) {
+  // Daily scan cap
+  const { capScansPerDay: dailyLimit } = await import("../_shared/tierConfig.ts")
+    .then((m) => m.getTierLimits(supabase, ctx.subscription_tier));
+  if (ctx.scans_today >= dailyLimit) {
     await logScanBlocked(supabase, {
-      childId, questId, detectedLabel, confidence: confidence as number | undefined,
-      ipHash, isRateLimited: false,
+      childId, questId: questId as string | undefined, detectedLabel,
+      confidence: confidence as number | undefined, ipHash, isRateLimited: true,
     });
     return jsonResponse({
-      error:      "rate_limit_exceeded",
-      code:       "DAILY_QUOTA",
-      scansToday: ctx.scansToday,
-      limit:      dailyLimit,
-      tier:       ctx.subscriptionTier,
-      resetsAt:   utcMidnight(),
-      message:    "Daily scan limit reached. Come back tomorrow, brave adventurer!",
+      error: "daily_limit_reached",
+      childFriendly: "You've explored a lot today. Come back tomorrow, brave adventurer!",
     }, 429);
   }
 
@@ -517,84 +650,105 @@ serve(async (req: Request) => {
       })).filter((p) => p.word.length > 0)
     : [];
 
-  let cachedProperties:  PropertyScore[]        = [];
-  let missingProperties: PropertyRequirement[]  = pendingProperties;
+  let cachedV6Properties: PropertyScoreV6[] = [];
+  let missingProperties:  PropertyRequirement[] = pendingProperties;
 
   if (shouldUseCache && pendingProperties.length > 0) {
     const lookups = await Promise.all(
       pendingProperties.map(async (prop) => ({
         prop,
-        hit: await cacheGetProp(buildPerPropCacheKey(detectedLabel, prop.word)),
-      }))
+        hit: await cacheGetVerdict(buildPerPropCacheKey(detectedLabel, prop.word)),
+      })),
     );
-    cachedProperties = lookups.filter((l) => l.hit !== null).map((l) => ({
-      word: l.hit!.word, score: l.hit!.score, reasoning: l.hit!.reasoning, passes: l.hit!.passes,
-    }));
+
+    cachedV6Properties = lookups
+      .filter((l) => l.hit !== null)
+      .map((l) => ({
+        word:      l.prop.word,
+        score:     l.hit!.verdict.score,
+        reasoning: l.hit!.verdict.reasoning,
+        passes:    l.hit!.verdict.passes,
+        kid_msg:   l.hit!.kid_msg,
+        nudge:     l.hit!.nudge,
+      }));
+
     missingProperties = lookups.filter((l) => l.hit === null).map((l) => l.prop);
 
     console.log(
-      `[evaluate] per-property: cached=${cachedProperties.length} ` +
+      `[evaluate] cache: cached=${cachedV6Properties.length} ` +
       `missing=${missingProperties.length} ` +
-      `(${cachedProperties.length === pendingProperties.length ? "FULL HIT"
+      `(${cachedV6Properties.length === pendingProperties.length ? "FULL HIT"
         : missingProperties.length === pendingProperties.length ? "FULL MISS" : "PARTIAL HIT"}) ` +
-      `childId=${childId}`
+      `childId=${childId}`,
     );
   } else if (isGenericLabel) {
     console.log(`[evaluate] Skipping cache (generic label="${labelTrimmed}"): childId=${childId}`);
   }
 
-  // ── 5. FULL CACHE HIT — skip model entirely ───────────────────────────────
-  if (shouldUseCache && missingProperties.length === 0 && cachedProperties.length > 0) {
+  // ── 5. Quest flavor template (composed into childFeedback) ───────────────
+  const questFlavorTemplate = await fetchQuestFlavorTemplate(supabase, questId as string | undefined);
+
+  // ── 6. FULL CACHE HIT — skip model entirely ───────────────────────────────
+  if (shouldUseCache && missingProperties.length === 0 && cachedV6Properties.length > 0) {
     const cachedResolvedRow = await cacheGetResolvedName(buildResolvedNameCacheKey(detectedLabel));
     const resolvedName      = cachedResolvedRow?.name;
 
     console.log(
       `[evaluate] resolved-name cache: ${
-        cachedResolvedRow ? `HIT (producedBy=${cachedResolvedRow._modelId ?? "unknown"}, name="${resolvedName}")` : "MISS — using detectedLabel"
-      } childId=${childId}`
+        cachedResolvedRow
+          ? `HIT (producedBy=${cachedResolvedRow.meta.model_id}, name="${resolvedName}")`
+          : "MISS — using detectedLabel"
+      } childId=${childId}`,
     );
 
-    const composed = composeResultFromCachedOnly(
-      detectedLabel, cachedProperties, attempts, xpRates, resolvedName,
-    );
+    const composed = composeFinalResult({
+      detectedLabel,
+      resolvedName,
+      freshProperties:     [],
+      cachedProperties:    cachedV6Properties,
+      childAge:            childAge as number,
+      failedAttempts:      attempts,
+      questFlavorTemplate,
+      xpRates,
+    });
 
     const scanAttemptId = await logScanCacheHit(supabase, {
-      childId, questId, detectedLabel, confidence: confidence as number | undefined, ipHash, result: composed,
+      childId, questId: questId as string | undefined, detectedLabel,
+      confidence: confidence as number | undefined, ipHash, result: composed,
     });
 
     return jsonResponse({
       ...composed,
       _cacheHit:      true,
       _scanAttemptId: scanAttemptId,
-      _rateLimit:     buildAlertFlags(ctx.scansToday, dailyLimit, ctx.subscriptionTier),
+      _rateLimit:     buildAlertFlags(ctx.scans_today, dailyLimit, ctx.subscription_tier),
     });
   }
 
-  // ── 6. Pick adapter for this request (v5.4) ───────────────────────────────
-  const routing = await pickAdapterForRequest(
-    supabase, ctx.subscriptionTier, ctx.haikuCallsToday,
-  );
+  // ── 7. Pick adapter for this request ──────────────────────────────────────
+  const routing = await pickAdapterForRequest(supabase, ctx.subscription_tier, primaryCallsToday);
   console.log(
     `[evaluate] routing: model=${routing.adapter.id} reason=${routing.reason} ` +
-    `parent_tier=${ctx.subscriptionTier} haiku_today=${ctx.haikuCallsToday}/${routing.haikuCallsPerDay} ` +
-    `childId=${childId}`
+    `parent_tier=${ctx.subscription_tier} primary_today=${primaryCallsToday}/${routing.primaryCallsPerDay} ` +
+    `childId=${childId}`,
   );
 
-  // ── 7. Call the model (full miss or partial hit) ──────────────────────────
-  const claudeStart = Date.now();
-  let evaluationResult: EvaluationResult;
+  // ── 8. Call the model (full miss or partial hit) ─────────────────────────
+  const modelStart = Date.now();
+  let evaluation: { result: EvaluationResult; freshProperties: PropertyScoreV6[]; resolvedObjectName: string };
 
   try {
-    evaluationResult = await evaluateObject(
+    evaluation = await evaluateObject(
       {
         detectedLabel,
         confidence:                    confidence as number,
         frameBase64:                   frameBase64 as string | null | undefined,
         requiredProperties:            missingProperties,
-        previouslyEvaluatedProperties: cachedProperties.length > 0 ? cachedProperties : undefined,
+        previouslyEvaluatedProperties: cachedV6Properties.length > 0 ? cachedV6Properties : undefined,
         childAge:                      childAge as number,
         failedAttempts:                attempts,
         questName:                     questName as string | undefined,
+        questFlavorTemplate,
         masteryProfile:                masteryProfile as Parameters<typeof evaluateObject>[0]["masteryProfile"],
         alreadyFoundWords: Array.isArray(alreadyFoundWords)
           ? (alreadyFoundWords as unknown[]).filter((w): w is string => typeof w === "string")
@@ -607,44 +761,59 @@ serve(async (req: Request) => {
     const msg = err instanceof Error ? err.message : "Evaluation failed";
     console.error(`[evaluate] model call failed (modelId=${routing.adapter.id}):`, msg);
     await logScanBlocked(supabase, {
-      childId, questId, detectedLabel, confidence: confidence as number | undefined,
-      ipHash, isRateLimited: false,
+      childId, questId: questId as string | undefined, detectedLabel,
+      confidence: confidence as number | undefined, ipHash, isRateLimited: false,
     });
     return jsonResponse({ error: msg }, 500);
   }
 
-  // ── 8. Log full result (cache_hit=false; model ran) ───────────────────────
-  const scanAttemptId = await logScanResult(supabase, {
-    childId, questId, detectedLabel, confidence: confidence as number | undefined,
-    ipHash, claudeLatencyMs: Date.now() - claudeStart,
-    result: evaluationResult,
-    modelId: routing.adapter.id,                  // NEW v5.4
-  });
+  const modelLatencyMs = Date.now() - modelStart;
+  const modelId        = routing.adapter.id;
 
-  // ── 9. Cache writes ───────────────────────────────────────────────────────
-  if (shouldUseCache) {
-    const missingWords = new Set(missingProperties.map((p) => p.word));
-    const freshScores  = evaluationResult.properties.filter((p) => missingWords.has(p.word));
+  // ── 9. Write fresh properties to cache (per-property + resolved-name) ─────
+  if (shouldUseCache && evaluation.freshProperties.length > 0) {
+    await Promise.all(evaluation.freshProperties.map(async (p) => {
+      const key: string = buildPerPropCacheKey(detectedLabel, p.word);
+      const payload: CachedVerdictV6 = {
+        v: 6,
+        verdict: { score: p.score, passes: p.passes, reasoning: p.reasoning },
+        kid_msg: p.kid_msg,
+        nudge:   p.nudge,
+        meta: {
+          model_id:   modelId,
+          schema:     6,
+          written_at: new Date().toISOString(),
+          source:     "organic",
+        },
+      };
+      await cacheSetVerdict(key, payload);
+    }));
 
-    const writes: Promise<unknown>[] = freshScores.map((score) =>
-      cacheSetProp(buildPerPropCacheKey(detectedLabel, score.word), score, routing.adapter.id),
-    );
-    writes.push(cacheSetResolvedName(
-      buildResolvedNameCacheKey(detectedLabel),
-      evaluationResult.resolvedObjectName, routing.adapter.id, detectedLabel,
-    ));
-    await Promise.all(writes);
+    if (evaluation.resolvedObjectName && evaluation.resolvedObjectName.trim().length > 0) {
+      await cacheSetResolvedName(
+        buildResolvedNameCacheKey(detectedLabel),
+        evaluation.resolvedObjectName,
+        modelId,
+        detectedLabel,
+      );
+    }
   }
 
-  // ── 10. Parent alert flags + return ───────────────────────────────────────
-  const newScansToday = ctx.scansToday + 1;
+  // ── 10. Log scan_attempts and respond ─────────────────────────────────────
+  const scanAttemptId = await logScanResult(supabase, {
+    childId, questId: questId as string | undefined, detectedLabel,
+    confidence: confidence as number | undefined, ipHash,
+    result: evaluation.result, claudeLatencyMs: modelLatencyMs, modelId,
+  });
+
   return jsonResponse({
-    ...evaluationResult,
+    ...evaluation.result,
     _cacheHit:      false,
     _scanAttemptId: scanAttemptId,
-    _rateLimit:     buildAlertFlags(newScansToday, dailyLimit, ctx.subscriptionTier),
-    // Optional client telemetry — useLexiEvaluate ignores extra props.
-    _modelId:       routing.adapter.id,
-    _routing:       routing.reason,
+    _rateLimit:     buildAlertFlags(ctx.scans_today, dailyLimit, ctx.subscription_tier),
+    _routing:       { reason: routing.reason, modelId },
   });
 });
+
+// utcMidnight is exported for tests; not currently used inside this file
+export { utcMidnight };

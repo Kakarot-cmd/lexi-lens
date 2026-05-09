@@ -1,71 +1,84 @@
 /**
  * supabase/functions/_shared/tierRouting.ts
- * Lexi-Lens — per-parent Haiku→Gemini adapter routing (Phase 4.10b).
+ * Lexi-Lens — per-request adapter routing (v6.0).
  *
- * Picks the model adapter for a single evaluate call based on:
+ * Picks the model adapter for one evaluate call based on:
  *
  *   1. The global feature_flags.evaluate_model_provider kill switch.
- *      If 'gemini', everyone gets Gemini regardless of tier (cost
- *      emergency / Anthropic outage).
+ *      If 'anthropic' → force Haiku for everyone (cost emergency rollback).
+ *      If 'gemini'    → force Gemini for everyone.
+ *      If 'mistral' or unset/null → normal tier routing below.
  *
- *   2. The parent's tier_config.haiku_calls_per_day budget.
- *      If 0, this tier never uses Haiku.
+ *   2. The parent's tier_config.primary_calls_per_day budget.
+ *      If 0 → this tier never uses primary; route to Gemini fallback.
  *
- *   3. Today's Haiku call count for this parent.
- *      If exhausted, fall back to Gemini for the rest of the day.
+ *   3. Today's primary call count for this parent.
+ *      If exhausted → fall back to Gemini for the rest of the day.
  *
  *   4. Adapter availability (isConfigured()).
- *      If Gemini is selected but GOOGLE_AI_STUDIO_KEY is missing,
- *      fall back to Anthropic with a warn log. Same defensive
- *      pattern as the main model factory.
+ *      Walks an explicit fallback chain (mistral → gemini → anthropic).
  *
- * ─── Why a separate file from _shared/models/index.ts ─────────────────────
+ * ─── Provider hierarchy (locked in v6.0) ──────────────────────────────────
  *
- *   The existing factory (getModelAdapter) is cold-start cached and
- *   returns ONE adapter for the whole container's lifetime. It's right
- *   for the global-flag use case but wrong for per-request routing.
+ *   Primary  : Mistral Small 4
+ *   Fallback : Gemini 2.5 Flash-Lite  (cost throttle, primary outage)
+ *   Deeper   : Anthropic Haiku 4.5    (Mistral + Gemini both down)
  *
- *   This helper is per-request and stateless. It reads cached values
- *   (tierConfig, model factory) but the routing decision itself happens
- *   on every evaluate call.
+ *   Order rationale:
+ *     - Gemini second: faster (1.77s vs 2.99s median), cheaper than Haiku,
+ *       same vendor diversity benefit
+ *     - Haiku last: highest verdict quality but slowest and most expensive;
+ *       reserved for "primary AND fallback both broken" scenarios
+ *
+ * ─── What changed from v5.4 ───────────────────────────────────────────────
+ *
+ *   • haikuCallsPerDay → primaryCallsPerDay (DB column rename + code)
+ *   • haikuCallsToday  → primaryCallsToday  (parameter rename only;
+ *                                            RPC still returns the old
+ *                                            field name — see the
+ *                                            evaluate/index.ts call site)
+ *   • Reasons enum reworked around the new hierarchy
+ *   • New 'mistral' value path; old 'gemini'/'anthropic' kept for kill-switch
  *
  * ─── Cache hits don't count ───────────────────────────────────────────────
  *
- *   The Haiku count this routing logic checks excludes cache hits, by
+ *   The primary count this routing logic checks excludes cache hits, by
  *   construction (the count comes from get_evaluate_context which filters
- *   cache_hit=false). This means a parent who scans 50 prewarmed objects
- *   plus 3 novel ones has "3 Haiku calls today", not 53. Consistent with
- *   the v5.2.2 cap design.
+ *   cache_hit=false). A parent who scans 50 prewarmed objects plus 3
+ *   novel ones has "3 primary calls today", not 53.
  */
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 import { anthropicHaikuAdapter } from "./models/anthropic.ts";
 import { geminiAdapter }         from "./models/gemini.ts";
+import { mistralAdapter }        from "./models/mistral.ts";
 import type { ModelAdapter }     from "./models/types.ts";
 import { getTierLimits }         from "./tierConfig.ts";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+export type RoutingReason =
+  | "kill-switch-anthropic"     // global flag = 'anthropic' (force Haiku for all)
+  | "kill-switch-gemini"        // global flag = 'gemini' (force Gemini for all)
+  | "tier-primary-zero"         // primary_calls_per_day = 0 for this tier
+  | "primary-exhausted"         // today's count >= primary_calls_per_day
+  | "primary-budget"            // within budget, route to Mistral
+  | "fallback-not-configured";  // picked adapter has no key, walked chain
+
 export interface RoutingDecision {
   adapter: ModelAdapter;
-  /** Why this adapter was picked. Surface in logs for observability. */
-  reason:
-    | "global-kill-switch"     // feature_flags.evaluate_model_provider = 'gemini'
-    | "tier-haiku-zero"        // haiku_calls_per_day = 0 for this tier
-    | "haiku-exhausted"        // today's count >= haiku_calls_per_day
-    | "haiku-budget"           // within budget, route to Haiku
-    | "gemini-not-configured"; // Gemini selected but key missing → fallback
+  reason:  RoutingReason;
   /** Effective cap and current count for log line / response telemetry. */
-  haikuCallsPerDay: number;
-  haikuCallsToday:  number;
+  primaryCallsPerDay: number;
+  primaryCallsToday:  number;
 }
 
 // ─── Internal: feature_flags.evaluate_model_provider read ────────────────────
 //
-// Lightweight standalone read; doesn't reuse the model factory's getModelAdapter
-// because that would couple cold-start cache to per-request routing in
-// confusing ways. 60s in-process cache, same pattern as elsewhere.
+// 60s in-process cache. Doesn't reuse the model factory's getModelAdapter
+// because that would couple the cold-start cache to per-request routing
+// in confusing ways.
 
 const FLAG_TTL_MS = 60_000;
 let cachedFlag: { value: string | null; expiresAt: number } | null = null;
@@ -88,9 +101,9 @@ async function readGlobalProviderFlag(
       return null;
     }
 
-    const raw = (data as { value?: unknown } | null)?.value;
+    const raw   = (data as { value?: unknown } | null)?.value;
     const value = typeof raw === "string" ? raw.trim().toLowerCase() : null;
-    cachedFlag = { value, expiresAt: now + FLAG_TTL_MS };
+    cachedFlag  = { value, expiresAt: now + FLAG_TTL_MS };
     return value;
   } catch {
     cachedFlag = { value: null, expiresAt: now + FLAG_TTL_MS };
@@ -98,98 +111,117 @@ async function readGlobalProviderFlag(
   }
 }
 
+// ─── Internal: fallback chain ────────────────────────────────────────────────
+//
+// Order matters. When the picked adapter is unconfigured, finalize() walks
+// this list in order, skipping the picked one, and returns the first that's
+// configured. If nothing's configured, returns the original decision and the
+// eventual .call() throws — better than swallowing a misconfiguration.
+
+const FALLBACK_CHAIN: readonly ModelAdapter[] = [
+  mistralAdapter,         // primary (preferred fallback if Gemini also down)
+  geminiAdapter,          // fallback
+  anthropicHaikuAdapter,  // deeper fallback
+] as const;
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
  * Decide which adapter to use for one evaluate request.
  *
- * @param supabase         Service-role Supabase client.
- * @param subscriptionTier Parent's tier (free | tier1 | tier2 | family | paid).
- * @param haikuCallsToday  Already-used Haiku calls (parent-aggregated).
+ * @param supabase           Service-role Supabase client.
+ * @param subscriptionTier   Parent's tier (free | tier1 | tier2 | family | paid).
+ * @param primaryCallsToday  Already-used primary calls today (parent-aggregated).
+ *                           Source: get_evaluate_context RPC's haiku_calls_today
+ *                           field; the field name is residual from v5 and
+ *                           is corrected by the caller's variable name.
  */
 export async function pickAdapterForRequest(
-  supabase:         SupabaseClient,
-  subscriptionTier: string,
-  haikuCallsToday:  number,
+  supabase:           SupabaseClient,
+  subscriptionTier:   string,
+  primaryCallsToday:  number,
 ): Promise<RoutingDecision> {
   const limits = await getTierLimits(supabase, subscriptionTier);
 
   // 1. Global kill switch — overrides everything except adapter availability.
   const globalFlag = await readGlobalProviderFlag(supabase);
+  if (globalFlag === "anthropic") {
+    return finalize({
+      adapter:            anthropicHaikuAdapter,
+      reason:             "kill-switch-anthropic",
+      primaryCallsPerDay: limits.primaryCallsPerDay,
+      primaryCallsToday,
+    });
+  }
   if (globalFlag === "gemini") {
     return finalize({
-      adapter:           geminiAdapter,
-      reason:            "global-kill-switch",
-      haikuCallsPerDay:  limits.haikuCallsPerDay,
-      haikuCallsToday,
+      adapter:            geminiAdapter,
+      reason:             "kill-switch-gemini",
+      primaryCallsPerDay: limits.primaryCallsPerDay,
+      primaryCallsToday,
     });
   }
+  // globalFlag === "mistral" or null → continue with normal routing.
 
-  // 2. Tier explicitly configured for zero Haiku calls.
-  if (limits.haikuCallsPerDay === 0) {
+  // 2. Tier explicitly configured for zero primary calls.
+  if (limits.primaryCallsPerDay === 0) {
     return finalize({
-      adapter:           geminiAdapter,
-      reason:            "tier-haiku-zero",
-      haikuCallsPerDay:  limits.haikuCallsPerDay,
-      haikuCallsToday,
+      adapter:            geminiAdapter,
+      reason:             "tier-primary-zero",
+      primaryCallsPerDay: limits.primaryCallsPerDay,
+      primaryCallsToday,
     });
   }
 
-  // 3. Parent's daily Haiku budget exhausted.
-  if (haikuCallsToday >= limits.haikuCallsPerDay) {
+  // 3. Parent's daily primary budget exhausted.
+  if (primaryCallsToday >= limits.primaryCallsPerDay) {
     return finalize({
-      adapter:           geminiAdapter,
-      reason:            "haiku-exhausted",
-      haikuCallsPerDay:  limits.haikuCallsPerDay,
-      haikuCallsToday,
+      adapter:            geminiAdapter,
+      reason:             "primary-exhausted",
+      primaryCallsPerDay: limits.primaryCallsPerDay,
+      primaryCallsToday,
     });
   }
 
-  // 4. Within Haiku budget.
+  // 4. Within primary budget — route to Mistral.
   return finalize({
-    adapter:           anthropicHaikuAdapter,
-    reason:            "haiku-budget",
-    haikuCallsPerDay:  limits.haikuCallsPerDay,
-    haikuCallsToday,
+    adapter:            mistralAdapter,
+    reason:             "primary-budget",
+    primaryCallsPerDay: limits.primaryCallsPerDay,
+    primaryCallsToday,
   });
 }
 
-/**
- * Test-only helper: reset the global flag cache.
- */
-export function _resetTierRoutingCacheForTests(): void {
-  cachedFlag = null;
-}
-
-// ─── Internal: adapter availability final check ──────────────────────────────
+// ─── Internal: adapter availability final check + fallback walk ──────────────
 
 function finalize(decision: RoutingDecision): RoutingDecision {
-  if (!decision.adapter.isConfigured()) {
-    // Fallback: if the picked adapter has no API key, use the other one.
-    // Anthropic is the safest default since it's the original primary.
-    const fallback = decision.adapter.id === "claude-haiku-4-5"
-      ? geminiAdapter
-      : anthropicHaikuAdapter;
+  if (decision.adapter.isConfigured()) return decision;
 
-    if (fallback.isConfigured()) {
+  // Walk the fallback chain in order, skipping the original (broken) pick.
+  for (const candidate of FALLBACK_CHAIN) {
+    if (candidate.id === decision.adapter.id) continue;
+    if (candidate.isConfigured()) {
       console.warn(
-        `[tierRouting] picked=${decision.adapter.id} but not configured; ` +
-        `falling back to ${fallback.id} (reason was ${decision.reason})`
+        `[tierRouting] picked=${decision.adapter.id} not configured; ` +
+        `falling back to ${candidate.id} (original reason: ${decision.reason})`
       );
       return {
         ...decision,
-        adapter: fallback,
-        reason:  "gemini-not-configured",
+        adapter: candidate,
+        reason:  "fallback-not-configured",
       };
     }
-
-    // Both unconfigured — surface the original decision; the eventual
-    // adapter.call() will throw a clear error which evaluate logs and
-    // returns 500 on. Better than swallowing the misconfiguration here.
-    console.error(
-      `[tierRouting] no adapter is configured. Set ANTHROPIC_API_KEY or ` +
-      `GOOGLE_AI_STUDIO_KEY in Edge Function secrets.`
-    );
   }
-  return decision;
+
+  console.error(
+    `[tierRouting] no adapter is configured. Set MISTRAL_API_KEY, ` +
+    `GOOGLE_AI_STUDIO_KEY, or ANTHROPIC_API_KEY in Edge Function secrets. ` +
+    `Original pick: ${decision.adapter.id}, reason: ${decision.reason}`
+  );
+  return decision; // .call() will throw a clear ModelCallError
+}
+
+/** Test-only helper: reset the global flag cache. */
+export function _resetTierRoutingCacheForTests(): void {
+  cachedFlag = null;
 }
