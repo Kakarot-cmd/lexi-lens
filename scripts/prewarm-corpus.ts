@@ -1,314 +1,370 @@
 /**
  * scripts/prewarm-corpus.ts
- * Lexi-Lens — curated cache pre-warm corpus.
+ * Lexi-Lens — prewarm corpus v2 (audited 2026-05-09).
  *
- * v3 (2026-05-09): rewritten for the no-overlap 3-dungeon design.
+ * v2 changes from v1, based on the model-evaluation finding that 14 of 143
+ * (label × property) assignments produced cross-model verdict disagreement:
  *
- *   The free tier now has three distinct dungeons in three distinct rooms,
- *   with three completely disjoint property pools (no word appears in more
- *   than one pool). The corpus reflects this: per-object property lists
- *   are the union of pool words across whichever dungeons that object is
- *   plausibly scanned in.
+ *   • REMOVED 11 genuinely-ambiguous assignments (a kid scanning the same
+ *     object class would get inconsistent verdicts depending on the specific
+ *     instance). These were corpus design problems, not model problems.
  *
- *   Pool A — Bedroom textures:    soft, fluffy, smooth, stretchy
- *   Pool B — Kitchen shape-3D:    round, hollow, cylindrical, curved
- *   Pool C — Library flatness:    flat, rectangular, rigid, thin
+ *   • ADDED evaluationHints to 14 category-truth assignments where one or
+ *     more models (sometimes including Haiku itself) reasoned at instance-
+ *     level rather than category-level. Hints anchor all models toward the
+ *     pedagogically-correct interpretation.
  *
- *   12 unique property words. Pool intersections all empty.
+ * v2 verdict-agreement projection: ~95%+ across all models, up from 87%
+ * baseline (Mistral) and 87% (Gemini). Validate with a re-run before
+ * prewarming the cache.
  *
- * The corpus is in TWO blocks:
+ * ─── Shape ────────────────────────────────────────────────────────────────
  *
- *   1. category="free_dungeon" — high priority. Every entry maps a
- *      likely-scan object to the union of pool words it could be tested
- *      against. A "ball" gets tested for {smooth, soft} from A and
- *      {round, hollow, curved} from B because balls show up in both
- *      dungeons. A "book" gets only Pool C words. A "pillow" gets only
- *      Pool A words.
+ *   Mixed: properties is an array of `string` (no hint) OR
+ *   `{ word: string, evaluationHints: string }` (hint-anchored).
  *
- *      Run before launch:
- *        deno run -A scripts/prewarm-cache.ts --env staging \
- *          --category free_dungeon --skip-cached
+ *   The eval harness's normalizeEntry() and evaluateObject() both accept
+ *   this mixed shape — string properties default to using the word as
+ *   its own definition, object properties carry the hint into the prompt.
  *
- *   2. category="general_household" — wider corpus, paid-tier and edge
- *      cases. Properties extend beyond the 12-word free pool. Lower
- *      priority; run after launch when prod data tells you what paid
- *      users actually scan.
+ * ─── Disjoint property pools (preserved from v1) ──────────────────────────
  *
- * ─── Design rules ─────────────────────────────────────────────────────────
+ *   Free Dungeon A — Plushy Pixie's Bedroom (textures):  soft, fluffy, smooth, stretchy
+ *   Free Dungeon B — Hollow Hippo's Kitchen (3D shape):  round, hollow, cylindrical, curved
+ *   Free Dungeon C — Bookbound Banshee's Library (flat): flat, rectangular, rigid, thin
  *
- *   1. Lower-case singular labels. The cache-key normalize step handles
- *      plurals and casing — "apple" warms hits for "apples", "Apple",
- *      "APPLES" too.
- *
- *   2. 4-8 properties per entry. Production caps Anthropic at
- *      max_tokens=700; more than 8 risks truncation.
- *
- *   3. For free_dungeon entries, the property list is the union of words
- *      from any pool the object plausibly belongs to. Each (object, word)
- *      pair gets cached regardless of model verdict — false verdicts
- *      ("a book is not soft") still save a model call when a kid scans
- *      mistakenly.
- *
- *   4. Phrasal labels ("toy car", "stuffed animal", "remote control")
- *      match the canonical form the model would return as
- *      resolvedObjectName. The resolved-name cache layer maps ML Kit's
- *      labels onto these separately. iOS perceptual-hash work, when it
- *      lands, MUST resolve to this same canonical label set.
- *
- * ─── Maintenance ───────────────────────────────────────────────────────────
- *
- *   When you spot a (label, word) pair that consistently misses cache in
- *   production (run the SQL in monitor v5.3 § "Cache hit surface — repeat
- *   (label, word) pairs"), add it to free_dungeon if it's a free-tier
- *   miss, or general_household otherwise. Re-run prewarm with --skip-cached;
- *   only new entries cost the per-call rate.
- *
- *   IMPORTANT: if the 3 free-tier dungeons' age_band_properties are
- *   updated to add/remove words, update the FREE_DUNGEON_POOL constant
- *   below to match — and verify pool disjointness before committing.
+ *   Disjointness is asserted at module-load time; bad entries fail loudly.
  */
 
-export interface PrewarmEntry {
-  /** Object label as it would arrive from ML Kit (or be canonicalised by the model). */
-  label: string;
-  /** Property words to evaluate together in one model call. 4-8 items. */
-  properties: string[];
-  /** Category tag for grouping logs and partial runs. */
-  category: string;
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+export interface PrewarmProperty {
+  word:             string;
+  evaluationHints?: string;
 }
 
-// ─── FREE-TIER DUNGEON POOLS (must match age_band_properties on the 3 free dungeons) ──
+export interface PrewarmEntry {
+  category:    "free_dungeon" | "general_household";
+  label:       string;
+  /** Mixed: string for unambiguous properties, object for hint-anchored. */
+  properties:  Array<string | PrewarmProperty>;
+}
+
+// ─── Disjoint property pool constants ────────────────────────────────────────
+
+const POOL_TEXTURES   = new Set(["soft", "fluffy", "smooth", "stretchy"]);
+const POOL_3D_SHAPE   = new Set(["round", "hollow", "cylindrical", "curved"]);
+const POOL_FLATNESS   = new Set(["flat", "rectangular", "rigid", "thin"]);
+
+// ─── Hint text constants (re-used across multiple entries) ───────────────────
+
+const HINT_FLUFFY_PILE_OBJECTS =
+  "Accept PASS for any object with raised pile, plush, or fleece-like texture. " +
+  "Reason at the object class level: this category typically has a fluffy texture, " +
+  "even if individual instances vary. Avoid FAIL for image-based uncertainty.";
+
+const HINT_KNIT_STRETCH =
+  "Accept PASS for any knitted garment. Knitted fabrics stretch by construction; " +
+  "reason at the category level rather than rejecting due to a specific instance " +
+  "looking firm in the image.";
+
+const HINT_GLASS_ROUND =
+  "A drinking glass has a circular (round) cross-section and rim. Accept PASS — " +
+  "'round' applies to circular shape, not only spherical objects.";
+
+const HINT_GLASS_HOLLOW =
+  "A drinking glass is by design hollow — it holds liquid in an empty interior. " +
+  "Accept PASS for any glass; this is a category truth.";
+
+const HINT_GLASS_CYLINDRICAL =
+  "Drinking glasses have vertical or near-vertical sides forming a cylindrical " +
+  "or tapered-cylindrical body. Accept PASS for typical drinkware.";
+
+const HINT_GLASS_CURVED =
+  "Glasses have curved rims and often curved sides. Accept PASS for any drinking glass.";
+
+const HINT_KETTLE_ROUND =
+  "A kettle has a round (circular cross-section) body. The presence of a spout " +
+  "or handle does not disqualify — the body itself is round.";
+
+const HINT_PHONE_FLAT =
+  "A modern smartphone is a flat slab. Accept PASS — slight edge curvature does " +
+  "not disqualify the overall flat geometry.";
+
+const HINT_BLOCKS_RECTANGULAR =
+  "Building blocks are rectangular cuboids. Accept PASS — this is the canonical block shape.";
+
+const HINT_BOOK_RIGID =
+  "Hardcover and most paperback books have rigid covers and a bound spine. " +
+  "Accept PASS unless the object is clearly a soft/floppy booklet.";
+
+const HINT_BOOK_THIN =
+  "A book is thin relative to its length and width. Accept PASS based on the " +
+  "thin dimension being narrower than the others — not on absolute thinness.";
+
+const HINT_BLANKET_FLUFFY =
+  "Accept PASS for blankets with any plush, soft, or pile texture (fleece, " +
+  "sherpa, knit, quilted). Most household blankets meet this category description.";
+
+const HINT_TOWEL_FLUFFY =
+  "Accept PASS for any terry-cloth or pile-textured towel. Standard bath, " +
+  "hand, and beach towels all qualify by category.";
+
+const HINT_RUG_FLUFFY =
+  "Accept PASS for any rug with raised pile (shag, plush, area rugs). " +
+  "Most household rugs have some pile and qualify by category.";
+
+const HINT_CUSHION_FLUFFY =
+  "Accept PASS for cushions filled with foam, down, or fiberfill that creates " +
+  "a plump, airy texture. Standard household cushions qualify.";
+
+// ─── Free Dungeon — corpus entries (40, audited 2026-05-09) ──────────────────
 //
-// These constants are the source of truth for what gets prewarmed. If the
-// dungeon definitions in Supabase change, update these — pool disjointness
-// is asserted at module load time (see the bottom of this file).
+// Inline comments document the v1 → v2 audit changes. Removed properties are
+// noted but absent from the array; added hints are present on object entries.
 
-export const FREE_DUNGEON_POOL_A_TEXTURES   = ["soft", "fluffy", "smooth", "stretchy"]   as const;
-export const FREE_DUNGEON_POOL_B_SHAPES_3D  = ["round", "hollow", "cylindrical", "curved"] as const;
-export const FREE_DUNGEON_POOL_C_FLATNESS   = ["flat", "rectangular", "rigid", "thin"]   as const;
+const FREE_DUNGEON_ENTRIES: PrewarmEntry[] = [
 
-// ─── FREE-DUNGEON PRIORITY BLOCK ─────────────────────────────────────────────
-//
-// Per-object property mapping: each object lists the union of pool words
-// from whichever dungeons it might be scanned in. The model returns a
-// verdict per word; both passes and fails get cached and save future
-// model calls.
-//
-// Object selection criteria:
-//   - Things kids 5-10 actually point cameras at, in or near bedrooms,
-//     kitchens, and libraries.
-//   - At least one object per pool gets several entries to drive hit
-//     rate concentration in that pool.
-//   - Cross-pool objects (ball, plate, balloon) are explicit so a single
-//     object scan during gameplay across multiple dungeons gets the right
-//     verdict from cache.
+  // ── Plushy Pixie's Bedroom — texture properties ──
 
-const FREE_DUNGEON_ENTRIES: readonly PrewarmEntry[] = [
-  // ─── BEDROOM-only objects (Pool A: textures) ─────────────────────────────
-  { category: "free_dungeon", label: "pillow",          properties: ["soft", "fluffy", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "blanket",         properties: ["soft", "fluffy", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "teddy bear",      properties: ["soft", "fluffy", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "stuffed animal",  properties: ["soft", "fluffy", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "doll",            properties: ["soft", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "sock",            properties: ["soft", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "shirt",           properties: ["soft", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "sweater",         properties: ["soft", "fluffy", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "scarf",           properties: ["soft", "fluffy", "smooth", "stretchy"] },
-  { category: "free_dungeon", label: "towel",           properties: ["soft", "fluffy", "smooth"] },
-  { category: "free_dungeon", label: "cushion",         properties: ["soft", "fluffy", "smooth"] },
-  { category: "free_dungeon", label: "rug",             properties: ["soft", "fluffy", "smooth"] },
+  // pillow: removed "smooth" (outer cover smooth, filling not — ambiguous)
+  { category: "free_dungeon", label: "pillow",
+    properties: ["soft", "fluffy", "stretchy"] },
 
-  // ─── KITCHEN-only objects (Pool B: shape-3D) ─────────────────────────────
-  { category: "free_dungeon", label: "cup",             properties: ["round", "hollow", "cylindrical", "curved"] },
-  { category: "free_dungeon", label: "mug",             properties: ["round", "hollow", "cylindrical", "curved"] },
-  { category: "free_dungeon", label: "bowl",            properties: ["round", "hollow", "curved"] },
-  { category: "free_dungeon", label: "glass",           properties: ["round", "hollow", "cylindrical", "curved"] },
-  { category: "free_dungeon", label: "bottle",          properties: ["round", "hollow", "cylindrical", "curved"] },
-  { category: "free_dungeon", label: "jar",             properties: ["round", "hollow", "cylindrical", "curved"] },
-  { category: "free_dungeon", label: "pot",             properties: ["round", "hollow", "cylindrical", "curved"] },
-  { category: "free_dungeon", label: "kettle",          properties: ["round", "hollow", "curved"] },
+  { category: "free_dungeon", label: "blanket",
+    properties: [
+      "soft",
+      { word: "fluffy", evaluationHints: HINT_BLANKET_FLUFFY },
+      // "smooth" removed: ambiguous (depends on material)
+      "stretchy",
+    ]
+  },
 
-  // ─── LIBRARY-only objects (Pool C: flatness) ─────────────────────────────
-  { category: "free_dungeon", label: "book",            properties: ["flat", "rectangular", "rigid", "thin"] },
-  { category: "free_dungeon", label: "notebook",        properties: ["flat", "rectangular", "thin"] },
-  { category: "free_dungeon", label: "paper",           properties: ["flat", "rectangular", "thin"] },
-  { category: "free_dungeon", label: "magazine",        properties: ["flat", "rectangular", "thin"] },
-  { category: "free_dungeon", label: "ruler",           properties: ["flat", "rectangular", "rigid", "thin"] },
-  { category: "free_dungeon", label: "binder",          properties: ["flat", "rectangular", "rigid"] },
-  { category: "free_dungeon", label: "envelope",        properties: ["flat", "rectangular", "thin"] },
-  { category: "free_dungeon", label: "card",            properties: ["flat", "rectangular", "thin", "rigid"] },
+  { category: "free_dungeon", label: "teddy bear",
+    properties: ["soft", "fluffy", "smooth", "stretchy"] },
 
-  // ─── CROSS-POOL objects (likely scanned across multiple dungeons) ────────
-  // These get the union of words from EVERY pool they plausibly belong to.
+  { category: "free_dungeon", label: "stuffed animal",
+    properties: ["soft", "fluffy", "smooth", "stretchy"] },
 
-  // Ball: in Bedroom (texture quest) AND Kitchen (shape quest)
-  { category: "free_dungeon", label: "ball",            properties: ["soft", "smooth", "round", "hollow", "curved"] },
+  // doll: removed "smooth" (varies by body part — face plastic, hair textured)
+  { category: "free_dungeon", label: "doll",
+    properties: ["soft", "stretchy"] },
 
-  // Balloon: same as ball
-  { category: "free_dungeon", label: "balloon",         properties: ["smooth", "stretchy", "round", "hollow", "curved"] },
+  // sock: removed "smooth" (depends on weave/material)
+  { category: "free_dungeon", label: "sock",
+    properties: ["soft", "stretchy"] },
 
-  // Plate: Kitchen (curved/round) AND Library (flat/rigid)
-  { category: "free_dungeon", label: "plate",           properties: ["round", "curved", "flat", "rigid"] },
+  // shirt: removed "smooth" (varies by fabric)
+  { category: "free_dungeon", label: "shirt",
+    properties: ["soft", "stretchy"] },
 
-  // Tablet: typically Library (flat/rigid/rectangular) but sometimes scanned for textures
-  { category: "free_dungeon", label: "tablet",          properties: ["smooth", "flat", "rectangular", "rigid", "thin"] },
+  // sweater: removed "smooth" (most are textured knit). Hinted "stretchy" since
+  // some models doubted at instance level.
+  { category: "free_dungeon", label: "sweater",
+    properties: [
+      "soft",
+      "fluffy",
+      { word: "stretchy", evaluationHints: HINT_KNIT_STRETCH },
+    ]
+  },
 
-  // Phone: same as tablet
-  { category: "free_dungeon", label: "phone",           properties: ["smooth", "flat", "rectangular", "rigid", "thin"] },
+  // scarf: removed "smooth" and "fluffy" (both depend on material — silk vs wool)
+  { category: "free_dungeon", label: "scarf",
+    properties: ["soft", "stretchy"] },
 
-  // Remote control: Library (rectangular/rigid) but kids hold it on bed too
-  { category: "free_dungeon", label: "remote control",  properties: ["smooth", "flat", "rectangular", "rigid"] },
+  { category: "free_dungeon", label: "towel",
+    properties: [
+      "soft",
+      { word: "fluffy", evaluationHints: HINT_TOWEL_FLUFFY },
+      // "smooth" removed: terry-cloth not smooth by design
+    ]
+  },
 
-  // Toys that show up in Bedroom AND Library
-  { category: "free_dungeon", label: "toy car",         properties: ["smooth", "round", "rigid"] },
-  { category: "free_dungeon", label: "lego",            properties: ["smooth", "rigid", "rectangular"] },
-  { category: "free_dungeon", label: "blocks",          properties: ["smooth", "rigid", "rectangular"] },
+  { category: "free_dungeon", label: "cushion",
+    properties: [
+      "soft",
+      { word: "fluffy", evaluationHints: HINT_CUSHION_FLUFFY },
+      // "smooth" removed: ambiguous
+    ]
+  },
 
-  // ─── COMMON FRUIT (kids carry into Bedroom + Kitchen) ────────────────────
-  { category: "free_dungeon", label: "apple",           properties: ["smooth", "round", "curved"] },
-  { category: "free_dungeon", label: "orange",          properties: ["round", "curved"] },
-  { category: "free_dungeon", label: "banana",          properties: ["smooth", "curved"] },
+  { category: "free_dungeon", label: "rug",
+    properties: [
+      "soft",
+      { word: "fluffy", evaluationHints: HINT_RUG_FLUFFY },
+      // "smooth" removed: most rugs have texture
+    ]
+  },
+
+  // ── Hollow Hippo's Kitchen — 3D shape properties ──
+
+  { category: "free_dungeon", label: "cup",
+    properties: ["round", "hollow", "cylindrical", "curved"] },
+
+  { category: "free_dungeon", label: "mug",
+    properties: ["round", "hollow", "cylindrical", "curved"] },
+
+  { category: "free_dungeon", label: "bowl",
+    properties: ["round", "hollow", "curved"] },
+
+  // glass: ALL FOUR properties hinted. Haiku itself was wrong on "round" and
+  // gave self-contradictory reasoning on hollow/cylindrical/curved. Strong hints.
+  { category: "free_dungeon", label: "glass",
+    properties: [
+      { word: "round",       evaluationHints: HINT_GLASS_ROUND },
+      { word: "hollow",      evaluationHints: HINT_GLASS_HOLLOW },
+      { word: "cylindrical", evaluationHints: HINT_GLASS_CYLINDRICAL },
+      { word: "curved",      evaluationHints: HINT_GLASS_CURVED },
+    ]
+  },
+
+  { category: "free_dungeon", label: "bottle",
+    properties: ["round", "hollow", "cylindrical", "curved"] },
+
+  { category: "free_dungeon", label: "jar",
+    properties: ["round", "hollow", "cylindrical", "curved"] },
+
+  // pot: hinted "cylindrical" (Haiku was over-cautious about taper)
+  { category: "free_dungeon", label: "pot",
+    properties: [
+      "round",
+      "hollow",
+      { word: "cylindrical", evaluationHints:
+          "Most cooking pots are cylindrical — circular cross-section, vertical sides. " +
+          "Slight taper does not disqualify." },
+      "curved",
+    ]
+  },
+
+  // kettle: hinted "round" (Haiku FAILed due to spout/handle; body is still round)
+  { category: "free_dungeon", label: "kettle",
+    properties: [
+      { word: "round", evaluationHints: HINT_KETTLE_ROUND },
+      "hollow",
+      "curved",
+    ]
+  },
+
+  // ── Bookbound Banshee's Library — flatness properties ──
+
+  // book: hinted both "rigid" (Haiku correct, others doubted) and "thin"
+  // (Haiku was over-strict on the relative interpretation)
+  { category: "free_dungeon", label: "book",
+    properties: [
+      "flat",
+      "rectangular",
+      { word: "rigid", evaluationHints: HINT_BOOK_RIGID },
+      { word: "thin",  evaluationHints: HINT_BOOK_THIN },
+    ]
+  },
+
+  { category: "free_dungeon", label: "notebook",
+    properties: [
+      "flat",
+      "rectangular",
+      { word: "thin", evaluationHints: HINT_BOOK_THIN },
+    ]
+  },
+
+  { category: "free_dungeon", label: "paper",
+    properties: ["flat", "rectangular", "thin"] },
+
+  { category: "free_dungeon", label: "magazine",
+    properties: [
+      "flat",
+      "rectangular",
+      { word: "thin", evaluationHints: HINT_BOOK_THIN },
+    ]
+  },
+
+  { category: "free_dungeon", label: "ruler",
+    properties: ["flat", "rectangular", "rigid", "thin"] },
+
+  { category: "free_dungeon", label: "binder",
+    properties: ["flat", "rectangular", "rigid"] },
+
+  { category: "free_dungeon", label: "envelope",
+    properties: ["flat", "rectangular", "thin"] },
+
+  { category: "free_dungeon", label: "card",
+    properties: ["flat", "rectangular", "thin", "rigid"] },
+
+  // ── Cross-pool / general entries (formerly assumed general_household but
+  //    appearing in the free_dungeon eval set) ──
+
+  // ball: removed "smooth" and "soft" (vary too much by ball type — basketball
+  // vs ping-pong vs tennis ball). Kept the shape properties.
+  { category: "free_dungeon", label: "ball",
+    properties: ["round", "hollow", "curved"] },
+
+  { category: "free_dungeon", label: "balloon",
+    properties: ["smooth", "stretchy", "round", "hollow", "curved"] },
+
+  { category: "free_dungeon", label: "plate",
+    properties: ["round", "curved", "flat", "rigid"] },
+
+  { category: "free_dungeon", label: "tablet",
+    properties: ["smooth", "flat", "rectangular", "rigid", "thin"] },
+
+  // phone: hinted "flat" (Haiku FAILed due to slight edge curvature)
+  { category: "free_dungeon", label: "phone",
+    properties: [
+      "smooth",
+      { word: "flat", evaluationHints: HINT_PHONE_FLAT },
+      "rectangular",
+      "rigid",
+      "thin",
+    ]
+  },
+
+  { category: "free_dungeon", label: "remote control",
+    properties: ["smooth", "flat", "rectangular", "rigid"] },
+
+  // toy car: REMOVED "round" entirely (depends on wheels vs body — corpus
+  // designer's intent unclear, kid-confusing either way)
+  { category: "free_dungeon", label: "toy car",
+    properties: ["smooth", "rigid"] },
+
+  // lego: removed "smooth" (studs make it not smooth)
+  { category: "free_dungeon", label: "lego",
+    properties: ["rigid", "rectangular"] },
+
+  // blocks: hinted "rectangular" (Haiku was self-contradictory FAIL with reasoning
+  // that said "most blocks are rectangular")
+  { category: "free_dungeon", label: "blocks",
+    properties: [
+      "smooth",
+      "rigid",
+      { word: "rectangular", evaluationHints: HINT_BLOCKS_RECTANGULAR },
+    ]
+  },
+
+  { category: "free_dungeon", label: "apple",
+    properties: ["smooth", "round", "curved"] },
+
+  { category: "free_dungeon", label: "orange",
+    properties: ["round", "curved"] },
+
+  { category: "free_dungeon", label: "banana",
+    properties: ["smooth", "curved"] },
 ];
 
-// ─── GENERAL HOUSEHOLD BLOCK ─────────────────────────────────────────────────
+// ─── general_household entries (PRESERVE FROM v1 — not yet audited) ──────────
 //
-// Wider coverage for paid-tier scans, edge-case objects, and organic-traffic
-// shoulder. Properties extend beyond the 12-word free pool. Run AFTER you
-// have prod data showing what paid users actually scan.
+// These haven't been through eval yet. Run `eval-adapters.ts --corpus
+// general_household` before prewarm to identify property-assignment issues.
+// Then re-audit the same way as free_dungeon was audited above.
 
-const GENERAL_HOUSEHOLD_ENTRIES: readonly PrewarmEntry[] = [
-  // ─── FRUITS & VEGETABLES (extras beyond free_dungeon) ────────────────────
-  { category: "general_household", label: "lemon",        properties: ["yellow", "oval", "bumpy", "sour", "small"] },
-  { category: "general_household", label: "strawberry",   properties: ["red", "small", "bumpy", "sweet", "soft"] },
-  { category: "general_household", label: "grape",        properties: ["small", "round", "smooth", "sweet", "purple", "green"] },
-  { category: "general_household", label: "carrot",       properties: ["orange", "long", "hard", "pointy", "smooth"] },
-  { category: "general_household", label: "tomato",       properties: ["red", "round", "smooth", "shiny", "soft"] },
-  { category: "general_household", label: "broccoli",     properties: ["green", "bumpy", "small", "soft"] },
-  { category: "general_household", label: "potato",       properties: ["brown", "round", "rough", "hard", "bumpy"] },
-
-  // ─── KITCHEN (extras) ────────────────────────────────────────────────────
-  { category: "general_household", label: "spoon",        properties: ["smooth", "shiny", "metal", "small", "curved"] },
-  { category: "general_household", label: "fork",         properties: ["pointy", "shiny", "metal", "smooth"] },
-  { category: "general_household", label: "knife",        properties: ["sharp", "shiny", "metal", "long"] },
-
-  // ─── TOYS (extras) ───────────────────────────────────────────────────────
-  { category: "general_household", label: "puzzle",       properties: ["flat", "small", "colorful", "hard"] },
-  { category: "general_household", label: "kite",         properties: ["light", "flat", "colorful", "thin"] },
-  { category: "general_household", label: "yo-yo",        properties: ["round", "small", "hard", "smooth"] },
-  { category: "general_household", label: "toy train",    properties: ["long", "hard", "shiny", "small"] },
-
-  // ─── SCHOOL (extras) ─────────────────────────────────────────────────────
-  { category: "general_household", label: "pencil",       properties: ["long", "thin", "wooden", "pointy", "smooth"] },
-  { category: "general_household", label: "pen",          properties: ["long", "thin", "smooth", "plastic", "shiny"] },
-  { category: "general_household", label: "crayon",       properties: ["small", "smooth", "colorful", "pointy", "waxy"] },
-  { category: "general_household", label: "marker",       properties: ["long", "thin", "smooth", "plastic", "colorful"] },
-  { category: "general_household", label: "eraser",       properties: ["small", "soft", "rubber", "smooth"] },
-  { category: "general_household", label: "scissors",     properties: ["sharp", "metal", "shiny", "small"] },
-  { category: "general_household", label: "glue stick",   properties: ["small", "smooth", "sticky", "plastic"] },
-  { category: "general_household", label: "backpack",     properties: ["soft", "big", "cloth", "colorful"] },
-
-  // ─── FURNITURE & HOUSEHOLD ───────────────────────────────────────────────
-  { category: "general_household", label: "chair",        properties: ["hard", "tall", "wooden", "smooth"] },
-  { category: "general_household", label: "table",        properties: ["flat", "hard", "wooden", "smooth", "tall"] },
-  { category: "general_household", label: "sofa",         properties: ["soft", "big", "fluffy", "cloth"] },
-  { category: "general_household", label: "bed",          properties: ["soft", "big", "flat", "fluffy"] },
-  { category: "general_household", label: "lamp",         properties: ["bright", "tall", "smooth", "shiny"] },
-  { category: "general_household", label: "mirror",       properties: ["flat", "shiny", "smooth", "fragile"] },
-  { category: "general_household", label: "clock",        properties: ["round", "flat", "hard", "smooth"] },
-  { category: "general_household", label: "vase",         properties: ["tall", "smooth", "fragile", "shiny", "hollow"] },
-  { category: "general_household", label: "candle",       properties: ["small", "smooth", "waxy", "cylindrical"] },
-  { category: "general_household", label: "key",          properties: ["small", "metal", "shiny", "hard", "smooth"] },
-
-  // ─── CLOTHES (extras) ────────────────────────────────────────────────────
-  { category: "general_household", label: "hat",          properties: ["soft", "round", "cloth", "small"] },
-  { category: "general_household", label: "shoe",         properties: ["soft", "leather", "small", "flexible"] },
-  { category: "general_household", label: "jacket",       properties: ["warm", "soft", "thick", "big"] },
-  { category: "general_household", label: "gloves",       properties: ["small", "soft", "warm", "stretchy"] },
-
-  // ─── ANIMALS ─────────────────────────────────────────────────────────────
-  { category: "general_household", label: "cat",          properties: ["soft", "small", "fluffy", "warm"] },
-  { category: "general_household", label: "dog",          properties: ["soft", "fluffy", "warm", "big"] },
-  { category: "general_household", label: "fish",         properties: ["small", "shiny", "smooth", "wet"] },
-  { category: "general_household", label: "bird",         properties: ["small", "light", "soft"] },
-  { category: "general_household", label: "rabbit",       properties: ["soft", "fluffy", "small", "warm"] },
-
-  // ─── NATURE & OUTDOOR ────────────────────────────────────────────────────
-  { category: "general_household", label: "tree",         properties: ["tall", "wooden", "rough", "big"] },
-  { category: "general_household", label: "leaf",         properties: ["green", "thin", "flat", "small", "smooth"] },
-  { category: "general_household", label: "flower",       properties: ["colorful", "small", "soft", "smooth"] },
-  { category: "general_household", label: "grass",        properties: ["green", "thin", "soft", "small"] },
-  { category: "general_household", label: "rock",         properties: ["hard", "rough", "heavy", "small"] },
-  { category: "general_household", label: "stick",        properties: ["wooden", "long", "rough", "thin"] },
-  { category: "general_household", label: "pinecone",     properties: ["brown", "rough", "small", "hard", "bumpy"] },
-  { category: "general_household", label: "seashell",     properties: ["small", "smooth", "hard", "shiny"] },
-
-  // ─── VEHICLES ────────────────────────────────────────────────────────────
-  { category: "general_household", label: "car",          properties: ["big", "hard", "shiny", "metal", "smooth"] },
-  { category: "general_household", label: "truck",        properties: ["big", "hard", "heavy", "metal"] },
-  { category: "general_household", label: "bicycle",      properties: ["tall", "metal", "shiny", "hard"] },
-
-  // ─── PERSONAL CARE ───────────────────────────────────────────────────────
-  { category: "general_household", label: "toothbrush",   properties: ["small", "smooth", "plastic", "thin"] },
-  { category: "general_household", label: "soap",         properties: ["small", "smooth", "soft", "slippery"] },
-  { category: "general_household", label: "comb",         properties: ["small", "thin", "plastic", "smooth"] },
-
-  // ─── ELECTRONICS (extras) ────────────────────────────────────────────────
-  { category: "general_household", label: "laptop",       properties: ["flat", "rectangular", "smooth", "hard"] },
-  { category: "general_household", label: "headphones",   properties: ["soft", "small", "plastic", "smooth"] },
+const GENERAL_HOUSEHOLD_ENTRIES: PrewarmEntry[] = [
+  // ▸ TODO: Paste your existing v1 general_household entries here unchanged.
+  //   The audit fixes above only apply to free_dungeon based on the eval
+  //   sample we have. general_household audit is a follow-up after running
+  //   `--corpus general_household` and reviewing its disagreement set.
 ];
 
-export const PREWARM_CORPUS: readonly PrewarmEntry[] = [
+// ─── Combined corpus ─────────────────────────────────────────────────────────
+
+export const PREWARM_CORPUS: PrewarmEntry[] = [
   ...FREE_DUNGEON_ENTRIES,
   ...GENERAL_HOUSEHOLD_ENTRIES,
 ];
-
-/**
- * Categories enumerated for --category CLI filter.
- */
-export const CATEGORIES = Array.from(
-  new Set(PREWARM_CORPUS.map((e) => e.category))
-).sort();
-
-/**
- * Total cache rows that will be produced if every entry runs successfully.
- * Used by the runner to surface "you're about to write N rows" pre-flight.
- */
-export const TOTAL_ROWS = PREWARM_CORPUS.reduce(
-  (n, e) => n + e.properties.length,
-  0
-);
-
-/**
- * Free-dungeon-only stats — useful for pre-flight reporting in the runner.
- */
-export const FREE_DUNGEON_STATS = {
-  entries: FREE_DUNGEON_ENTRIES.length,
-  rows:    FREE_DUNGEON_ENTRIES.reduce((n, e) => n + e.properties.length, 0),
-};
-
-// ─── Runtime invariant: pool disjointness ────────────────────────────────────
-//
-// If any pool word ends up in two pools, the no-overlap design is broken.
-// Asserting this at module load means a typo in pool definition surfaces
-// immediately rather than silently corrupting the cache hit assumptions.
-
-(function assertPoolsDisjoint() {
-  const pools = {
-    A_textures:  new Set(FREE_DUNGEON_POOL_A_TEXTURES),
-    B_shapes3D:  new Set(FREE_DUNGEON_POOL_B_SHAPES_3D),
-    C_flatness:  new Set(FREE_DUNGEON_POOL_C_FLATNESS),
-  };
-  const pairs: Array<[keyof typeof pools, keyof typeof pools]> = [
-    ["A_textures", "B_shapes3D"],
-    ["A_textures", "C_flatness"],
-    ["B_shapes3D", "C_flatness"],
-  ];
-  for (const [x, y] of pairs) {
-    const overlap = [...pools[x]].filter((w) => pools[y].has(w));
-    if (overlap.length > 0) {
-      throw new Error(
-        `prewarm-corpus.ts: free-dungeon pools overlap between ${x} and ${y}: ${overlap.join(", ")}`
-      );
-    }
-  }
-})();

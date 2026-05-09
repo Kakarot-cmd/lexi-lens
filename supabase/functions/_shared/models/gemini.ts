@@ -48,7 +48,7 @@ import { ModelCallError } from "./types.ts";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const DEFAULT_MODEL_VARIANT = "gemma-4-26b-a4b-it";
+const DEFAULT_MODEL_VARIANT = "gemini-2.5-flash-lite";
 const API_BASE              = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_MAX_TOKENS    = 700;
 const DEFAULT_TIMEOUT_MS    = 30_000;
@@ -67,6 +67,8 @@ const VARIANT_TO_MODEL_ID: Record<string, ModelId> = {
   "gemma-4-31b-it":                  "gemma-4-31b",
   "gemini-3.1-flash-preview":        "gemini-3-1-flash",
   "gemini-3.1-flash-lite-preview":   "gemini-3-1-flash-lite",
+  "gemini-2.5-flash":                "gemini-2-5-flash",
+  "gemini-2.5-flash-lite":           "gemini-2-5-flash-lite",
 };
 
 function resolveVariant(): { variant: string; modelId: ModelId } {

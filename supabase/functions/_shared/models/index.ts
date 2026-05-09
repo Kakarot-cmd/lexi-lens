@@ -1,74 +1,49 @@
 /**
  * supabase/functions/_shared/models/index.ts
- * Lexi-Lens — Model Provider Factory (v5.1)
+ * Lexi-Lens — Model Provider Factory (v5.4-eval, 2026-05-09)
  *
- * Returns a configured ModelAdapter for a given Edge Function scope.
+ * v5.4-eval — Adds openai and mistral adapters to ADAPTERS map for the
+ *   Phase 4.10b model evaluation. Both are wired through the same
+ *   feature_flags + env-var resolution chain as anthropic/gemini.
+ *   Production routing in tierRouting.ts still only knows about anthropic
+ *   and gemini for now — flipping evaluate to OpenAI or Mistral as primary
+ *   requires updating tierRouting.ts and is intentionally NOT wired here
+ *   until the eval results justify it.
+ *
+ * v5.1 — Initial provider abstraction with Anthropic + Gemini.
  *
  * ─── Flag resolution order (first hit wins) ──────────────────────────────────
  *
  *   1. Database row in `feature_flags`
  *      key = "{scope}_model_provider", e.g. "evaluate_model_provider"
- *      Cached in-process for FLAG_CACHE_TTL_MS (60 s) so steady-state
- *      requests pay zero DB cost. A flip via SQL UPDATE takes effect
- *      within ~60 s across all warm Edge Function containers.
+ *      Cached in-process for FLAG_CACHE_TTL_MS (60 s).
  *
  *   2. Environment variable
  *      EVALUATE_MODEL_PROVIDER (per scope) or MODEL_PROVIDER (global).
- *      Used when the flag table is unavailable (DB down, row missing,
- *      malformed value). Functions as the failsafe baseline that survives
- *      total DB outage.
  *
  *   3. Hardcoded default: "anthropic"
- *      Final safety. Only reached if both the DB and env are unusable.
- *
- * ─── Why a DB row, not just an env var ──────────────────────────────────────
- *
- *   Solo-dev workflow: flip via Supabase Dashboard → SQL Editor
- *
- *     UPDATE feature_flags
- *     SET    value = 'gemini', updated_at = now()
- *     WHERE  key   = 'evaluate_model_provider';
- *
- *   No code change. No redeploy. No CI. ~60 s to take effect; rollback is
- *   the same UPDATE in reverse. Audit trail in updated_at.
- *
- *   The env-var path remains as a hard backstop — if you ever need to flip
- *   a model when Supabase itself is unreachable, set the secret and redeploy.
- *
- * ─── Why not a per-request DB read ──────────────────────────────────────────
- *
- *   At v5.0 launch scale (<1K concurrent) the 60 s in-process cache means
- *   a typical hour does ~60 DB reads total across all Edge Function
- *   containers, not per-scan. Per-request reads would add ~30 ms latency
- *   on every scan to no benefit. The cache TTL is the operational knob —
- *   shorten if you ever need faster flips.
- *
- * ─── Failure modes ──────────────────────────────────────────────────────────
- *
- *   DB read errors are logged and treated as "no override" — the env-var
- *   chain takes over. Model-provider selection NEVER throws to the caller;
- *   the worst outcome is "we run on Anthropic when you wanted Gemini",
- *   which is recoverable. The opposite (throwing on selection) would mean
- *   one bad flag value takes the whole evaluate path down.
  */
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 import { anthropicHaikuAdapter } from "./anthropic.ts";
 import { geminiAdapter }         from "./gemini.ts";
+import { openaiAdapter }         from "./openai.ts";
+import { mistralAdapter }        from "./mistral.ts";
 import type { ModelAdapter }     from "./types.ts";
 
 // ─── Provider keys ───────────────────────────────────────────────────────────
 
-export type ProviderKey = "anthropic" | "gemini";
+export type ProviderKey = "anthropic" | "gemini" | "openai" | "mistral";
 
 const ADAPTERS: Record<ProviderKey, ModelAdapter> = {
   anthropic: anthropicHaikuAdapter,
   gemini:    geminiAdapter,
+  openai:    openaiAdapter,
+  mistral:   mistralAdapter,
 };
 
 // Functions that may have their own provider override.
-// Add a new scope by adding a row here and a row to SCOPE_ENV_VAR.
 export type FunctionScope =
   | "evaluate"
   | "classify"
@@ -90,15 +65,11 @@ function flagKey(scope: FunctionScope): string {
 }
 
 // ─── In-process flag cache ───────────────────────────────────────────────────
-//
-// Module-level cache shared by all requests hitting this Edge Function
-// container. Cold-start does one DB read per scope; subsequent requests
-// within FLAG_CACHE_TTL_MS reuse the cached value.
 
-const FLAG_CACHE_TTL_MS = 60_000; // 60 seconds
+const FLAG_CACHE_TTL_MS = 60_000;
 
 interface CachedFlag {
-  value:     ProviderKey | null; // null = explicitly resolved as "no DB override"
+  value:     ProviderKey | null;
   expiresAt: number;
 }
 
@@ -106,7 +77,7 @@ const flagCache = new Map<FunctionScope, CachedFlag>();
 const loggedScopes = new Set<FunctionScope>();
 
 function isProviderKey(v: unknown): v is ProviderKey {
-  return v === "anthropic" || v === "gemini";
+  return v === "anthropic" || v === "gemini" || v === "openai" || v === "mistral";
 }
 
 function readProviderEnv(name: string): ProviderKey | null {
@@ -148,19 +119,10 @@ async function readFlagFromDb(
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-/**
- * Returns a configured ModelAdapter for the given scope.
- *
- * `supabase` is required so the factory can read the live feature_flags row.
- * Pass the same service-role client the Edge Function already uses for
- * scan_attempts inserts — service role bypasses RLS, so no policy work is
- * needed.
- */
 export async function getModelAdapter(
   scope:    FunctionScope,
   supabase: SupabaseClient,
 ): Promise<ModelAdapter> {
-  // 1. DB row (cached in process)
   const now    = Date.now();
   const cached = flagCache.get(scope);
   let dbValue: ProviderKey | null;
@@ -172,11 +134,9 @@ export async function getModelAdapter(
     flagCache.set(scope, { value: dbValue, expiresAt: now + FLAG_CACHE_TTL_MS });
   }
 
-  // 2. Env-var fallback chain
   const envScoped = readProviderEnv(SCOPE_ENV_VAR[scope]);
   const envGlobal = readProviderEnv("MODEL_PROVIDER");
 
-  // 3. Final default
   const chosen: ProviderKey = dbValue ?? envScoped ?? envGlobal ?? "anthropic";
   const source: string =
       dbValue   !== null ? "feature_flags"
@@ -194,8 +154,6 @@ export async function getModelAdapter(
     adapter = ADAPTERS.anthropic;
   }
 
-  // One log line per cold start per scope, so logs show which model is live
-  // without spamming every request.
   if (!loggedScopes.has(scope)) {
     console.log(`[models] scope=${scope} provider=${chosen} model=${adapter.id} source=${source}`);
     loggedScopes.add(scope);
@@ -204,12 +162,14 @@ export async function getModelAdapter(
   return adapter;
 }
 
-/**
- * Test-only helper: clear the in-process flag cache. Useful when toggling
- * the DB row in integration tests and you don't want to wait 60 s for the
- * cache to expire.
- */
 export function _resetFlagCacheForTests(): void {
   flagCache.clear();
   loggedScopes.clear();
 }
+
+// ─── Adapter registry export ─────────────────────────────────────────────────
+// Exposed for the eval harness, which needs direct access to all adapters
+// regardless of feature_flags state. Production code should use
+// getModelAdapter() instead.
+
+export { ADAPTERS };

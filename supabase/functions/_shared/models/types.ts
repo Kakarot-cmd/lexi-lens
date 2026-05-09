@@ -1,37 +1,35 @@
 /**
  * supabase/functions/_shared/models/types.ts
- * Lexi-Lens — Model Provider Abstraction (v5.1.2, 2026-05-08)
+ * Lexi-Lens — Model Provider Abstraction (v5.4-eval, 2026-05-09)
  *
- * Defines the model-agnostic interface that every Edge Function uses to
- * call an LLM. The actual call shape (Anthropic vs Gemini vs whatever next)
- * is hidden behind ModelAdapter.
+ * v5.4-eval — ModelId union extended for the Phase 4.10b model evaluation.
+ *   Adds:
+ *     • "gemini-2-5-flash"      — stable GA mid-tier
+ *     • "gemini-2-5-flash-lite" — stable GA, replaces 3.1-preview as fallback
+ *     • "gpt-4-1-nano"          — OpenAI's cheap vision model
+ *     • "gpt-4-1-mini"          — OpenAI mid-tier (eval-only, not for prod)
+ *     • "gpt-5-4-nano"          — OpenAI's newest cheap (text-first, eval-only)
+ *     • "mistral-small-4"       — Pixtral merged into Small 4
  *
- * v5.1.2 — Gemini 3.1 Flash family added to ModelId union
- *   New stable ids: "gemini-3-1-flash" and "gemini-3-1-flash-lite". The
- *   wire-format names ("gemini-3.1-flash-lite-preview" etc.) live in
- *   gemini.ts's VARIANT_TO_MODEL_ID; the union here uses dot-free ids so
- *   the values round-trip cleanly through cache keys and log lines.
- *
- * v5.1.1 — Gemma 4 26B added (variant fix)
+ * v5.1.2 — Gemini 3.1 Flash family added
+ * v5.1.1 — Gemma 4 26B added
  * v5.1   — Initial provider abstraction
  */
 
 // ─── Identity ────────────────────────────────────────────────────────────────
-//
-// Stable identifiers used in:
-//   • Cache value's `_modelId` field
-//   • Edge Function logs
-//   • Adapter id property
-//
-// These are dot-free for safe round-tripping through cache keys, log lines,
-// and any future SQL filtering.
 
 export type ModelId =
-  | "claude-haiku-4-5"       // claude-haiku-4-5-20251001
-  | "gemma-4-26b"            // google/gemma-4-26b-a4b-it (MoE)
-  | "gemma-4-31b"            // google/gemma-4-31b-it (dense)
-  | "gemini-3-1-flash"       // gemini-3.1-flash-preview (mid-tier, fast)
-  | "gemini-3-1-flash-lite"; // gemini-3.1-flash-lite-preview (latency-optimized)
+  | "claude-haiku-4-5"          // claude-haiku-4-5-20251001
+  | "gemma-4-26b"               // google/gemma-4-26b-a4b-it (MoE)
+  | "gemma-4-31b"               // google/gemma-4-31b-it (dense)
+  | "gemini-3-1-flash"          // gemini-3.1-flash-preview
+  | "gemini-3-1-flash-lite"     // gemini-3.1-flash-lite-preview
+  | "gemini-2-5-flash"          // gemini-2.5-flash (stable GA)
+  | "gemini-2-5-flash-lite"     // gemini-2.5-flash-lite (stable GA, recommended fallback)
+  | "gpt-4-1-nano"              // gpt-4.1-nano
+  | "gpt-4-1-mini"              // gpt-4.1-mini
+  | "gpt-5-4-nano"              // gpt-5.4-nano
+  | "mistral-small-4";          // mistral-small-2603 (Small 4 with Pixtral)
 
 export const SUPPORTED_MODELS: readonly ModelId[] = [
   "claude-haiku-4-5",
@@ -39,7 +37,43 @@ export const SUPPORTED_MODELS: readonly ModelId[] = [
   "gemma-4-31b",
   "gemini-3-1-flash",
   "gemini-3-1-flash-lite",
+  "gemini-2-5-flash",
+  "gemini-2-5-flash-lite",
+  "gpt-4-1-nano",
+  "gpt-4-1-mini",
+  "gpt-5-4-nano",
+  "mistral-small-4",
 ] as const;
+
+// ─── Per-model approximate price (USD per million tokens) ────────────────────
+// Used by the eval harness for cost estimation. Production code should NOT
+// read from here for billing; these are best-effort book-keeping values.
+//
+// Values current as of May 2026. Source: official provider pricing pages.
+// Update when re-running the eval if the market has moved.
+
+export interface ModelPricing {
+  inputPerMillion:  number;
+  outputPerMillion: number;
+  /** Effective date for this pricing snapshot (ISO date string). */
+  pricedAt: string;
+  /** Notes about the pricing (preview rates, batch discounts, etc). */
+  note?: string;
+}
+
+export const MODEL_PRICING: Record<ModelId, ModelPricing> = {
+  "claude-haiku-4-5":      { inputPerMillion: 1.00, outputPerMillion: 5.00, pricedAt: "2026-05-09" },
+  "gemma-4-26b":           { inputPerMillion: 0.00, outputPerMillion: 0.00, pricedAt: "2026-05-09", note: "Google AI Studio free tier" },
+  "gemma-4-31b":           { inputPerMillion: 0.00, outputPerMillion: 0.00, pricedAt: "2026-05-09", note: "Google AI Studio free tier" },
+  "gemini-3-1-flash":      { inputPerMillion: 0.30, outputPerMillion: 2.50, pricedAt: "2026-05-09", note: "Preview rates" },
+  "gemini-3-1-flash-lite": { inputPerMillion: 0.10, outputPerMillion: 0.40, pricedAt: "2026-05-09", note: "Preview rates" },
+  "gemini-2-5-flash":      { inputPerMillion: 0.30, outputPerMillion: 2.50, pricedAt: "2026-05-09" },
+  "gemini-2-5-flash-lite": { inputPerMillion: 0.10, outputPerMillion: 0.40, pricedAt: "2026-05-09" },
+  "gpt-4-1-nano":          { inputPerMillion: 0.10, outputPerMillion: 0.40, pricedAt: "2026-05-09" },
+  "gpt-4-1-mini":          { inputPerMillion: 0.40, outputPerMillion: 1.60, pricedAt: "2026-05-09" },
+  "gpt-5-4-nano":          { inputPerMillion: 0.20, outputPerMillion: 1.25, pricedAt: "2026-05-09" },
+  "mistral-small-4":       { inputPerMillion: 0.15, outputPerMillion: 0.60, pricedAt: "2026-05-09" },
+};
 
 // ─── Input shape ─────────────────────────────────────────────────────────────
 
@@ -48,15 +82,14 @@ export interface ModelCallOptions {
   systemPrompt: string;
   /** The user's text prompt — property requirements, mastery context, etc. */
   userText: string;
-  /** Optional image as base64 JPEG. Same encoding both providers accept. */
+  /** Optional image as base64 JPEG. Same encoding all providers accept. */
   imageBase64?: string;
   /** Output token cap. Defaults per-call site (evaluate uses 700). */
   maxTokens?: number;
   /**
    * Strict JSON mode. When true, the adapter sets the provider's native
-   * JSON-mode flag (responseMimeType for Gemini; prompt-only for Anthropic).
-   * Caller still parses the result text — the flag just reduces the chance
-   * of markdown fences and prose preambles.
+   * JSON-mode flag (responseMimeType for Gemini, response_format for OpenAI/
+   * Mistral, prompt-only for Anthropic). Caller still parses the result text.
    */
   jsonMode?: boolean;
   /**
@@ -75,36 +108,35 @@ export interface ModelCallResult {
   modelId: ModelId;
   /** Total wall-clock latency including network + provider compute. */
   latencyMs: number;
-  /** Token usage from the provider — null if the provider didn't return it. */
-  usage: {
-    inputTokens:  number | null;
-    outputTokens: number | null;
+  /**
+   * Token usage. Optional because not every provider returns it the same way;
+   * adapters fill in what they can. Used by the eval harness for cost math.
+   */
+  usage?: {
+    inputTokens?:  number;
+    outputTokens?: number;
   };
 }
 
-// ─── The adapter contract ────────────────────────────────────────────────────
+// ─── Adapter interface ───────────────────────────────────────────────────────
 
 export interface ModelAdapter {
+  /** Stable model id; used in logs, cache `_modelId` stamps, and SQL filters. */
   readonly id: ModelId;
-  /** Hard fail if the adapter is missing critical config (e.g. API key). */
+  /** Whether the adapter has its required env vars set. */
   isConfigured(): boolean;
-  /** Single-shot call. Throws on transport error or non-2xx response. */
+  /** Make one model call. May throw ModelCallError on transport / 4xx / 5xx. */
   call(opts: ModelCallOptions): Promise<ModelCallResult>;
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
-/**
- * Thrown when a provider returns a 4xx/5xx response or the request aborts.
- * Caller (evaluateObject.ts) catches this and surfaces a generic 502 to
- * the client — the actual provider name is NOT leaked to user-facing copy.
- */
 export class ModelCallError extends Error {
   constructor(
-    public readonly modelId: ModelId,
-    public readonly status: number | null,
-    public readonly bodyExcerpt: string,
-    message: string,
+    public modelId:    ModelId,
+    public httpStatus: number | null,
+    public bodyText:   string,
+    message:           string,
   ) {
     super(message);
     this.name = "ModelCallError";
