@@ -1294,19 +1294,29 @@ DROP POLICY IF EXISTS "No public access to admin_users" ON public.admin_users;
 CREATE POLICY "No public access to admin_users" ON public.admin_users USING (false);
 
 DROP POLICY IF EXISTS "Parent private quests visible to own children" ON public.quests;
-CREATE POLICY "Parent private quests visible to own children" ON public.quests FOR SELECT USING (((visibility = 'public'::text) OR (created_by = auth.uid()) OR ((visibility = 'private'::text) AND (created_by IN ( SELECT child_profiles.parent_id
-   FROM public.child_profiles
-  WHERE (child_profiles.id IN ( SELECT child_profiles_1.id
-           FROM public.child_profiles child_profiles_1
-          WHERE (child_profiles_1.parent_id = ( SELECT child_profiles_2.parent_id
-                   FROM public.child_profiles child_profiles_2
-                  WHERE ((child_profiles_2.id)::text = (auth.uid())::text)
-                 LIMIT 1)))))) AND ((target_child_id IS NULL) OR (target_child_id IN ( SELECT child_profiles.id
-   FROM public.child_profiles
-  WHERE (child_profiles.parent_id = ( SELECT child_profiles_1.parent_id
-           FROM public.child_profiles child_profiles_1
-          WHERE (child_profiles_1.id = quests.target_child_id)
-         LIMIT 1))))))));
+DROP POLICY IF EXISTS quests_select_with_tier_gate                     ON public.quests;
+DROP POLICY IF EXISTS quests_select_parent                             ON public.quests;
+CREATE POLICY quests_select_parent ON public.quests
+  FOR SELECT TO authenticated
+  USING (
+    is_active = true
+    AND (
+      (visibility = 'public' AND (
+        min_subscription_tier = 'free'
+        OR EXISTS (
+          SELECT 1 FROM public.parents p
+          WHERE p.id = auth.uid()
+            AND p.subscription_tier IN ('paid','tier1','tier2','family')
+        )
+      ))
+      OR (visibility = 'private' AND created_by = auth.uid())
+      OR (
+        visibility = 'private'
+        AND created_by IN (SELECT cp.parent_id FROM public.child_profiles cp WHERE cp.parent_id = auth.uid())
+        AND (target_child_id IS NULL OR target_child_id IN (SELECT cp.id FROM public.child_profiles cp WHERE cp.parent_id = auth.uid()))
+      )
+    )
+  );
 
 DROP POLICY IF EXISTS "Parents can create quests" ON public.quests;
 CREATE POLICY "Parents can create quests" ON public.quests FOR INSERT WITH CHECK ((created_by = auth.uid()));

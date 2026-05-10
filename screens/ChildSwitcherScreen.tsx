@@ -92,6 +92,7 @@ const P = {
 interface ChildRow {
   id:           string;
   display_name: string;
+  age:          number;   // v6.1 — selected from child_profiles.age, passed into ChildSession
   age_band:     string;
   level:        number;
   total_xp:     number;
@@ -319,6 +320,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     startChildSession({
       id:           child.id,
       display_name: child.display_name,
+      age:          child.age,
       age_band:     child.age_band,
       level:        child.level,
       total_xp:     child.total_xp,
