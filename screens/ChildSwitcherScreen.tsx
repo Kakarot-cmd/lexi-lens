@@ -41,13 +41,25 @@ type Props = NativeStackScreenProps<RootStackParamList, "ChildSwitcher">;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const AGE_BANDS = [
-  { band: "5-6",   label: "5–6 yrs",   desc: "Early reader", age: 6  },
-  { band: "7-8",   label: "7–8 yrs",   desc: "Developing",   age: 8  },
-  { band: "9-10",  label: "9–10 yrs",  desc: "Advancing",    age: 10 },
-  { band: "11-12", label: "11–12 yrs", desc: "Proficient",   age: 12 },
+// Actual ages (5-12), grouped visually by reading band for the picker UX.
+// The model and DB store the actual integer age. The age_band column in DB
+// is derived server-side via the sync_age_band trigger.
+//
+// Why integers and not bands: Mistral's kid_msg.young/older split fires at
+// age<8 → young, age≥8 → older. A 7-year-old picked as part of the "7-8"
+// band used to be sent to the model as age=8, flipping their voice register
+// to "older". Capturing actual age fixes this and lets future tuning tighten
+// the threshold without a UI change.
+const AGE_OPTIONS = [
+  { age: 5,  bandLabel: "Early reader" },
+  { age: 6,  bandLabel: "Early reader" },
+  { age: 7,  bandLabel: "Developing"   },
+  { age: 8,  bandLabel: "Developing"   },
+  { age: 9,  bandLabel: "Advancing"    },
+  { age: 10, bandLabel: "Advancing"    },
+  { age: 11, bandLabel: "Proficient"   },
+  { age: 12, bandLabel: "Proficient"   },
 ] as const;
-type AgeBand = typeof AGE_BANDS[number]["band"];
 
 const AVATAR_OPTIONS = [
   { key: "wizard",  emoji: "🧙", label: "Wizard" },
@@ -145,7 +157,10 @@ interface AddChildFormProps {
 
 function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
   const [name,      setName]      = useState("");
-  const [ageBand,   setAgeBand]   = useState<AgeBand>("7-8");
+  // No default — parent must actively pick an age. This prevents the
+  // pre-v6.1 bug where every child silently got age=8 because that was
+  // the form's hardcoded initial value.
+  const [age,       setAge]       = useState<number | null>(null);
   const [avatarKey, setAvatarKey] = useState<string>("wizard");
   const [saving,    setSaving]    = useState(false);
   const [error,     setError]     = useState<string | null>(null);
@@ -153,18 +168,21 @@ function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
   const handleSave = async () => {
     const trimmed = name.trim();
     if (!trimmed) { setError("Please enter a display name."); return; }
+    if (age === null) { setError("Please pick the child's age."); return; }
     setSaving(true);
     setError(null);
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error("Not signed in");
 
+      // Insert with actual `age` only. The sync_age_band trigger derives
+      // age_band from age automatically; we don't need to supply it.
       const { error: insertErr } = await supabase
         .from("child_profiles")
         .insert({
           parent_id:    user.id,
           display_name: trimmed,
-          age_band:     ageBand,
+          age,
           avatar_key:   avatarKey,
         });
 
@@ -194,17 +212,17 @@ function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
         autoFocus
       />
 
-      {/* Age band */}
-      <Text style={styles.addFormLabel}>Age range</Text>
+      {/* Actual age picker — 8 options, no default */}
+      <Text style={styles.addFormLabel}>Age</Text>
       <View style={styles.chipRow}>
-        {AGE_BANDS.map((b) => (
+        {AGE_OPTIONS.map((opt) => (
           <TouchableOpacity
-            key={b.band}
-            style={[styles.chip, ageBand === b.band && styles.chipActive]}
-            onPress={() => { setAgeBand(b.band); Haptics.selectionAsync(); }}
+            key={opt.age}
+            style={[styles.chip, age === opt.age && styles.chipActive]}
+            onPress={() => { setAge(opt.age); Haptics.selectionAsync(); }}
           >
-            <Text style={[styles.chipLabel, ageBand === b.band && styles.chipLabelActive]}>{b.label}</Text>
-            <Text style={[styles.chipDesc,  ageBand === b.band && styles.chipDescActive]}>{b.desc}</Text>
+            <Text style={[styles.chipLabel, age === opt.age && styles.chipLabelActive]}>{opt.age}</Text>
+            <Text style={[styles.chipDesc,  age === opt.age && styles.chipDescActive]}>{opt.bandLabel}</Text>
           </TouchableOpacity>
         ))}
       </View>
@@ -230,9 +248,9 @@ function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
           <Text style={styles.cancelBtnText}>Cancel</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.saveBtn, saving && { opacity: 0.7 }]}
+          style={[styles.saveBtn, (saving || age === null) && { opacity: 0.7 }]}
           onPress={handleSave}
-          disabled={saving}
+          disabled={saving || age === null}
         >
           {saving
             ? <ActivityIndicator color={P.white} size="small" />
@@ -271,7 +289,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     try {
       const { data, error } = await supabase
         .from("child_profiles")
-        .select("id, display_name, age_band, level, total_xp, avatar_key")
+        .select("id, display_name, age, age_band, level, total_xp, avatar_key")
         .order("created_at", { ascending: true });
 
       if (error) throw error;

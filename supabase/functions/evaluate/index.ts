@@ -43,7 +43,7 @@
  */
 
 import { serve }        from "https://deno.land/std@0.208.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 import {
   evaluateObject,
@@ -64,6 +64,107 @@ const IP_LIMIT_PER_MINUTE = 20;
 const IP_WINDOW_MS        = 60_000;
 
 const GENERIC_LABELS = new Set(["", "object", "unknown", "thing", "item"]);
+
+/**
+ * v6.1 — Basket labels: ML Kit returns these for multiple distinct
+ * canonical objects with materially different property verdicts.
+ *
+ * VERIFIED against the official ML Kit base-model label map at
+ * https://developers.google.com/ml-kit/vision/image-labeling/label-map
+ * (last fetched May 2026). Every entry here is confirmed present in the
+ * base model vocabulary — no phantom labels that would never fire.
+ *
+ * Examples of the failure mode this guards against:
+ *   • ML Kit labels both a biscuit packet and a ceramic plate as "tableware".
+ *     A "smooth=passes" verdict cached for the plate would silently apply
+ *     to a future scan of a (non-smooth) biscuit packet under the same
+ *     label — the cache would serve a wrong verdict without a model call.
+ *   • Material labels like "leather" wrap many objects (wallet, couch,
+ *     belt, jacket) with materially different "soft" and "hard" verdicts.
+ *   • Catchall buckets like "product", "junk", "model", "vehicle" are
+ *     extreme — they cover hundreds of distinct objects.
+ *
+ * Treatment is the same as GENERIC_LABELS: skip cache lookup AND skip
+ * cache write for these scans. Every basket-labeled scan is a model call.
+ * The alias map is also bypassed for these — there's no useful canonical
+ * to redirect to when one detected label maps to many real objects.
+ *
+ * Cost impact: bounded. At ~$0.0006/scan and a measured-from-PROD-data
+ * fraction of basket-labeled scans, every basket scan is a model call.
+ * The blended cost vs. ideal-cache is the basket fraction × $0.0006.
+ *
+ * v6.2 will revisit with a two-stage approach: a cheap-classify call
+ * (potentially via a different cheaper provider — Gemini Flash-Lite) to
+ * resolve the canonical name, then cache lookup on the canonical, then
+ * full-evaluate only on miss. Defer until PROD data justifies the
+ * complexity. See roadmap.
+ *
+ * Add labels here if PROD logs show new basket-label patterns producing
+ * wrong cache hits. Sharp labels (single canonical object — "apple",
+ * "couch", "television", etc.) MUST stay out — putting them here turns
+ * off cache for them too.
+ */
+const BASKET_LABELS = new Set([
+  // ── Container / packaging / serveware ──────────────────────────────────
+  "tableware",        // plates, mugs, cups, bowls, cutlery — extreme range
+  "cutlery",          // forks vs spoons vs knives — different props
+  "cookware and bakeware",  // pots vs pans vs baking trays
+  "bag",              // backpack vs plastic bag vs handbag
+
+  // ── Food category buckets ──────────────────────────────────────────────
+  "food",             // ML Kit's most general food label
+  "fruit",            // apple vs banana vs grape — different props
+  "vegetable",        // carrot vs potato vs broccoli
+  "fast food",        // burger vs fries vs nuggets
+  "cuisine",          // generic food bucket
+  "meal", "lunch", "supper",  // generic meal labels
+  "alcohol",          // bottle vs glass vs can
+  "bread",            // loaf vs roll vs pita
+
+  // ── Materials (wrap many distinct objects) ─────────────────────────────
+  "leather",          // wallet vs couch vs belt vs jacket
+  "metal",
+  "textile",
+  "denim",            // jacket vs jeans vs shirt
+  "cotton",
+  "wool",
+  "fur",
+  "porcelain",        // mug vs vase vs figurine
+  "tile",             // ceramic, vinyl, wallpaper variants
+
+  // ── Furniture & home buckets ───────────────────────────────────────────
+  "cabinetry",        // kitchen cabinet vs wardrobe vs dresser
+  "infrastructure",   // bridge vs tower vs road
+  "building",         // cathedral vs office vs house
+
+  // ── Vehicles & vehicle-like ────────────────────────────────────────────
+  "vehicle",          // car vs bus vs boat vs helicopter
+  "aircraft",         // plane vs helicopter vs drone
+  "model",            // model car vs model plane vs fashion model
+
+  // ── Wearables (category buckets) ───────────────────────────────────────
+  "outerwear",        // jacket vs coat vs blazer vs cape
+  "swimwear",         // different swimsuit types
+  "shoe",             // ML Kit returns "shoe" as the catchall when it can't
+                      // narrow to "sneakers"; could be sandal, boot, dress
+                      // shoe, slipper. "sneakers" stays as a sharp label.
+
+  // ── Toys & play (category buckets) ─────────────────────────────────────
+  "toy",              // car toy vs doll vs blocks — extreme range
+  "stuffed toy",      // bear vs bunny vs unicorn
+  "plush",            // generic plush bucket
+
+  // ── Jewellery & adornment ──────────────────────────────────────────────
+  "jewellery",        // ring vs necklace vs bracelet vs earring
+  "centrepiece",      // table centerpiece category
+  "wreath",           // door wreath vs holiday wreath
+
+  // ── Catchall multi-object labels ───────────────────────────────────────
+  "product",          // ML Kit's broadest "this is a packaged thing" label
+  "junk",             // generic catchall in ML Kit
+  "plant", "flora",   // tree vs flower vs herb vs cactus
+  "musical instrument", "musical",  // piano vs guitar vs drum vs flute
+]);
 
 // ─── Redis / Upstash ─────────────────────────────────────────────────────────
 
@@ -136,6 +237,30 @@ function buildResolvedNameCacheKey(label: string): string {
   return key;
 }
 
+/**
+ * v6.1 — Alias key. Maps an ML-Kit-detected label (often misclassified)
+ * to a canonical object name (Mistral-resolved). Used as a redirect layer
+ * BEFORE the main verdict cache lookup so mislabeled scans converge on
+ * the same canonical key as correctly-labeled scans of the same object.
+ *
+ * Read path: GET v6:alias:{detectedLabel} → if hit + confidence >= 0.5,
+ * use alias.canonical as the key for verdict + resolved-name lookups.
+ *
+ * Write path: after a successful model call, if resolvedObjectName differs
+ * from detectedLabel (after normalization), bump or create the alias entry.
+ */
+function buildAliasCacheKey(detectedLabel: string): string {
+  const nl = normalizeForKey(detectedLabel);
+  if (nl.length === 0) {
+    return `${ENV_NAME}:lexi:v6:alias:_h:${btoa(detectedLabel).replace(/=/g, "")}`;
+  }
+  const key = `${ENV_NAME}:lexi:v6:alias:${nl}`;
+  if (key.length > FULL_KEY_MAX) {
+    return `${ENV_NAME}:lexi:v6:alias:_h:${btoa(detectedLabel).replace(/=/g, "")}`;
+  }
+  return key;
+}
+
 // ─── Cache value shapes (v6) ────────────────────────────────────────────────
 
 type WriteSource = "organic" | "prewarm" | "manual";
@@ -159,6 +284,32 @@ interface CachedResolvedNameV6 {
   v:    6;
   name: string;
   meta: CacheMetaV6;
+}
+
+/**
+ * v6.1 — Alias entry. Maps mistralized canonical name to the noisy
+ * detected label that ML Kit produces. Confidence and observed_count
+ * grow over repeated confirmations so the alias is "advisory" until it
+ * has enough evidence to be trusted.
+ *
+ * Confidence model:
+ *   • new entry  = 0.6, observed_count = 1
+ *   • confirmation (same detected → same canonical):
+ *       confidence = min(1.0, confidence + 0.1), observed_count++
+ *   • conflict (same detected → different canonical):
+ *       confidence -= 0.1; if < 0.3, evict the alias entry entirely
+ *
+ * Read threshold: alias is used only if confidence >= 0.5. Below that,
+ * the read path falls through to the original detectedLabel.
+ */
+interface CachedAliasV6 {
+  v:               6;
+  canonical:       string;        // normalized canonical name (matches verdict key segment)
+  confidence:      number;        // 0.0–1.0; threshold for use is 0.5
+  observed_count:  number;        // bumped on every confirmation
+  first_seen:      string;        // ISO
+  last_seen:       string;        // ISO
+  meta:            CacheMetaV6;
 }
 
 // ─── Cache shape validators ──────────────────────────────────────────────────
@@ -202,6 +353,23 @@ function isCachedResolvedNameV6(v: unknown): v is CachedResolvedNameV6 {
   const o = v as Record<string, unknown>;
   if (o.v !== 6) return false;
   if (typeof o.name !== "string" || o.name.trim().length === 0) return false;
+  if (!isCacheMetaV6(o.meta)) return false;
+  return true;
+}
+
+function isCachedAliasV6(v: unknown): v is CachedAliasV6 {
+  if (!v || typeof v !== "object") return false;
+  const o = v as Record<string, unknown>;
+  if (o.v !== 6) return false;
+  if (typeof o.canonical !== "string" || o.canonical.trim().length === 0) return false;
+  if (typeof o.confidence !== "number"
+      || Number.isNaN(o.confidence)
+      || o.confidence < 0 || o.confidence > 1) return false;
+  if (typeof o.observed_count !== "number"
+      || !Number.isInteger(o.observed_count)
+      || o.observed_count < 0) return false;
+  if (typeof o.first_seen !== "string") return false;
+  if (typeof o.last_seen  !== "string") return false;
   if (!isCacheMetaV6(o.meta)) return false;
   return true;
 }
@@ -323,6 +491,207 @@ async function cacheSetResolvedName(
   }
 }
 
+// ─── v6.1 Alias I/O ──────────────────────────────────────────────────────────
+//
+// The alias layer maps noisy ML-Kit detected labels to canonical names.
+// On read, we check the alias and (if confident enough) redirect verdict
+// lookups to the canonical key. On write (after a successful model call),
+// we bump or create the alias if the model corrected the label.
+
+const ALIAS_READ_THRESHOLD     = 0.5;   // below this, alias is not used
+const ALIAS_NEW_CONFIDENCE     = 0.6;   // initial confidence for a new alias
+const ALIAS_CONFIRM_INCREMENT  = 0.1;   // bump on repeat confirmation
+const ALIAS_CONFLICT_DECREMENT = 0.1;   // bump on disagreement
+const ALIAS_EVICT_THRESHOLD    = 0.3;   // below this, evict alias entirely
+
+async function cacheGetAlias(key: string): Promise<CachedAliasV6 | null> {
+  if (!REDIS_URL) return null;
+  try {
+    const res  = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${REDIS_TOKEN}` },
+    });
+    const json = await res.json() as { result?: string | null };
+    if (!json.result) return null;
+
+    let parsed: unknown;
+    try { parsed = JSON.parse(json.result); }
+    catch { logCacheShapeInvalid(key, json.result, "json-parse-failed"); return null; }
+
+    if (!isCachedAliasV6(parsed)) {
+      logCacheShapeInvalid(key, json.result, "shape-validation-failed");
+      return null;
+    }
+    return parsed;
+  } catch (e) {
+    console.error(`[evaluate] cacheGetAlias threw key=${key}:`, e);
+    return null;
+  }
+}
+
+async function cacheSetAlias(key: string, payload: CachedAliasV6): Promise<void> {
+  if (!REDIS_URL) return;
+  try {
+    await fetch(REDIS_URL, {
+      method:  "POST",
+      headers: {
+        Authorization:  `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["SET", key, JSON.stringify(payload), "EX", CACHE_TTL_S]),
+    });
+  } catch (e) {
+    console.error(`[evaluate] cacheSetAlias threw key=${key}:`, e);
+  }
+}
+
+async function cacheDeleteAlias(key: string): Promise<void> {
+  if (!REDIS_URL) return;
+  try {
+    await fetch(REDIS_URL, {
+      method:  "POST",
+      headers: {
+        Authorization:  `Bearer ${REDIS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(["DEL", key]),
+    });
+  } catch (e) {
+    console.error(`[evaluate] cacheDeleteAlias threw key=${key}:`, e);
+  }
+}
+
+/**
+ * v6.1 — Resolve a detected label to the name we should use as the cache
+ * key. Falls back to detectedLabel if there's no alias or alias confidence
+ * is below the read threshold.
+ *
+ * One Redis GET per request. Result is the canonical key segment to use
+ * for verdict lookups.
+ */
+async function resolveCanonicalLabel(detectedLabel: string): Promise<{
+  canonical:    string;       // the label to use for cache key construction
+  aliasUsed:    boolean;      // true if we redirected to a canonical name
+  aliasEntry:   CachedAliasV6 | null;
+}> {
+  if (!REDIS_URL) return { canonical: detectedLabel, aliasUsed: false, aliasEntry: null };
+
+  const aliasKey   = buildAliasCacheKey(detectedLabel);
+  const aliasEntry = await cacheGetAlias(aliasKey);
+
+  if (aliasEntry && aliasEntry.confidence >= ALIAS_READ_THRESHOLD) {
+    return {
+      canonical:  aliasEntry.canonical,
+      aliasUsed:  true,
+      aliasEntry,
+    };
+  }
+
+  return {
+    canonical:  detectedLabel,
+    aliasUsed:  false,
+    aliasEntry,
+  };
+}
+
+/**
+ * v6.1 — Update the alias map after a successful model call. Three cases:
+ *
+ *   1. Model resolved to the same name as detected (after normalization):
+ *      no alias needed — ML Kit was right. Skip.
+ *
+ *   2. Model resolved to a different name AND no existing alias:
+ *      create a new alias with starting confidence 0.6.
+ *
+ *   3. Existing alias for this detected label:
+ *      a. If new resolution agrees with stored canonical → confirm
+ *         (confidence + 0.1, observed_count + 1)
+ *      b. If new resolution disagrees with stored canonical → conflict
+ *         (confidence - 0.1, observed_count + 1).
+ *         If post-conflict confidence < 0.3 → evict the alias.
+ */
+async function updateAliasMap(
+  detectedLabel:      string,
+  resolvedObjectName: string,
+  modelId:            string,
+  existingAlias:      CachedAliasV6 | null,
+): Promise<void> {
+  const detectedNorm = normalizeForKey(detectedLabel);
+  const resolvedNorm = normalizeForKey(resolvedObjectName);
+
+  // Case 1 — ML Kit was right; no alias work needed.
+  if (detectedNorm === resolvedNorm || resolvedNorm.length === 0) return;
+
+  const aliasKey  = buildAliasCacheKey(detectedLabel);
+  const nowIso    = new Date().toISOString();
+  const baseMeta  = { model_id: modelId, schema: 6 as const, written_at: nowIso, source: "organic" as const };
+
+  // Case 2 — no existing alias; create new at starting confidence.
+  if (!existingAlias) {
+    const payload: CachedAliasV6 = {
+      v:               6,
+      canonical:       resolvedNorm,
+      confidence:      ALIAS_NEW_CONFIDENCE,
+      observed_count:  1,
+      first_seen:      nowIso,
+      last_seen:       nowIso,
+      meta:            baseMeta,
+    };
+    await cacheSetAlias(aliasKey, payload);
+    console.log(
+      `[evaluate] alias created: detected="${detectedNorm}" → canonical="${resolvedNorm}" ` +
+      `confidence=${ALIAS_NEW_CONFIDENCE}`,
+    );
+    return;
+  }
+
+  // Case 3a — confirmation (existing canonical matches new resolution).
+  if (existingAlias.canonical === resolvedNorm) {
+    const newConfidence = Math.min(1.0, existingAlias.confidence + ALIAS_CONFIRM_INCREMENT);
+    const payload: CachedAliasV6 = {
+      ...existingAlias,
+      confidence:     newConfidence,
+      observed_count: existingAlias.observed_count + 1,
+      last_seen:      nowIso,
+      meta:           baseMeta,
+    };
+    await cacheSetAlias(aliasKey, payload);
+    console.log(
+      `[evaluate] alias confirmed: detected="${detectedNorm}" → canonical="${resolvedNorm}" ` +
+      `confidence=${existingAlias.confidence.toFixed(2)}→${newConfidence.toFixed(2)} ` +
+      `observed=${payload.observed_count}`,
+    );
+    return;
+  }
+
+  // Case 3b — conflict (new resolution disagrees with stored canonical).
+  // Decrement confidence; if it drops below the evict threshold, delete
+  // the alias entirely so a future scan starts fresh.
+  const newConfidence = existingAlias.confidence - ALIAS_CONFLICT_DECREMENT;
+  if (newConfidence < ALIAS_EVICT_THRESHOLD) {
+    await cacheDeleteAlias(aliasKey);
+    console.log(
+      `[evaluate] alias evicted: detected="${detectedNorm}" prev_canonical="${existingAlias.canonical}" ` +
+      `new_canonical="${resolvedNorm}" confidence=${existingAlias.confidence.toFixed(2)}→${newConfidence.toFixed(2)}`,
+    );
+    return;
+  }
+
+  // Conflict but not enough to evict — decay confidence, keep stored canonical.
+  const payload: CachedAliasV6 = {
+    ...existingAlias,
+    confidence:     newConfidence,
+    observed_count: existingAlias.observed_count + 1,
+    last_seen:      nowIso,
+    meta:           baseMeta,
+  };
+  await cacheSetAlias(aliasKey, payload);
+  console.log(
+    `[evaluate] alias conflict: detected="${detectedNorm}" stored_canonical="${existingAlias.canonical}" ` +
+    `new_resolution="${resolvedNorm}" confidence=${existingAlias.confidence.toFixed(2)}→${newConfidence.toFixed(2)} ` +
+    `(kept stored canonical)`,
+  );
+}
+
 // ─── Quest flavor template fetch ─────────────────────────────────────────────
 //
 // Small in-process cache (60s TTL) keyed by quest_id so a parent doing a
@@ -333,7 +702,7 @@ const FLAVOR_TTL_MS    = 60_000;
 const flavorCache      = new Map<string, CachedFlavor>();
 
 async function fetchQuestFlavorTemplate(
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
   questId:  string | undefined,
 ): Promise<string | null> {
   if (!questId) return null;
@@ -376,7 +745,7 @@ interface LogScanArgs {
 }
 
 async function logScanResult(
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
   opts:     LogScanArgs & { claudeLatencyMs: number; modelId: string },
 ): Promise<string | null> {
   try {
@@ -408,7 +777,7 @@ async function logScanResult(
 }
 
 async function logScanCacheHit(
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
   opts:     LogScanArgs,
 ): Promise<string | null> {
   try {
@@ -440,7 +809,7 @@ async function logScanCacheHit(
 }
 
 async function logScanBlocked(
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
   opts: {
     childId:       string;
     questId?:      string;
@@ -520,7 +889,7 @@ function extractIp(headers: Headers): string {
 }
 
 async function checkIpRateLimit(
-  supabase: ReturnType<typeof createClient>,
+  supabase: SupabaseClient,
   ipHash:   string,
 ): Promise<{ allowed: boolean; requestCount: number }> {
   const windowStart = new Date(Date.now() - IP_WINDOW_MS).toISOString();
@@ -639,8 +1008,12 @@ serve(async (req: Request) => {
   // ── 4. Per-property cache lookup ──────────────────────────────────────────
   const labelTrimmed   = detectedLabel.toLowerCase().trim();
   const isGenericLabel = GENERIC_LABELS.has(labelTrimmed);
+  // v6.1: Basket labels (e.g. "tableware") apply to many distinct objects
+  // with different property verdicts. Cache-bypass them like generic labels
+  // to prevent serving wrong verdicts. See BASKET_LABELS comment for why.
+  const isBasketLabel  = BASKET_LABELS.has(labelTrimmed);
   const attempts       = (failedAttempts as number | undefined) ?? 0;
-  const shouldUseCache = !isGenericLabel && attempts === 0;
+  const shouldUseCache = !isGenericLabel && !isBasketLabel && attempts === 0;
 
   const pendingProperties: PropertyRequirement[] = Array.isArray(requiredProperties)
     ? (requiredProperties as Array<Record<string, unknown>>).map((p) => ({
@@ -650,6 +1023,29 @@ serve(async (req: Request) => {
       })).filter((p) => p.word.length > 0)
     : [];
 
+  // v6.1: Resolve detected label to canonical name via the alias map BEFORE
+  // verdict cache lookups. If ML Kit said "tableware" but we've previously
+  // observed Mistral resolving that to "biscuit packet", we look up under
+  // "biscuit packet" so this scan benefits from prior cache writes.
+  // Falls back to detectedLabel when no confident alias exists.
+  // Skipped for generic labels and retries (those bypass cache anyway).
+  const aliasResolution = shouldUseCache
+    ? await resolveCanonicalLabel(detectedLabel)
+    : { canonical: detectedLabel, aliasUsed: false, aliasEntry: null as CachedAliasV6 | null };
+
+  if (shouldUseCache) {
+    console.log(
+      `[evaluate] alias-resolve: detected="${normalizeForKey(detectedLabel)}" ` +
+      `→ canonical="${normalizeForKey(aliasResolution.canonical)}" ` +
+      `aliasUsed=${aliasResolution.aliasUsed}` +
+      (aliasResolution.aliasEntry
+        ? ` confidence=${aliasResolution.aliasEntry.confidence.toFixed(2)} ` +
+          `observed=${aliasResolution.aliasEntry.observed_count}`
+        : "") +
+      ` childId=${childId}`,
+    );
+  }
+
   let cachedV6Properties: PropertyScoreV6[] = [];
   let missingProperties:  PropertyRequirement[] = pendingProperties;
 
@@ -657,7 +1053,7 @@ serve(async (req: Request) => {
     const lookups = await Promise.all(
       pendingProperties.map(async (prop) => ({
         prop,
-        hit: await cacheGetVerdict(buildPerPropCacheKey(detectedLabel, prop.word)),
+        hit: await cacheGetVerdict(buildPerPropCacheKey(aliasResolution.canonical, prop.word)),
       })),
     );
 
@@ -683,6 +1079,8 @@ serve(async (req: Request) => {
     );
   } else if (isGenericLabel) {
     console.log(`[evaluate] Skipping cache (generic label="${labelTrimmed}"): childId=${childId}`);
+  } else if (isBasketLabel) {
+    console.log(`[evaluate] Skipping cache (basket label="${labelTrimmed}" — covers many canonical objects): childId=${childId}`);
   }
 
   // ── 5. Quest flavor template (composed into childFeedback) ───────────────
@@ -690,7 +1088,7 @@ serve(async (req: Request) => {
 
   // ── 6. FULL CACHE HIT — skip model entirely ───────────────────────────────
   if (shouldUseCache && missingProperties.length === 0 && cachedV6Properties.length > 0) {
-    const cachedResolvedRow = await cacheGetResolvedName(buildResolvedNameCacheKey(detectedLabel));
+    const cachedResolvedRow = await cacheGetResolvedName(buildResolvedNameCacheKey(aliasResolution.canonical));
     const resolvedName      = cachedResolvedRow?.name;
 
     console.log(
@@ -770,10 +1168,29 @@ serve(async (req: Request) => {
   const modelLatencyMs = Date.now() - modelStart;
   const modelId        = routing.adapter.id;
 
-  // ── 9. Write fresh properties to cache (per-property + resolved-name) ─────
+  // ── 9. Write fresh properties to cache (per-property + resolved-name + alias) ─
+  //
+  // v6.1: cache writes use the canonical name as the key segment, not the
+  // raw detectedLabel. Canonical = evaluation.resolvedObjectName if the
+  // model produced one, else the alias-resolved canonical, else the raw
+  // detectedLabel as before.
+  //
+  // This means:
+  //   • Mistral-correct scans (model returns a resolvedName) seed the
+  //     canonical cache directly.
+  //   • Subsequent ML-Kit-mislabeled scans of the same object find the
+  //     same canonical entries via the alias redirect.
+  //   • Backward compat: existing v6 cache entries keyed on raw
+  //     detectedLabel keep serving for their TTL; new writes from v6.1
+  //     converge on canonical keys.
+  const canonicalForWrite =
+    evaluation.resolvedObjectName && evaluation.resolvedObjectName.trim().length > 0
+      ? evaluation.resolvedObjectName
+      : aliasResolution.canonical;
+
   if (shouldUseCache && evaluation.freshProperties.length > 0) {
     await Promise.all(evaluation.freshProperties.map(async (p) => {
-      const key: string = buildPerPropCacheKey(detectedLabel, p.word);
+      const key: string = buildPerPropCacheKey(canonicalForWrite, p.word);
       const payload: CachedVerdictV6 = {
         v: 6,
         verdict: { score: p.score, passes: p.passes, reasoning: p.reasoning },
@@ -790,11 +1207,24 @@ serve(async (req: Request) => {
     }));
 
     if (evaluation.resolvedObjectName && evaluation.resolvedObjectName.trim().length > 0) {
+      // Resolved-name cache: keyed under the canonical so a future scan
+      // that lands on the same canonical (via alias or direct match) finds
+      // the resolved name.
       await cacheSetResolvedName(
-        buildResolvedNameCacheKey(detectedLabel),
+        buildResolvedNameCacheKey(canonicalForWrite),
         evaluation.resolvedObjectName,
         modelId,
+        canonicalForWrite,
+      );
+
+      // Alias map update: only relevant when the model corrected the
+      // detected label. updateAliasMap handles all the cases (no-op when
+      // detected ≈ resolved, create-new, confirm, conflict, evict).
+      await updateAliasMap(
         detectedLabel,
+        evaluation.resolvedObjectName,
+        modelId,
+        aliasResolution.aliasEntry,
       );
     }
   }

@@ -383,7 +383,7 @@ export function ParentDashboard({ navigation }: Props) {
     async function fetchChildren() {
       const { data, error: e } = await supabase
         .from("child_profiles")
-        .select("id, display_name, age_band, level, total_xp, avatar_key")
+        .select("id, display_name, age, age_band, level, total_xp, avatar_key")
         .order("created_at");
       if (e) { setError(e.message); return; }
       setChildren(data ?? []);
@@ -423,7 +423,7 @@ export function ParentDashboard({ navigation }: Props) {
       const [childRes, tomeRes, completionsRes] = await Promise.all([
         supabase
           .from("child_profiles")
-          .select("id, display_name, age_band, level, total_xp, avatar_key")
+          .select("id, display_name, age, age_band, level, total_xp, avatar_key")
           .eq("id", childId)
           .single(),
         supabase

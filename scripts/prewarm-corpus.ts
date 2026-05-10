@@ -368,3 +368,43 @@ export const PREWARM_CORPUS: PrewarmEntry[] = [
   ...FREE_DUNGEON_ENTRIES,
   ...GENERAL_HOUSEHOLD_ENTRIES,
 ];
+
+// ─── Derived exports ─────────────────────────────────────────────────────────
+//
+// Used by scripts/prewarm-cache.ts for CLI validation, summary stats, and
+// cost estimation. Computed from PREWARM_CORPUS so they stay in sync if
+// entries are added, removed, or recategorised. Type assertion on the
+// category set is safe — corpus entries already constrain `category` to
+// the literal union via PrewarmEntry.
+
+/**
+ * All distinct category strings that appear in PREWARM_CORPUS. Used to
+ * validate the `--categories` CLI arg against typos like "free-dungeon"
+ * instead of "free_dungeon".
+ */
+export const CATEGORIES: ReadonlyArray<PrewarmEntry["category"]> = Array.from(
+  new Set(PREWARM_CORPUS.map((e) => e.category)),
+) as ReadonlyArray<PrewarmEntry["category"]>;
+
+/**
+ * Total number of per-property cache rows the corpus would write if every
+ * entry were warmed end-to-end (one row per (label, property)). Used in
+ * the final summary line so operators can verify completeness.
+ */
+export const TOTAL_ROWS: number = PREWARM_CORPUS.reduce(
+  (sum, e) => sum + e.properties.length,
+  0,
+);
+
+/**
+ * Subset stats for the free_dungeon corpus specifically — used in the
+ * summary because the free_dungeon coverage matters more than the
+ * general_household coverage at launch (free-tier kids hit it most).
+ */
+export const FREE_DUNGEON_STATS: { entries: number; rows: number } = (() => {
+  const subset = PREWARM_CORPUS.filter((e) => e.category === "free_dungeon");
+  return {
+    entries: subset.length,
+    rows:    subset.reduce((sum, e) => sum + e.properties.length, 0),
+  };
+})();

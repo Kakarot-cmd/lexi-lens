@@ -696,7 +696,12 @@ export function ScanScreen({ route, navigation }: Props) {
         frameBase64Already: frameBase64 ?? undefined,
         requiredProperties: pendingNow,
         alreadyFoundWords,
-        childAge:           parseInt(ac.age_band.split("-")[1], 10),
+        // v6.1: pass ACTUAL age, not the band's upper bound. Pre-v6.1 the
+        // line below was `parseInt(ac.age_band.split("-")[1], 10)` which
+        // collapsed every child to age 6/8/10/12 regardless of true age and
+        // forced 7-year-olds into the kid_msg.older voice (band threshold
+        // is age<8). The model receives the actual integer now.
+        childAge:           ac.age,
         failedAttempts:     currentAttempts,
         xp_reward_first_try:  aq.quest.xp_reward_first_try  ?? 40,
         xp_reward_retry:      aq.quest.xp_reward_retry      ?? 25,

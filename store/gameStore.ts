@@ -215,7 +215,8 @@ export interface ActiveQuest {
 export interface ChildSession {
   id:           string;
   display_name: string;
-  age_band:     string;
+  age:          number;   // v6.1 — actual integer age, NOT the band's representative
+  age_band:     string;   // derived from age via DB trigger; kept for cohort queries
   level:        number;
   total_xp:     number;
   avatar_key:   string | null;

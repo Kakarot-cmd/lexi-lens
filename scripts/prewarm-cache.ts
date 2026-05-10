@@ -62,6 +62,7 @@
 
 import {
   evaluateObject,
+  type EvaluationResult,
   type PropertyRequirement,
   type PropertyScore,
 } from "../supabase/functions/evaluate/evaluateObject.ts";
@@ -75,7 +76,26 @@ import {
   TOTAL_ROWS,
   FREE_DUNGEON_STATS,
   type PrewarmEntry,
+  type PrewarmProperty,
 } from "./prewarm-corpus.ts";
+
+// ─── Property normalisation helpers ──────────────────────────────────────────
+//
+// PrewarmEntry.properties is `Array<string | PrewarmProperty>`. Strings are
+// unambiguous properties ("round", "soft"). Objects are hint-anchored
+// properties — the model gets extra evaluationHints text to anchor judgement
+// at the category level (e.g. "Accept PASS for any object with raised pile,
+// plush, or fleece-like texture..."). The downstream cache code uses the
+// word as a key, but the hint must flow through to the model when present
+// so cache writes capture the hint-anchored verdict, not a hint-free one.
+
+function propWord(p: string | PrewarmProperty): string {
+  return typeof p === "string" ? p : p.word;
+}
+
+function propHint(p: string | PrewarmProperty): string | undefined {
+  return typeof p === "string" ? undefined : p.evaluationHints;
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -214,7 +234,11 @@ function parseCli(args: string[]): Cli {
     Deno.exit(1);
   }
   if (cli.categories) {
-    const unknown = cli.categories.filter((c) => !CATEGORIES.includes(c));
+    // CATEGORIES is typed as the literal union; .includes accepts only those
+    // literals under strict TS. Cast to string[] for the membership check
+    // since cli.categories is plain string[] from CLI parsing.
+    const known = CATEGORIES as readonly string[];
+    const unknown = cli.categories.filter((c) => !known.includes(c));
     if (unknown.length > 0) {
       console.error(`ERROR: unknown categories: ${unknown.join(", ")}`);
       console.error(`       Available: ${CATEGORIES.join(", ")}`);
@@ -487,7 +511,17 @@ async function processEntry(
 ): Promise<EntryOutcome> {
   const out: EntryOutcome = { entry, status: "warmed", perProperty: [] };
 
-  const preflightKeys = entry.properties.map((word) => ({
+  // Normalize entry.properties (Array<string | PrewarmProperty>) → string[]
+  // for cache key construction and Set membership checks. Hints are kept
+  // in a side-channel Map so they can flow through to the model call.
+  const propWords: string[]               = entry.properties.map(propWord);
+  const hintByWord: Map<string, string>   = new Map();
+  for (const p of entry.properties) {
+    const h = propHint(p);
+    if (h) hintByWord.set(propWord(p).toLowerCase(), h);
+  }
+
+  const preflightKeys = propWords.map((word) => ({
     word,
     key:  buildPerPropCacheKey(envNs, entry.label, word),
   }));
@@ -502,7 +536,7 @@ async function processEntry(
     );
     cachedSet = new Set(checks.filter((c) => c.cached).map((c) => c.word));
 
-    if (cachedSet.size === entry.properties.length) {
+    if (cachedSet.size === propWords.length) {
       out.status = "skipped-cached";
       out.reason = "all properties already cached";
       out.perProperty = preflightKeys.map(({ word, key }) => ({
@@ -514,8 +548,8 @@ async function processEntry(
     }
   }
 
-  const missingProperties = entry.properties.filter((w) => !cachedSet.has(w));
-  for (const word of entry.properties) {
+  const missingProperties: string[] = propWords.filter((w) => !cachedSet.has(w));
+  for (const word of propWords) {
     if (cachedSet.has(word)) {
       out.perProperty.push({
         word,
@@ -527,7 +561,7 @@ async function processEntry(
 
   if (cli.dryRun) {
     out.status = "warmed";
-    out.reason = `dry-run (would warm ${missingProperties.length}/${entry.properties.length} props)`;
+    out.reason = `dry-run (would warm ${missingProperties.length}/${propWords.length} props)`;
     for (const word of missingProperties) {
       out.perProperty.push({
         word,
@@ -540,13 +574,25 @@ async function processEntry(
 
   const requiredProperties: PropertyRequirement[] = missingProperties.map((word) => ({
     word,
-    definition: DEFINITIONS[word.toLowerCase()] ?? word,
+    definition:      DEFINITIONS[word.toLowerCase()] ?? word,
+    evaluationHints: hintByWord.get(word.toLowerCase()),
   }));
 
-  let result;
+  let result: EvaluationResult;
   const startedAt = Date.now();
   try {
-    result = await evaluateObject(
+    // v6.0 note: evaluateObject's return shape is { result, freshProperties,
+    // resolvedObjectName }. We destructure `result` for verdict + properties
+    // (the v5-shaped PropertyScore[]) and ignore `freshProperties` (the v6
+    // shape with kid_msg/nudge) and the outer resolvedObjectName.
+    //
+    // This means the cache values this script writes are v5-shaped — they
+    // will be rejected by v6 evaluate's strict shape validator with the
+    // CACHE_SHAPE_INVALID prefix, treated as miss. If/when prewarm is
+    // revived post-launch, switch this to use freshProperties and write
+    // the v6 shape (kid_msg.young/older, nudge, meta block). See the
+    // outstanding-from-v6.0-PR list in the roadmap.
+    const evalOutput = await evaluateObject(
       {
         detectedLabel:     entry.label,
         confidence:        1.0,
@@ -560,9 +606,10 @@ async function processEntry(
       },
       adapter,
     );
+    result = evalOutput.result;
     out.modelLatencyMs = Date.now() - startedAt;
     out.modelId        = adapter.id;
-    out.resolvedName   = result.resolvedObjectName;
+    out.resolvedName   = evalOutput.resolvedObjectName;
   } catch (e) {
     out.status = "failed";
     out.reason = e instanceof Error ? e.message : String(e);

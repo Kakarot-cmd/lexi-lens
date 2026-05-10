@@ -165,7 +165,7 @@ Deno.serve(async (req: Request) => {
   //      This is the security gate — a parent cannot export another family's data.
   const { data: childData, error: childErr } = await admin
     .from("child_profiles")
-    .select("id, display_name, age_band, level, total_xp, avatar_key")
+    .select("id, display_name, age, age_band, level, total_xp, avatar_key")
     .eq("id", childId)
     .eq("parent_id", parentId)
     .single();
@@ -208,7 +208,13 @@ Deno.serve(async (req: Request) => {
     console.warn("[export-word-tome] quest_completions fetch warn:", questsErr.message);
   }
 
-  const quests: QuestCompletion[] = (questsData ?? []) as QuestCompletion[];
+  // Cast through unknown: Supabase's relational-select inferred type returns
+  // `quests` as an array per the FK relation, but QuestCompletion models it
+  // as a singular `{...} | null` because each quest_completion row maps to
+  // exactly one quest. Direct cast doesn't have enough structural overlap
+  // for TS strict; through-unknown bypasses the overlap check. Runtime
+  // shape is unchanged — Supabase still returns the same JSON.
+  const quests: QuestCompletion[] = (questsData ?? []) as unknown as QuestCompletion[];
 
   // ── 7. Generate AI portfolio summary ──────────────────────────────────────
   const summary = await generatePortfolioSummary(child, words, quests);
