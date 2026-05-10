@@ -1188,7 +1188,33 @@ serve(async (req: Request) => {
       ? evaluation.resolvedObjectName
       : aliasResolution.canonical;
 
-  if (shouldUseCache && evaluation.freshProperties.length > 0) {
+  // v6.1.3 — Symmetric input contract: the read path bypasses cache for
+  // GENERIC_LABELS and BASKET_LABELS. The write path now refuses to
+  // create cache or alias entries when the MODEL'S resolvedObjectName
+  // normalizes into the same buckets. Without this guard, any model
+  // that punts (Gemini occasionally returns literal "object", "thing",
+  // or "tableware" when uncertain) creates polluting bucket entries
+  // that future generic-label-bypassed scans can't even look up but
+  // the alias map happily redirects future ML-mislabeled scans into.
+  //
+  // Observed in PROD logs 2026-05-10: Gemini returned resolvedObjectName=
+  // "object" on a "hair"-detected scan. Cache wrote v6:verdict:object:*
+  // entries; alias mapped hair→object. Future "hair" detections would
+  // pull those junk verdicts.
+  const canonicalNormalized = canonicalForWrite.toLowerCase().trim();
+  const canonicalIsGeneric  = GENERIC_LABELS.has(canonicalNormalized);
+  const canonicalIsBasket   = BASKET_LABELS.has(canonicalNormalized);
+  const canonicalIsValid    = !canonicalIsGeneric && !canonicalIsBasket && canonicalNormalized.length > 0;
+
+  if (shouldUseCache && !canonicalIsValid) {
+    console.warn(
+      `[evaluate] CACHE_WRITE_SKIPPED canonical="${canonicalNormalized}" ` +
+      `reason=${canonicalIsGeneric ? "generic-canonical" : canonicalIsBasket ? "basket-canonical" : "empty-canonical"} ` +
+      `detectedLabel="${detectedLabel}" childId=${childId}`,
+    );
+  }
+
+  if (shouldUseCache && canonicalIsValid && evaluation.freshProperties.length > 0) {
     await Promise.all(evaluation.freshProperties.map(async (p) => {
       const key: string = buildPerPropCacheKey(canonicalForWrite, p.word);
       const payload: CachedVerdictV6 = {

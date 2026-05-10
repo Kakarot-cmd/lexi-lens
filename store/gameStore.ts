@@ -193,6 +193,16 @@ export interface Quest {
   weapon_emoji?:        string;
   spell_description?:   string;
   created_by?:          string;
+  /**
+   * v6.0 — DB column `quests.min_subscription_tier`.
+   * 'free' = visible+playable for everyone.
+   * 'paid' = visible-but-locked for free parents (greyed card with
+   *   upgrade CTA). Server `evaluate` enforces the gate as a safety
+   *   net even if a client somehow bypasses the lock.
+   * Optional in the client type because legacy quests pre-dating the
+   * column may return null; treat null as 'free'.
+   */
+  min_subscription_tier?: "free" | "paid";
 }
 
 export interface ComponentProgress {
@@ -348,6 +358,22 @@ interface GameState {
   loadDailyQuest:        () => Promise<void>;
   recordDailyCompletion: (questId: string) => Promise<void>;
   loadSpellBook:         () => Promise<void>;
+
+  // ── v6.0 — Parent subscription tier (drives quest lock state on the map) ─
+  /**
+   * 'free' or 'paid', sourced from public.parents.subscription_tier.
+   * null means "not yet loaded" — render conservatively as if free.
+   * Persisted via partialize so cold starts don't flash a misleading
+   * unlocked-then-locked state on the QuestMap.
+   */
+  parentSubscriptionTier: "free" | "paid" | null;
+  /**
+   * Fetches the signed-in parent's subscription_tier and writes it to
+   * the store. Defaults to 'free' on any error or missing row — the
+   * most restrictive value, so the lock stays on if we can't verify.
+   * Idempotent; safe to call from any mount.
+   */
+  loadParentProfile:     () => Promise<void>;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -422,6 +448,9 @@ export const useGameStore = create<GameState>()(
       achievements:          [],
       newlyEarnedBadges:     [],
       isLoadingAchievements: false,
+
+      // v6.0 — null until loadParentProfile() resolves; render as free meanwhile
+      parentSubscriptionTier: null,
 
       resetSessionCounters: () =>
         set({ sessionCounters: { questsStarted: 0, questsFinished: 0, xpEarned: 0 } }),
@@ -522,6 +551,47 @@ export const useGameStore = create<GameState>()(
           set({ questLibrary: filtered, isLoadingQuests: false });
         } catch (err: any) {
           set({ questError: err.message ?? "Failed to load quests", isLoadingQuests: false });
+        }
+      },
+
+      // ── v6.0 — Parent profile (subscription tier) ─────────
+      //
+      // Reads the signed-in parent's row from public.parents and writes
+      // subscription_tier into the store. Used by QuestMapScreen to mark
+      // paid quests as locked for free parents.
+      //
+      // Failure modes — all bias toward 'free' (most restrictive lock state):
+      //   • Not signed in              → null  (treat as free at render time)
+      //   • parents row missing         → 'free' (defensive default)
+      //   • Network / DB error          → 'free'
+      //   • Column doesn't exist yet    → 'free' (graceful pre-migration)
+      //
+      // Server-side `evaluate` is the authoritative gate; this client value
+      // only drives UI affordance, never a security decision.
+      loadParentProfile: async () => {
+        try {
+          const { data: { user }, error: authErr } = await supabase.auth.getUser();
+          if (authErr || !user) {
+            set({ parentSubscriptionTier: null });
+            return;
+          }
+
+          const { data, error } = await supabase
+            .from("parents")
+            .select("subscription_tier")
+            .eq("id", user.id)
+            .maybeSingle();
+
+          if (error) {
+            // Likely the column or row is missing — fail closed to 'free'.
+            set({ parentSubscriptionTier: "free" });
+            return;
+          }
+
+          const raw = (data as { subscription_tier?: string } | null)?.subscription_tier;
+          set({ parentSubscriptionTier: raw === "paid" ? "paid" : "free" });
+        } catch {
+          set({ parentSubscriptionTier: "free" });
         }
       },
 
@@ -1158,6 +1228,9 @@ export const useGameStore = create<GameState>()(
         isDailyQuestComplete:  state.isDailyQuestComplete,
         spellBook:             state.spellBook,
         hasSeenOnboarding:     state.hasSeenOnboarding,
+        // v6.0 — persist parent tier so cold-start QuestMap doesn't flash
+        // unlocked content for a beat before loadParentProfile() resolves.
+        parentSubscriptionTier: state.parentSubscriptionTier,
       }),
     }
   )
@@ -1245,6 +1318,26 @@ export const selectQuestCompletionMode = (
 
 export const selectHasHardMode = (quest: Quest): boolean =>
   Array.isArray(quest.hard_mode_properties) && quest.hard_mode_properties.length > 0;
+
+/**
+ * v6.0 — true if the quest is paid-tier AND the parent is on free.
+ * Used by QuestMapScreen to render the locked card variant.
+ *
+ * Treats null parentSubscriptionTier as 'free' (most restrictive) — better
+ * to show a transient lock during cold start than to flash an unlocked
+ * paid quest before loadParentProfile() resolves.
+ *
+ * Treats missing/null quest.min_subscription_tier as 'free' (legacy quest
+ * pre-dating the column).
+ */
+export const selectIsQuestLocked = (
+  quest:      Quest,
+  parentTier: GameState["parentSubscriptionTier"],
+): boolean => {
+  const questNeeds = quest.min_subscription_tier ?? "free";
+  if (questNeeds !== "paid") return false;
+  return parentTier !== "paid"; // null or 'free' both lock
+};
 
 export const selectLevelProgress = (state: GameState): number => {
   const xp    = state.activeChild?.total_xp ?? 0;

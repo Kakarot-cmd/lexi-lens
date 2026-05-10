@@ -35,6 +35,7 @@ import {
   StyleSheet,
   Platform,
   ActivityIndicator,
+  Alert,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -48,6 +49,7 @@ import {
   selectLevelProgress,
   selectQuestsGroupedByTier,
   selectDailyQuest,
+  selectIsQuestLocked,
   getDisplayProperties,
   TIER_META,
   type Quest,
@@ -88,6 +90,15 @@ const P = {
   lockedBg:     "#0d0d1a",
   lockedBorder: "#2a2040",
   lockedText:   "#4a3f6b",
+
+  // v6.0 — Premium-locked quest card (visible-but-locked)
+  // Uses gold accents to read as "valuable thing you could unlock" rather
+  // than "broken/unavailable". Distinct from the tier-progression lock
+  // (which uses the dim purple lockedBg above).
+  premiumBg:     "rgba(245,200,66,0.06)",
+  premiumBorder: "rgba(245,200,66,0.30)",
+  premiumGold:   "#f5c842",
+  premiumDim:    "#7a6a3a",
 };
 
 // ─── XP / level bar ───────────────────────────────────────────────────────────
@@ -200,10 +211,17 @@ function QuestCard({
   quest,
   onBegin,
   onHardMode,
+  isLocked,
 }: {
   quest:      Quest;
   onBegin:    () => void;
   onHardMode: () => void;
+  /**
+   * v6.0 — true when quest is paid-tier and the parent is on free.
+   * Renders a greyed card with a 🔒 Premium CTA instead of Begin.
+   * Server `evaluate` enforces the gate authoritatively — this is UX only.
+   */
+  isLocked:   boolean;
 }) {
   const completionMode   = useGameStore((s) => selectQuestCompletionMode(s, quest.id));
   const dailyQuestId     = useGameStore((s) => s.dailyQuest.questId);
@@ -225,45 +243,69 @@ function QuestCard({
   const maxXpFirst  = Math.round((quest.xp_reward_first_try ?? 40) * propCount * multiBonus);
   const maxXpRetry  = Math.round((quest.xp_reward_retry     ?? 25) * propCount * multiBonus);
 
+  // ── v6.0 — Premium-locked tap handler ─────────────────────
+  // Pre-RevenueCat (Phase 4.4): single Alert explaining the lock.
+  // Post-RevenueCat: replace this body with the paywall trigger.
+  const handleLockedTap = useCallback(() => {
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+    Alert.alert(
+      "🔒 Premium Quest",
+      `"${quest.name}" is part of the Premium adventure pack.\n\nUpgrade your account to unlock all premium dungeons, harder challenges, and more XP.`,
+      [
+        { text: "Maybe later", style: "cancel" },
+        // TODO Phase 4.4 — replace with RevenueCat paywall presenter.
+        { text: "Tell me more", style: "default", onPress: () => { /* paywall hook */ } },
+      ],
+      { cancelable: true },
+    );
+  }, [quest.name]);
+
   return (
     <View
       style={[
         styles.card,
-        isHardBeaten && styles.cardHardBeaten,
-        isCompleted && !isHardBeaten && styles.cardCompleted,
-        // v2.3 — fire glow for today's daily quest (only when not yet done)
-        isDaily && !isDailyComplete && styles.cardDaily,
+        isLocked && styles.cardLocked,
+        isHardBeaten && !isLocked && styles.cardHardBeaten,
+        isCompleted && !isHardBeaten && !isLocked && styles.cardCompleted,
+        // v2.3 — fire glow for today's daily quest (only when not yet done AND not locked)
+        isDaily && !isDailyComplete && !isLocked && styles.cardDaily,
       ]}
     >
       {/* ── Header ─────────────────────────────────────── */}
       <View style={styles.cardHeader}>
-        <Text style={styles.cardEmoji}>{quest.enemy_emoji}</Text>
+        <Text style={[styles.cardEmoji, isLocked && styles.dimmed]}>{quest.enemy_emoji}</Text>
         <View style={{ flex: 1 }}>
-          <Text style={styles.cardEnemyName}>{quest.enemy_name}</Text>
-          <Text style={styles.cardRoom}>{quest.room_label}</Text>
+          <Text style={[styles.cardEnemyName, isLocked && styles.dimmedText]}>{quest.enemy_name}</Text>
+          <Text style={[styles.cardRoom, isLocked && styles.dimmedText]}>{quest.room_label}</Text>
           <DifficultyDots sortOrder={quest.sort_order ?? 8} />
         </View>
 
         {/* Badges — right side */}
         <View style={styles.badgeStack}>
-          {/* v2.3 — Daily badge */}
-          {isDaily && !isDailyComplete && (
+          {/* v6.0 — Premium badge takes priority over other badges when locked */}
+          {isLocked && (
+            <View style={styles.badgePremium}>
+              <Text style={styles.badgePremiumText}>🔒 Premium</Text>
+            </View>
+          )}
+          {/* v2.3 — Daily badge (suppressed on locked cards to avoid mixed signals) */}
+          {!isLocked && isDaily && !isDailyComplete && (
             <View style={styles.badgeDaily}>
               <Text style={styles.badgeDailyText}>📅 Daily</Text>
             </View>
           )}
           {/* User-created badge */}
-          {quest.created_by && (
+          {!isLocked && quest.created_by && (
             <View style={styles.badgeUser}>
               <Text style={styles.badgeUserText}>✏ Custom</Text>
             </View>
           )}
-          {isHardBeaten && (
+          {!isLocked && isHardBeaten && (
             <View style={styles.badgeHard}>
               <Text style={styles.badgeHardText}>⚔ Hard</Text>
             </View>
           )}
-          {isCompleted && !isHardBeaten && (
+          {!isLocked && isCompleted && !isHardBeaten && (
             <View style={styles.badgeDone}>
               <Text style={styles.badgeDoneText}>✦ Done</Text>
             </View>
@@ -272,7 +314,7 @@ function QuestCard({
       </View>
 
       {/* ── Property preview — words the child will actually scan for ───── */}
-      <View style={styles.propRow}>
+      <View style={[styles.propRow, isLocked && styles.dimmed]}>
         {displayProps.slice(0, 3).map((p) => (
           <View key={p.word} style={styles.propChip}>
             <Text style={styles.propChipText}>{p.word}</Text>
@@ -284,7 +326,7 @@ function QuestCard({
       </View>
 
       {/* ── Hard mode property preview ───────────────────── */}
-      {isCompleted && !isHardBeaten && hasHard && (
+      {!isLocked && isCompleted && !isHardBeaten && hasHard && (
         <View style={styles.hardPropRow}>
           <Text style={styles.hardPropLabel}>⚔ Hard words: </Text>
           {quest.hard_mode_properties.slice(0, 3).map((p) => (
@@ -296,11 +338,11 @@ function QuestCard({
       )}
 
       {/* ── XP rewards (XP FIX: shows real formula total) ── */}
-      <View style={styles.xpRow}>
+      <View style={[styles.xpRow, isLocked && styles.dimmed]}>
         <View>
           <Text style={styles.xpText}>
             ⚡ Up to{" "}
-            <Text style={{ color: P.gold, fontWeight: "800" }}>{maxXpFirst} XP</Text>
+            <Text style={{ color: isLocked ? P.premiumDim : P.gold, fontWeight: "800" }}>{maxXpFirst} XP</Text>
           </Text>
           <Text style={[styles.xpText, { fontSize: 10, color: P.textDim, marginTop: 1 }]}>
             {quest.xp_reward_first_try ?? 40}/prop · {propCount} prop{propCount !== 1 ? "s" : ""} · {multiBonus}×
@@ -313,32 +355,45 @@ function QuestCard({
 
       {/* ── Action buttons ──────────────────────────────── */}
       <View style={styles.btnRow}>
-        {!isHardBeaten && (
+        {isLocked ? (
           <TouchableOpacity
-            style={[styles.beginBtn, isCompleted && styles.replayBtn]}
-            onPress={onBegin}
-            activeOpacity={0.8}
+            style={styles.premiumBtn}
+            onPress={handleLockedTap}
+            activeOpacity={0.85}
+            accessibilityLabel={`${quest.name} is a premium quest. Tap to learn more.`}
           >
-            <Text style={[styles.beginBtnText, isCompleted && styles.replayBtnText]}>
-              {isCompleted ? "↩ Replay" : "Begin Quest ✦"}
-            </Text>
+            <Text style={styles.premiumBtnText}>🔒 Unlock Premium</Text>
           </TouchableOpacity>
-        )}
+        ) : (
+          <>
+            {!isHardBeaten && (
+              <TouchableOpacity
+                style={[styles.beginBtn, isCompleted && styles.replayBtn]}
+                onPress={onBegin}
+                activeOpacity={0.8}
+              >
+                <Text style={[styles.beginBtnText, isCompleted && styles.replayBtnText]}>
+                  {isCompleted ? "↩ Replay" : "Begin Quest ✦"}
+                </Text>
+              </TouchableOpacity>
+            )}
 
-        {isCompleted && !isHardBeaten && hasHard && (
-          <TouchableOpacity
-            style={styles.hardBtn}
-            onPress={onHardMode}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.hardBtnText}>⚔ Hard Mode</Text>
-          </TouchableOpacity>
-        )}
+            {isCompleted && !isHardBeaten && hasHard && (
+              <TouchableOpacity
+                style={styles.hardBtn}
+                onPress={onHardMode}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.hardBtnText}>⚔ Hard Mode</Text>
+              </TouchableOpacity>
+            )}
 
-        {isHardBeaten && (
-          <View style={styles.hardBeatenRow}>
-            <Text style={styles.hardBeatenText}>👑 Hard mode conquered!</Text>
-          </View>
+            {isHardBeaten && (
+              <View style={styles.hardBeatenRow}>
+                <Text style={styles.hardBeatenText}>👑 Hard mode conquered!</Text>
+              </View>
+            )}
+          </>
         )}
       </View>
     </View>
@@ -364,6 +419,10 @@ export function QuestMapScreen({ navigation }: Props) {
   const questLibrary      = useGameStore((s) => s.questLibrary);
   const completedQuestIds = useGameStore((s) => s.completedQuestIds);
 
+  // v6.0 — parent subscription tier (drives quest lock state)
+  const parentTier        = useGameStore((s) => s.parentSubscriptionTier);
+  const loadParentProfile = useGameStore((s) => s.loadParentProfile);
+
   // v2.3 — streak + daily quest loaders
   const loadStreakData = useGameStore((s) => s.loadStreakData);
   const loadDailyQuest = useGameStore((s) => s.loadDailyQuest);
@@ -380,6 +439,10 @@ export function QuestMapScreen({ navigation }: Props) {
     loadQuests();
     loadCompleted();
     loadStreakData();
+    // v6.0 — fetch parent tier alongside quests so the QuestMap renders
+    // accurate lock state on first paint. Independent of activeChild
+    // since subscription is parent-level, but cheap to refresh on switch.
+    loadParentProfile();
   }, [activeChild?.id]);
 
   // Refresh child XP + level + completed quests whenever QuestMap regains
@@ -458,15 +521,20 @@ export function QuestMapScreen({ navigation }: Props) {
           />
         );
       }
+      // v6.0 — derive lock state per-quest. selectIsQuestLocked treats
+      // null parentTier as 'free' (most restrictive) so the card stays
+      // locked during the brief window before loadParentProfile resolves.
+      const isLocked = selectIsQuestLocked(item.quest, parentTier);
       return (
         <QuestCard
           quest={item.quest}
+          isLocked={isLocked}
           onBegin={() => handleBegin(item.quest, false)}
           onHardMode={() => handleBegin(item.quest, true)}
         />
       );
     },
-    [handleBegin]
+    [handleBegin, parentTier]
   );
 
   const keyExtractor = useCallback(
@@ -699,6 +767,22 @@ const styles = StyleSheet.create({
     }),
   },
 
+  // v6.0 — Premium-locked quest card. Subtle gold border to read as
+  // "premium content you could unlock", not "broken thing". Avoids any
+  // hard greying of the card itself — the dimming happens to the inner
+  // content so the gold frame stays inviting.
+  cardLocked: {
+    backgroundColor: P.premiumBg,
+    borderColor:     P.premiumBorder,
+    ...Platform.select({
+      ios:     { shadowColor: P.premiumGold, shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } },
+      android: { elevation: 3 },
+    }),
+  },
+  // Applied to inner content blocks (emoji, props, xp row) when locked
+  dimmed:     { opacity: 0.45 },
+  dimmedText: { color: P.textDim },
+
   cardHeader:    { flexDirection: "row", alignItems: "flex-start", gap: 12, marginBottom: 10 },
   cardEmoji:     { fontSize: 36 },
   cardEnemyName: { fontSize: 17, fontWeight: "700", color: P.textPrimary },
@@ -736,6 +820,17 @@ const styles = StyleSheet.create({
     paddingVertical:   4,
   },
   badgeDailyText: { fontSize: 11, color: "#fff", fontWeight: "700" },
+
+  // v6.0 — Premium lock badge in the card header
+  badgePremium: {
+    backgroundColor:   "rgba(245,200,66,0.18)",
+    borderRadius:      20,
+    borderWidth:       1,
+    borderColor:       P.premiumBorder,
+    paddingHorizontal: 10,
+    paddingVertical:   4,
+  },
+  badgePremiumText: { fontSize: 11, color: P.premiumGold, fontWeight: "700", letterSpacing: 0.3 },
 
   // ── Property chips ─────────────────────────────────────
   propRow: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginBottom: 6 },
@@ -788,6 +883,20 @@ const styles = StyleSheet.create({
 
   hardBeatenRow: { flex: 1, alignItems: "center", paddingVertical: 10 },
   hardBeatenText: { fontSize: 14, color: "#fca5a5", fontWeight: "600" },
+
+  // v6.0 — Premium-locked CTA button. Replaces Begin/Replay when isLocked.
+  // Gold-on-deep-purple to read as upsell, not as the regular purple
+  // primary action — keeps the visual hierarchy intact (premium ≠ free).
+  premiumBtn: {
+    flex:            1,
+    backgroundColor: "rgba(245,200,66,0.10)",
+    borderRadius:    12,
+    paddingVertical: 13,
+    alignItems:      "center",
+    borderWidth:     1,
+    borderColor:     P.premiumGold,
+  },
+  premiumBtnText: { fontSize: 15, fontWeight: "700", color: P.premiumGold, letterSpacing: 0.3 },
 
   // ── Empty / loading ────────────────────────────────────
   empty:     { flex: 1, alignItems: "center", justifyContent: "center", padding: 40 },

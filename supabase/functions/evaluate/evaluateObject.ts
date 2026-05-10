@@ -394,7 +394,7 @@ Your task: evaluate whether the detected object genuinely demonstrates each requ
 
 OUTPUT SHAPE (strict — return exactly this JSON shape; no prose, no markdown):
 {
-  "resolvedObjectName": "a precise common name for what's actually in frame",
+  "resolvedObjectName": "<bare lowercase common noun, NO articles (a/an/the), NO sentence punctuation. examples: 'apple', 'remote control', 'biscuit packet'. NOT 'a chair', 'The Bottle.', 'an apple'>",
   "properties": [
     {
       "word":      "<exact property word>",
@@ -442,6 +442,35 @@ Return only the JSON. No commentary, no markdown fences.`;
 }
 
 // ─── User message builder ────────────────────────────────────────────────────
+//
+// v6.1.2 — Image-only evaluation prompt (no detected-label poisoning).
+//
+// The previous version told the model "The child's camera detected: 'chair'
+// (Vision confidence: 76%)" and then asked it to "Evaluate whether 'chair'
+// satisfies each property". That's classic prompt poisoning: any vision
+// model will take the labeled identity as a strong prior, confirm it in
+// resolvedObjectName, and evaluate properties as if the labeled object
+// were what's in the frame — even when the image clearly shows something
+// else.
+//
+// Observed PROD failure (2026-05-10): a translucent orange water bottle
+// was scanned. ML Kit said "chair" 76%. Mistral, given the prompt above,
+// returned resolvedObjectName="chair", round=fail (chairs aren't round),
+// hollow=fail (chairs aren't hollow), curved=fail (chair backrests aren't
+// curved). Internally consistent verdicts — about the wrong object.
+//
+// The fix: stop telling the evaluator what the classifier guessed. Give
+// it the image and the property list. The model identifies the object in
+// resolvedObjectName (the same output field as before — no schema change)
+// and evaluates its own perception. ML Kit still serves as the cache-
+// lookup hint via the alias map — so cache hit rate is preserved — but
+// it does NOT influence the model's identification.
+//
+// `opts.detectedLabel` and `opts.confidence` are intentionally UNUSED
+// here. They remain in the EvaluateObjectOptions interface because they
+// drive cache key construction and alias-map updates upstream in
+// evaluate/index.ts. Don't reintroduce them into the prompt without
+// re-doing the eval against bottle/chair/tableware test cases.
 
 function buildUserText(opts: EvaluateObjectOptions): string {
   const propertyList = opts.requiredProperties
@@ -464,9 +493,7 @@ function buildUserText(opts: EvaluateObjectOptions): string {
 
   const failedAttempts = opts.failedAttempts ?? 0;
 
-  return `The child's camera detected: "${opts.detectedLabel}" (Vision confidence: ${(
-    opts.confidence * 100
-  ).toFixed(0)}%).
+  return `Look at the attached image. First identify what the object actually is — write the bare common noun in resolvedObjectName per the schema. Then evaluate that object — what you can SEE in the frame — against each property below. Trust your own perception, not any caption that may have arrived with the request.
 
 Properties to evaluate THIS scan (one or more is enough — the quest tracks completion across multiple scans):
 ${propertyList}
@@ -477,9 +504,7 @@ ${alreadyFoundContext}${previouslyEvaluatedContext}${
 }
 Failed attempts so far: ${failedAttempts}
 
-Evaluate whether "${opts.detectedLabel}" satisfies each property listed under "Properties to evaluate THIS scan". Return one entry per such property, using the exact word as written above.
-
-For each property, produce kid_msg.young AND kid_msg.older.
+Return one entry per property listed above, using the exact word as written. Produce kid_msg.young AND kid_msg.older for each.
 ${
   failedAttempts >= 2
     ? "The child has struggled. For any FAILING property, also produce a nudge with young+older variants."
@@ -512,6 +537,56 @@ interface ParsedModelOutput {
   properties:         PropertyScoreV6[];
 }
 
+/**
+ * v6.1.1 — Defensive normalization for the model's resolvedObjectName.
+ *
+ * What it fixes
+ * -------------
+ * Mistral (and Gemini occasionally) returns names with English determiners
+ * intact: "a chair", "the bottle", "an apple". The downstream
+ * normalizeForKey() in evaluate/index.ts treats spaces as part of the key
+ * and turns these into junk canonicals — "a-chair", "the-bottle" — that
+ * pollute the alias map and verdict cache for weeks (14-day TTL).
+ *
+ * Observed in PROD logs 2026-05-10:
+ *   [evaluate] alias created: detected="chair" → canonical="a-chair"
+ *
+ * Strategy
+ * --------
+ * Strip at parse time so EVERY downstream consumer (cache key builder,
+ * alias updater, EvaluationResult returned to the client) sees the same
+ * cleaned value. Don't try to normalize inside cache helpers — too easy
+ * to forget one.
+ *
+ * Conservative: only strips whole-word leading articles followed by a
+ * space. "Apple" stays "apple". "Antelope" stays "antelope" (not "telope"
+ * — we match "an " with a space, not bare "an").
+ *
+ * Lowercase + collapse internal whitespace too, so "Coffee  Mug" and
+ * "coffee mug" converge on the same canonical. Trailing punctuation
+ * (period, exclamation) gets trimmed because Mistral occasionally adds
+ * sentence-ending marks even though the schema is a noun.
+ */
+function normalizeResolvedObjectName(raw: string): string {
+  let s = raw.trim().toLowerCase();
+
+  // Strip a leading article when followed by a space and at least one more char
+  // ("a", "an", "the"). Loop in case of "the the" weirdness, capped at 2 iterations.
+  for (let i = 0; i < 2; i++) {
+    const stripped = s.replace(/^(a|an|the)\s+(?=\S)/, "");
+    if (stripped === s) break;
+    s = stripped;
+  }
+
+  // Collapse runs of whitespace to a single space
+  s = s.replace(/\s+/g, " ");
+
+  // Trim trailing punctuation that the model sometimes appends
+  s = s.replace(/[.!?,;:]+$/, "");
+
+  return s.trim();
+}
+
 function parseModelOutput(rawText: string): ParsedModelOutput {
   let parsed: unknown;
   try {
@@ -531,11 +606,23 @@ function parseModelOutput(rawText: string): ParsedModelOutput {
     throw new Error("Frame could not be evaluated safely.");
   }
 
-  const resolvedObjectName = typeof obj.resolvedObjectName === "string"
+  const rawName = typeof obj.resolvedObjectName === "string"
     ? obj.resolvedObjectName
     : "";
-  if (resolvedObjectName.length === 0) {
+  if (rawName.length === 0) {
     throw new Error("Model output missing resolvedObjectName");
+  }
+
+  // v6.1.1 — apply defensive normalization. See normalizeResolvedObjectName.
+  const resolvedObjectName = normalizeResolvedObjectName(rawName);
+  if (resolvedObjectName.length === 0) {
+    // E.g. model returned literally "the." → after strip+trim, empty.
+    throw new Error("Model output resolvedObjectName empty after normalization");
+  }
+  if (resolvedObjectName !== rawName) {
+    console.log(
+      `[evaluate] resolvedObjectName normalized: "${rawName}" → "${resolvedObjectName}"`,
+    );
   }
 
   if (!Array.isArray(obj.properties)) {
