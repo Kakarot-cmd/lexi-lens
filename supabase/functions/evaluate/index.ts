@@ -263,7 +263,11 @@ function buildAliasCacheKey(detectedLabel: string): string {
 
 // ─── Cache value shapes (v6) ────────────────────────────────────────────────
 
-type WriteSource = "organic" | "prewarm" | "manual";
+// v6.2: "model-seed" added — distinguishes alias entries created from model
+// introspection (canonical+aliases output) from "organic" entries observed
+// from real ML Kit detections. Operator queries can filter by source to
+// see which mechanism is producing the most cache value.
+type WriteSource = "organic" | "prewarm" | "manual" | "model-seed";
 
 interface CacheMetaV6 {
   model_id:   string;
@@ -330,7 +334,8 @@ function isCacheMetaV6(v: unknown): v is CacheMetaV6 {
   return typeof o.model_id   === "string"
       && o.schema === 6
       && typeof o.written_at === "string"
-      && (o.source === "organic" || o.source === "prewarm" || o.source === "manual");
+      && (o.source === "organic" || o.source === "prewarm"
+          || o.source === "manual" || o.source === "model-seed");
 }
 
 function isCachedVerdictV6(v: unknown): v is CachedVerdictV6 {
@@ -499,10 +504,17 @@ async function cacheSetResolvedName(
 // we bump or create the alias if the model corrected the label.
 
 const ALIAS_READ_THRESHOLD     = 0.5;   // below this, alias is not used
-const ALIAS_NEW_CONFIDENCE     = 0.6;   // initial confidence for a new alias
+const ALIAS_NEW_CONFIDENCE     = 0.6;   // initial confidence for a new alias (observed)
 const ALIAS_CONFIRM_INCREMENT  = 0.1;   // bump on repeat confirmation
 const ALIAS_CONFLICT_DECREMENT = 0.1;   // bump on disagreement
 const ALIAS_EVICT_THRESHOLD    = 0.3;   // below this, evict alias entirely
+
+// v6.2 — confidence at which we seed model-introspected aliases.
+// Lower than ALIAS_NEW_CONFIDENCE because these are guesses (the model's
+// theory of what someone else might call this object), not observations.
+// First real-world confirmation will ratchet them up via ALIAS_CONFIRM_INCREMENT.
+// First disagreement will drop them below ALIAS_EVICT_THRESHOLD and evict.
+const ALIAS_MODEL_SEED_CONFIDENCE = 0.5;
 
 async function cacheGetAlias(key: string): Promise<CachedAliasV6 | null> {
   if (!REDIS_URL) return null;
@@ -1013,7 +1025,35 @@ serve(async (req: Request) => {
   // to prevent serving wrong verdicts. See BASKET_LABELS comment for why.
   const isBasketLabel  = BASKET_LABELS.has(labelTrimmed);
   const attempts       = (failedAttempts as number | undefined) ?? 0;
-  const shouldUseCache = !isGenericLabel && !isBasketLabel && attempts === 0;
+
+  // v6.2 Phase 1: shouldUseCache split into READ vs WRITE.
+  //
+  // Why: with ML Kit kill-switched (v6.2 client), every Android scan now
+  // arrives with detectedLabel="object" (generic). Under the old unified
+  // shouldUseCache rule, this meant ALL writes were also bypassed — the
+  // cache could never accumulate. CC1 (Phase 2) would then ship into an
+  // empty cache.
+  //
+  // The split is safe because read and write key off different things:
+  //   • READ keys off DETECTED label (untrusted post-ML-Kit). If we can't
+  //     trust the lookup key, we can't trust the read. shouldReadCache
+  //     stays exactly like shouldUseCache used to.
+  //   • WRITE keys off the MODEL'S resolvedObjectName (canonical, trusted).
+  //     The existing v6.1.3 input-contract guard (canonicalIsValid) further
+  //     refuses writes when the canonical itself is generic/basket. So
+  //     shouldWriteCache is the broader "did the model evaluate at all"
+  //     gate; canonical validity is checked at write time.
+  //
+  // Result: with ML Kit gone, scans bypass cache lookup (no usable key) but
+  // write under the model's canonical. By the time CC1 ships in Phase 2,
+  // the cache holds a meaningful set of canonical→verdict mappings.
+  const shouldReadCache  = !isGenericLabel && !isBasketLabel && attempts === 0;
+  const shouldWriteCache = attempts === 0;
+
+  // Carried for compatibility with logging code that still references
+  // shouldUseCache as the "this scan participated in the cache system" flag.
+  // Equivalent to shouldReadCache (the more restrictive of the two).
+  const shouldUseCache = shouldReadCache;
 
   const pendingProperties: PropertyRequirement[] = Array.isArray(requiredProperties)
     ? (requiredProperties as Array<Record<string, unknown>>).map((p) => ({
@@ -1133,7 +1173,12 @@ serve(async (req: Request) => {
 
   // ── 8. Call the model (full miss or partial hit) ─────────────────────────
   const modelStart = Date.now();
-  let evaluation: { result: EvaluationResult; freshProperties: PropertyScoreV6[]; resolvedObjectName: string };
+  let evaluation: {
+    result:             EvaluationResult;
+    freshProperties:    PropertyScoreV6[];
+    resolvedObjectName: string;
+    aliases:            string[];   // v6.2 — model-introspected synonyms
+  };
 
   try {
     evaluation = await evaluateObject(
@@ -1206,7 +1251,10 @@ serve(async (req: Request) => {
   const canonicalIsBasket   = BASKET_LABELS.has(canonicalNormalized);
   const canonicalIsValid    = !canonicalIsGeneric && !canonicalIsBasket && canonicalNormalized.length > 0;
 
-  if (shouldUseCache && !canonicalIsValid) {
+  // v6.2: write gate changed from shouldUseCache → shouldWriteCache. See
+  // the split definition above. Reads still bypass for generic/basket
+  // detected labels; writes proceed under the model's canonical.
+  if (shouldWriteCache && !canonicalIsValid) {
     console.warn(
       `[evaluate] CACHE_WRITE_SKIPPED canonical="${canonicalNormalized}" ` +
       `reason=${canonicalIsGeneric ? "generic-canonical" : canonicalIsBasket ? "basket-canonical" : "empty-canonical"} ` +
@@ -1214,7 +1262,7 @@ serve(async (req: Request) => {
     );
   }
 
-  if (shouldUseCache && canonicalIsValid && evaluation.freshProperties.length > 0) {
+  if (shouldWriteCache && canonicalIsValid && evaluation.freshProperties.length > 0) {
     await Promise.all(evaluation.freshProperties.map(async (p) => {
       const key: string = buildPerPropCacheKey(canonicalForWrite, p.word);
       const payload: CachedVerdictV6 = {
@@ -1243,15 +1291,76 @@ serve(async (req: Request) => {
         canonicalForWrite,
       );
 
-      // Alias map update: only relevant when the model corrected the
-      // detected label. updateAliasMap handles all the cases (no-op when
-      // detected ≈ resolved, create-new, confirm, conflict, evict).
+      // Alias map update (detected-label observation):
+      // updateAliasMap handles all the cases (no-op when detected ≈ resolved,
+      // create-new, confirm, conflict, evict). This is the OBSERVED alias
+      // — what ML Kit actually returned and we mapped to a canonical.
       await updateAliasMap(
         detectedLabel,
         evaluation.resolvedObjectName,
         modelId,
         aliasResolution.aliasEntry,
       );
+
+      // v6.2 — Model-introspected aliases (synonym pre-seeding).
+      //
+      // The model emits a small list of common synonyms alongside the
+      // canonical (schema added in v6.2 evaluateObject.ts). Each one becomes
+      // a low-confidence alias entry pointing to the canonical. Future scans
+      // where ANOTHER model (or a different angle / lighting) returns one of
+      // those synonyms as detectedLabel can hit the cache via alias resolve.
+      //
+      // Lower starting confidence than detected-label aliases (0.5 vs the
+      // ALIAS_NEW_CONFIDENCE used by updateAliasMap) because synonyms are
+      // model-introspected, not observed. They're guesses about what other
+      // observers MIGHT call this object. Real observation will quickly
+      // ratchet confidence up via ALIAS_CONFIRM_INCREMENT or evict via
+      // ALIAS_CONFLICT_DECREMENT.
+      //
+      // Block-list: parseModelOutput already filters short/duplicate aliases.
+      // Here we additionally filter aliases that match the canonical itself
+      // (defense-in-depth) and aliases that normalize into GENERIC/BASKET
+      // buckets (same input contract as canonicalIsValid).
+      if (Array.isArray(evaluation.aliases) && evaluation.aliases.length > 0) {
+        for (const aliasRaw of evaluation.aliases) {
+          const aliasNorm = aliasRaw.toLowerCase().trim();
+          if (aliasNorm.length < 3)                continue;
+          if (aliasNorm === canonicalNormalized)   continue;
+          if (GENERIC_LABELS.has(aliasNorm))       continue;
+          if (BASKET_LABELS.has(aliasNorm))        continue;
+
+          // Don't clobber existing observed aliases — they have real
+          // observation backing them. Only seed where there's nothing yet.
+          const aliasKeyForRead = buildAliasCacheKey(aliasRaw);
+          const existing = await cacheGetAlias(aliasKeyForRead);
+          if (existing) {
+            // Existing alias maps to a different canonical — leave alone;
+            // observed data wins over model introspection.
+            continue;
+          }
+
+          // Seed a new alias entry at low confidence (0.5).
+          const seededPayload: CachedAliasV6 = {
+            v:               6,
+            canonical:       canonicalNormalized,
+            confidence:      ALIAS_MODEL_SEED_CONFIDENCE,
+            observed_count:  0,                    // 0 = never observed, only seeded
+            first_seen:      new Date().toISOString(),
+            last_seen:       new Date().toISOString(),
+            meta: {
+              model_id:   modelId,
+              schema:     6,
+              written_at: new Date().toISOString(),
+              source:     "model-seed",            // distinguishes from "organic"
+            },
+          };
+          await cacheSetAlias(aliasKeyForRead, seededPayload);
+          console.log(
+            `[evaluate] alias seeded: alias="${aliasNorm}" → canonical="${canonicalNormalized}" ` +
+            `confidence=${ALIAS_MODEL_SEED_CONFIDENCE} source=model-seed`,
+          );
+        }
+      }
     }
   }
 

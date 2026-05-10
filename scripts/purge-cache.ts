@@ -9,11 +9,19 @@
  * ─── What it does ──────────────────────────────────────────────────────
  *
  * Scans Upstash for keys matching the v6 namespace and DELs them in
- * batches. Three layers can be purged independently:
+ * batches. Four layers can be purged independently:
  *
  *   alias    — "{env}:lexi:v6:alias:*"     polluted ML-Kit→canonical map
  *   verdict  — "{env}:lexi:v6:verdict:*:*" per-property cached verdicts
  *   resolved — "{env}:lexi:v6:resolved:*"  per-canonical resolved-name cache
+ *   legacy   — "{env}:lexi:eval:*" + "lexi:eval:*" + cache:* variants —
+ *              v5-and-earlier zombie entries that v6 evaluate never reads.
+ *              Pure quota waste; safe to delete.
+ *
+ * Aggregate selectors:
+ *
+ *   --layer=all   = alias + verdict + resolved (all v6 layers)
+ *   --layer=nuke  = alias + verdict + resolved + legacy (full clean slate)
  *
  * Default mode is DRY RUN — counts and lists keys without deleting.
  * Pass `--apply` to actually delete.
@@ -27,8 +35,16 @@
  *   verdict + alias  Faster cleanup of orphans. Use when you want zero
  *                    waste in Upstash before a prewarm run.
  *
- *   all three        Full reset. Use after schema changes that change
+ *   all              Full v6 reset. Use after schema changes that change
  *                    the value shape of cached entries.
+ *
+ *   legacy           One-shot cleanup of pre-v6 zombie entries. Run once
+ *                    after migrating to v6; v6 evaluate code never reads
+ *                    these keys, so deleting them frees Upstash quota
+ *                    with zero behavioral impact.
+ *
+ *   nuke             Everything Lexi-touched. Use for a true clean slate
+ *                    before launch or before a major architecture change.
  *
  * ─── Usage ─────────────────────────────────────────────────────────────
  *
@@ -41,8 +57,11 @@
  *   # Nuke verdict + alias (orphans + their roots)
  *   deno run --allow-net --allow-env scripts/purge-cache.ts --layer=verdict --layer=alias --apply
  *
- *   # Full reset
- *   deno run --allow-net --allow-env scripts/purge-cache.ts --layer=all --apply
+ *   # Wipe pre-v6 zombie entries (v5 lexi:eval:* etc — safe, never read)
+ *   deno run --allow-net --allow-env scripts/purge-cache.ts --layer=legacy --apply
+ *
+ *   # FULL RESET — every Lexi-touched key in Upstash
+ *   deno run --allow-net --allow-env scripts/purge-cache.ts --layer=nuke --apply
  *
  * ─── Env required ──────────────────────────────────────────────────────
  *
@@ -87,16 +106,31 @@ const layers = args
   .map((a) => a.replace("--layer=", ""));
 
 if (layers.length === 0) {
-  console.error("No --layer specified. Use --layer=alias|verdict|resolved|all (repeatable).");
+  console.error("No --layer specified. Use --layer=alias|verdict|resolved|legacy|all|nuke (repeatable).");
   Deno.exit(1);
 }
 
-const allLayers = ["alias", "verdict", "resolved"];
-const targetLayers = layers.includes("all") ? allLayers : layers;
+// v6 layers — the current cache architecture
+const V6_LAYERS = ["alias", "verdict", "resolved"];
+
+// v6.2 — "legacy" wipes pre-v6 cache namespaces that are no longer read
+// by the evaluate function (lexi:eval:* from v5 and earlier). These are
+// zombie entries that just consume Upstash quota. Safe to delete; v6 code
+// never touches them.
+//
+// "nuke" = v6 + legacy combined. Use when starting from a true clean slate.
+//
+// Only "all" and explicit layer names match V6_LAYERS. "legacy" and "nuke"
+// are special markers handled in the layer expansion below.
+const allLayers = [...V6_LAYERS, "legacy"];
+const targetLayers =
+  layers.includes("nuke") ? [...V6_LAYERS, "legacy"]
+  : layers.includes("all") ? V6_LAYERS
+  : layers;
 
 for (const l of targetLayers) {
   if (!allLayers.includes(l)) {
-    console.error(`Unknown layer: "${l}". Valid: ${allLayers.join(", ")} or "all".`);
+    console.error(`Unknown layer: "${l}". Valid: ${allLayers.join(", ")}, "all", or "nuke".`);
     Deno.exit(1);
   }
 }
@@ -143,33 +177,56 @@ async function delMany(keys: string[]): Promise<number> {
 
 // ─── Per-layer purge ───────────────────────────────────────────────────────
 
+/**
+ * Pattern resolver. v6 layers live under {ENV}:lexi:v6:{layer}:*.
+ * Legacy entries are pre-v6 cache (v5 lexi:eval:* and friends) that the
+ * current evaluate function does not read; we wipe them in two passes
+ * to catch both env-prefixed and bare forms that may have accumulated.
+ */
+function patternsFor(layer: string): string[] {
+  if (layer === "legacy") {
+    // Match every pre-v6 lexi cache key, both with and without env prefix.
+    // Defensive: cover all observed legacy shapes (lexi:eval:*, lexi:cache:*).
+    return [
+      `${ENV_NAME}:lexi:eval:*`,
+      `${ENV_NAME}:lexi:cache:*`,
+      `lexi:eval:*`,                   // bare (un-env-namespaced) — older deployments
+      `lexi:cache:*`,
+    ];
+  }
+  return [`${ENV_NAME}:lexi:v6:${layer}:*`];
+}
+
 async function purgeLayer(layer: string): Promise<{ scanned: number; deleted: number; sampleKeys: string[] }> {
-  const pattern = `${ENV_NAME}:lexi:v6:${layer}:*`;
-  console.log(`─── ${layer.toUpperCase()} ─── pattern="${pattern}"`);
+  const patterns = patternsFor(layer);
+  console.log(`─── ${layer.toUpperCase()} ─── patterns=${JSON.stringify(patterns)}`);
 
   let cursor       = "0";
   let scanned      = 0;
   let deleted      = 0;
   const sampleKeys: string[] = [];
 
-  do {
-    const r = await scan(cursor, pattern, 200);
-    cursor   = r.cursor;
-    scanned += r.keys.length;
+  for (const pattern of patterns) {
+    cursor = "0";
+    do {
+      const r = await scan(cursor, pattern, 200);
+      cursor   = r.cursor;
+      scanned += r.keys.length;
 
-    // Show first 10 keys per layer for sanity
-    for (const k of r.keys) {
-      if (sampleKeys.length < 10) sampleKeys.push(k);
-    }
-
-    if (apply && r.keys.length > 0) {
-      // DEL in chunks to keep payloads bounded
-      const CHUNK = 100;
-      for (let i = 0; i < r.keys.length; i += CHUNK) {
-        deleted += await delMany(r.keys.slice(i, i + CHUNK));
+      // Show first 10 keys per layer for sanity
+      for (const k of r.keys) {
+        if (sampleKeys.length < 10) sampleKeys.push(k);
       }
-    }
-  } while (cursor !== "0");
+
+      if (apply && r.keys.length > 0) {
+        // DEL in chunks to keep payloads bounded
+        const CHUNK = 100;
+        for (let i = 0; i < r.keys.length; i += CHUNK) {
+          deleted += await delMany(r.keys.slice(i, i + CHUNK));
+        }
+      }
+    } while (cursor !== "0");
+  }
 
   return { scanned, deleted, sampleKeys };
 }

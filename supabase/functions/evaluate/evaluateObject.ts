@@ -395,6 +395,7 @@ Your task: evaluate whether the detected object genuinely demonstrates each requ
 OUTPUT SHAPE (strict — return exactly this JSON shape; no prose, no markdown):
 {
   "resolvedObjectName": "<bare lowercase common noun, NO articles (a/an/the), NO sentence punctuation. examples: 'apple', 'remote control', 'biscuit packet'. NOT 'a chair', 'The Bottle.', 'an apple'>",
+  "aliases": ["<up to 3 common synonyms or alternative names a different vision model might call this same object — bare lowercase nouns, NO articles, NO punctuation. example for 'water bottle': ['bottle', 'drink bottle', 'plastic bottle']. example for 'sneaker': ['shoe', 'trainer', 'tennis shoe']. example for 'mobile phone': ['phone', 'smartphone', 'cell phone']. Empty array [] is fine if no obvious synonyms exist (e.g. for 'apple'). Avoid generic basket terms like 'object', 'thing', 'item', 'tableware', 'food', 'plant'.>"],
   "properties": [
     {
       "word":      "<exact property word>",
@@ -534,6 +535,18 @@ function isPropertyScoreV6(v: unknown): v is PropertyScoreV6 {
 
 interface ParsedModelOutput {
   resolvedObjectName: string;
+  /**
+   * v6.2 — model-introspected synonyms for the canonical. Up to 3 entries.
+   * Used by the cache write path to populate the alias map at low confidence
+   * (0.5) so future scans of the same object that get a different label
+   * (different model, different angle, different ML detector) can still hit
+   * the cache. Empty array is fine — common for unique objects like "apple".
+   *
+   * Already filtered: empty entries removed, generic/basket entries removed,
+   * duplicates removed, normalized via normalizeResolvedObjectName, trimmed
+   * to max 3.
+   */
+  aliases:            string[];
   properties:         PropertyScoreV6[];
 }
 
@@ -638,7 +651,28 @@ function parseModelOutput(rawText: string): ParsedModelOutput {
     validated.push(p);
   }
 
-  return { resolvedObjectName, properties: validated };
+  // v6.2 — parse model-introspected aliases. Optional in the schema (some
+  // objects genuinely have no synonyms). Same normalization as resolvedObjectName.
+  // We don't enforce strict typing on the array contents — non-string entries
+  // are silently dropped. The downstream alias-write guard will additionally
+  // filter generic/basket terms and entries matching the canonical itself;
+  // we only do the cheap, model-output-level cleanup here.
+  const aliases: string[] = [];
+  if (Array.isArray(obj.aliases)) {
+    const seen = new Set<string>();
+    seen.add(resolvedObjectName); // exclude the canonical itself
+    for (const raw of obj.aliases) {
+      if (typeof raw !== "string") continue;
+      const normalized = normalizeResolvedObjectName(raw);
+      if (normalized.length < 3) continue;          // too short — likely junk
+      if (seen.has(normalized))   continue;         // dedupe
+      seen.add(normalized);
+      aliases.push(normalized);
+      if (aliases.length >= 3) break;               // schema cap
+    }
+  }
+
+  return { resolvedObjectName, aliases, properties: validated };
 }
 
 // ─── Main export ──────────────────────────────────────────────────────────────
@@ -646,7 +680,18 @@ function parseModelOutput(rawText: string): ParsedModelOutput {
 export async function evaluateObject(
   opts:    EvaluateObjectOptions,
   adapter: ModelAdapter,
-): Promise<{ result: EvaluationResult; freshProperties: PropertyScoreV6[]; resolvedObjectName: string }> {
+): Promise<{
+  result:             EvaluationResult;
+  freshProperties:    PropertyScoreV6[];
+  resolvedObjectName: string;
+  /**
+   * v6.2 — model-introspected synonyms. The caller in evaluate/index.ts uses
+   * these to populate the alias map at low confidence (0.5) so future scans
+   * of the same object that get a different label can still hit the cache.
+   * Already filtered/normalized; max 3; may be empty.
+   */
+  aliases:            string[];
+}> {
 
   if (opts.requiredProperties.length === 0) {
     throw new Error(
@@ -704,5 +749,6 @@ export async function evaluateObject(
     result,
     freshProperties:    validatedFresh,
     resolvedObjectName: parsed.resolvedObjectName,
+    aliases:            parsed.aliases,
   };
 }

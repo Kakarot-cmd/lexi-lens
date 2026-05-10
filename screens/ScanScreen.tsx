@@ -1,23 +1,29 @@
 /**
  * ScanScreen.tsx — Lexi-Lens main gameplay screen
  *
+ * v6.2 Phase 1 changes (ML Kit removal — premium UX overhaul):
+ *   • LiveLabelChip rendering REMOVED. Production data showed ~50% of ML Kit
+ *     labels were embarrassing (generic "object" or basket "tableware"). Lumi
+ *     mascot is now the sole framing-phase visual presence.
+ *   • LiveLabelChip COMPONENT preserved for rollback. Just no longer rendered.
+ *   • ScanButton pulses unconditionally after a 600ms settling delay (was
+ *     gated on ML Kit's scanReady). The pulse IS the tap-to-scan affordance
+ *     now that the chip is gone.
+ *   • Button label simplified — no more "✦ {detectedLabel} — tap to scan!"
+ *     since detectedLabel is always "object" post-ML-Kit-removal.
+ *
+ * Lumi: scan-screen LumiHUD wired to evaluationStatus already drives the
+ *   right state machine (idle/scanning/success/fail). v6.2 widens Lumi's
+ *   movement to "wander" during scan-framing for kid engagement.
+ *
  * v3.3 iOS patch (on top of v3.7):
  *   • scanErrorMsg state + onScanError wired to useObjectScanner
- *   • Camera gets photo={true} video={true} (required for VisionCamera v4
- *     platform-aware capture — takePhoto on iOS, takeSnapshot on Android)
+ *   • Camera gets photo={true} video={true}
  *   • Error toast rendered above ScanButton
  *
  * v3.5 additions (Rate Limiting + Abuse Prevention):
  *   • rateLimitCode, scansToday, dailyLimit, approachingLimit, resetsAt
  *   • RateLimitWall + ApproachingLimitBanner
- *
- * v3.1 additions:
- *   • LiveLabelChip — floating chip showing ML Kit live label (Android only)
- *   • liveLabel + liveConfidence from useObjectScanner
- *
- * Lumi addition (this file):
- *   • LumiHUD overlays the screen — auto-derives state from evaluation status,
- *     daily limit, hard-mode flag, failure streak, and hides during quest victory
  */
 
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
@@ -346,40 +352,53 @@ function ScanButton({
 }: {
   onPress:          () => void;
   isHardMode:       boolean;
+  /**
+   * v6.2: scanReady was previously gated on ML Kit confidence > 0.75. With
+   * ML Kit removed, this is always false and the button used to never pulse.
+   * The pulse is now driven by an internal 600ms settling delay below — the
+   * scanReady prop is preserved on the interface for future reuse but no
+   * longer gates the pulse.
+   */
   scanReady:        boolean;
   liveLabel:        string | null;
   stableFrameCount: number;
 }) {
   const pulse = useRef(new Animated.Value(1)).current;
 
+  // v6.2: pulse always runs after a brief settling delay. Without ML Kit,
+  // there's no "scanReady" signal to wait for, so the button itself becomes
+  // the primary tap-to-scan affordance. 600ms gives the camera a moment to
+  // initialize and the kid a moment to frame the object before the pulse
+  // starts demanding attention.
   useEffect(() => {
-    if (scanReady) {
+    const settle = setTimeout(() => {
       Animated.loop(
         Animated.sequence([
-          Animated.timing(pulse, { toValue: 1.04, duration: 520, useNativeDriver: true }),
-          Animated.timing(pulse, { toValue: 1.00, duration: 520, useNativeDriver: true }),
+          Animated.timing(pulse, { toValue: 1.06, duration: 580, useNativeDriver: true }),
+          Animated.timing(pulse, { toValue: 1.00, duration: 580, useNativeDriver: true }),
         ])
       ).start();
-    } else {
+    }, 600);
+    return () => {
+      clearTimeout(settle);
       pulse.stopAnimation();
-      Animated.timing(pulse, { toValue: 1, duration: 150, useNativeDriver: true }).start();
-    }
-  }, [scanReady]);
+      pulse.setValue(1);
+    };
+  }, []);
 
   const dotCount  = Math.min(stableFrameCount, 3);
   const dotColors = ["#6b5fa0", "#a78bfa", "#f5c842"];
 
-  const bgColor = scanReady
-    ? "#16a34a"
-    : isHardMode
-    ? P.hardRed
-    : "#7c3aed";
+  // v6.2: button color is now driven purely by hard-mode state, not by
+  // ML Kit's confidence threshold (which produced the green "ready" state).
+  // Green-ready signal removed because there's no per-frame confidence to
+  // anchor it to anymore.
+  const bgColor = isHardMode ? P.hardRed : "#7c3aed";
 
-  const label = scanReady && liveLabel
-    ? `✦ ${liveLabel} — tap to scan!`
-    : isHardMode
-    ? "⚔ Scan this object"
-    : "✦ Scan this object";
+  // v6.2: simplified label. Previously showed "✦ {liveLabel} — tap to scan!"
+  // when ML Kit was confident; that's gone. The verb-first phrasing is also
+  // more directive for younger kids.
+  const label = isHardMode ? "⚔ Tap to Scan" : "✦ Tap to Scan";
 
   return (
     <Animated.View style={{ transform: [{ scale: pulse }] }}>
@@ -791,11 +810,14 @@ export function ScanScreen({ route, navigation }: Props) {
         <>
           <CameraOverlay />
 
-          <LiveLabelChip
-            label={liveLabel}
-            confidence={liveConfidence}
-            visible={phase === "scanning" && status === "idle"}
-          />
+          {/*
+           * v6.2 Phase 1: LiveLabelChip removed from render.
+           * The component definition is preserved above for easy rollback;
+           * production data (2026-05-10) showed >50% of ML Kit labels were
+           * embarrassing (generic "object" or basket "tableware"), so we
+           * stopped showing them to users. Lumi (rendered below) is now the
+           * sole framing-phase visual presence.
+           */}
 
           <View style={[styles.topHud, { paddingTop: insets.top + 8 }]}>
             {isHardMode && <HardModeBanner />}
@@ -949,6 +971,14 @@ export function ScanScreen({ route, navigation }: Props) {
             • currentAttempts ≥ 3 → boss-help hint mode
             • hardMode            → red/crown variant
             • hidden during quest_victory (VictoryFusionScreen has its own Lumi)
+
+          v6.2 Phase 1: Lumi is now the sole framing-phase visual presence
+          (the ML Kit chip is gone). To compensate, override the scan preset's
+          'anchor' movement with 'wander' during framing — Lumi drifts in a
+          figure-8 across the upper portion of the screen with sparkle trail.
+          Reverts to 'anchor' during evaluation (status ≠ idle) so Lumi sits
+          near the scan button performing the magic loop without distracting
+          from the kid's wait.
        */}
       <LumiHUD
         screen="scan"
@@ -957,6 +987,8 @@ export function ScanScreen({ route, navigation }: Props) {
         dailyLimitReached={status === "rate_limited"}
         failureStreak={currentAttempts}
         hidden={phase === "quest_victory"}
+        movement={status === "idle" ? "wander" : "anchor"}
+        size={64}
       />
     </View>
   );

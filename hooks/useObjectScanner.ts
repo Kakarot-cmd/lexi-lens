@@ -1,13 +1,28 @@
 /**
- * useObjectScanner.ts  —  Lexi-Lens Smart Viewfinder  v3.3
+ * useObjectScanner.ts  —  Lexi-Lens Smart Viewfinder  v6.2 (Phase 1)
  *
- * v3.3 changes (iOS compatibility + TS fixes):
+ * v6.2 changes (ML Kit kill-switch — premium UX overhaul):
+ *  • ML_KIT_ENABLED constant at top — flip to false to disable ML Kit
+ *    entirely without touching call sites. Default: false (Phase 1).
+ *  • When disabled: loadMLKit() short-circuits, periodic ticker no-ops,
+ *    triggerManualScan still captures + base64-encodes the frame but skips
+ *    the ML Kit labeling pass. Result: every scan ships to the Edge
+ *    Function with detectedLabel="object" — equivalent to current iOS
+ *    behavior, applied to Android too.
+ *  • Function preserved end-to-end (vs deletion) so flipping the constant
+ *    back to true restores ML Kit behavior. Useful if Phase 4 architectural
+ *    decisions revisit the question.
+ *  • All previously-tracked state (liveLabel, liveConfidence, scanReady,
+ *    topLabels, stableFrameCount) stays in the return shape but is always
+ *    null/0/false when disabled. Existing call sites in ScanScreen.tsx
+ *    have been updated to no longer rely on these (the ScanButton's pulse
+ *    no longer gates on scanReady).
+ *
+ * v3.3 (carried):
  *  • Platform.OS guard on ML Kit import — Google ML Kit is Android-only.
  *  • captureFrame() — iOS: takePhoto({ flash:"off" }), Android: takeSnapshot().
- *    qualityPrioritization removed — dropped in VisionCamera v4 (TS2353 fix).
- *  • useRef<Camera | null>(null) — React 19 strict ref typing (TS2322 fix).
+ *  • useRef<Camera | null>(null) — React 19 strict ref typing.
  *  • onScanError callback — surfaces capture failures to UI.
- *  • Periodic live-label tick skipped on iOS (no ML Kit to poll).
  */
 
 import { AppState, AppStateStatus, Platform } from "react-native";
@@ -19,12 +34,30 @@ import {
 } from "react-native-vision-camera";
 import { readAsStringAsync } from "expo-file-system/legacy";
 
-// ─── ML Kit lazy load (Android only) ─────────────────────────────────────────
+// ─── ML Kit kill-switch (v6.2 Phase 1) ────────────────────────────────────────
+//
+// Flip to true to re-enable ML Kit's live framing labels and per-scan label
+// override. Default is false in v6.2 because production data (2026-05-10)
+// showed >50% of ML Kit labels were embarrassing (generic "object" or basket
+// labels like "tableware"), and Lumi mascot is now the sole framing-phase
+// visual presence on the ScanScreen.
+//
+// When false:
+//   • loadMLKit() short-circuits to false — never imports the ML Kit native module
+//   • Periodic ticker is a no-op
+//   • triggerManualScan() captures + base64-encodes the frame (still needed for
+//     evaluate) but skips the ML Kit labeling pass, sending detectedLabel="object"
+//     and confidence=0.5 to the Edge Function (equivalent to iOS behavior).
+//
+const ML_KIT_ENABLED = false;
+
+// ─── ML Kit lazy load (Android only when enabled) ────────────────────────────
 
 let mlKitAvailable = false;
 let ImageLabeling: any = null;
 
 async function loadMLKit(): Promise<boolean> {
+  if (!ML_KIT_ENABLED) return false;       // v6.2: kill-switch
   if (Platform.OS !== "android") return false;
   if (ImageLabeling) return true;
   try {
@@ -201,7 +234,7 @@ export function useObjectScanner({
   // ── ML Kit load (Android only) ────────────────────────────────────────────
   useEffect(() => { loadMLKit(); }, []);
 
-  // ── Periodic smart viewfinder (Android + ML Kit only) ────────────────────
+  // ── Periodic smart viewfinder (Android + ML Kit only — disabled in v6.2) ─
   useEffect(() => {
     if (!enabled) {
       setLiveLabel(null);
@@ -214,7 +247,10 @@ export function useObjectScanner({
       return;
     }
 
-    // iOS: no ML Kit → skip the interval entirely
+    // v6.2: ML Kit kill-switch. When disabled, no ticker fires on any platform.
+    if (!ML_KIT_ENABLED) return;
+
+    // iOS: no ML Kit → skip the interval entirely (carried)
     if (Platform.OS !== "android") return;
 
     const tick = setInterval(async () => {
@@ -306,13 +342,14 @@ export function useObjectScanner({
       }
 
       // Step 3: Determine label
-      // iOS: liveLabel always null (no ML Kit) → "object" fallback is fine;
-      // Claude identifies the object from the raw image.
+      // v6.2: with ML_KIT_ENABLED=false, finalLabel always="object" / conf=0.5.
+      // The Edge Function identifies the object from the raw image and returns
+      // resolvedObjectName as canonical truth. iOS already worked this way.
       let finalLabel = liveLabelRef.current ?? "object";
       let finalConf  = liveLabelRef.current ? liveConfRef.current : 0.5;
 
-      // Fresh ML Kit pass on high-quality frame (Android only)
-      if (Platform.OS === "android" && mlKitAvailable && ImageLabeling) {
+      // Fresh ML Kit pass on high-quality frame (Android only, ML Kit enabled only)
+      if (ML_KIT_ENABLED && Platform.OS === "android" && mlKitAvailable && ImageLabeling) {
         try {
           const freshSorted = filterAndSort(await ImageLabeling.label(uri));
           if (freshSorted.length > 0) {
