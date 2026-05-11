@@ -2,6 +2,12 @@
  * StatusBanner.tsx
  * Lexi-Lens — floating scan-state indicator rendered over the camera view.
  *
+ * v6.2 Phase 2 additions:
+ *   • `looking-up` state — paired with CC1 (canonical classifier) latency.
+ *     Reuses the evaluating pill styling (dots active, same colorway) so
+ *     CC1 + evaluate read as a single "thinking" beat to the kid.
+ *     Differentiation lives in the banner text, not the colors.
+ *
  * v3.1 additions:
  *   • `liveLabel` prop — when status is idle and ML Kit has detected something,
  *     shows "I see: cushion" instead of "Point at an object"
@@ -39,13 +45,16 @@ const STATUS_CONFIG: Record<
   EvaluateStatus,
   { color: string; bg: string; showDots: boolean }
 > = {
-  idle:         { color: "rgba(200,200,255,0.7)", bg: "rgba(15,6,32,0.75)",  showDots: false },
-  converting:   { color: "#c4b5fd",               bg: "rgba(15,6,32,0.85)",  showDots: true  },
-  evaluating:   { color: "#fde68a",               bg: "rgba(20,8,50,0.9)",   showDots: true  },
-  match:        { color: "#86efac",               bg: "rgba(5,46,22,0.9)",   showDots: false },
-  "no-match":   { color: "#fca5a5",               bg: "rgba(42,10,10,0.9)", showDots: false },
-  error:        { color: "#fca5a5",               bg: "rgba(30,10,10,0.85)",showDots: false },
-  rate_limited: { color: "#fbbf24",               bg: "rgba(30,15,0,0.9)",   showDots: false },
+  idle:           { color: "rgba(200,200,255,0.7)", bg: "rgba(15,6,32,0.75)",  showDots: false },
+  converting:     { color: "#c4b5fd",               bg: "rgba(15,6,32,0.85)",  showDots: true  },
+  // v6.2 Phase 2 — looking-up mirrors evaluating's styling. CC1 + evaluate
+  // read as one continuous "thinking" beat; the kid sees one pill, not two.
+  "looking-up":   { color: "#fde68a",               bg: "rgba(20,8,50,0.9)",   showDots: true  },
+  evaluating:     { color: "#fde68a",               bg: "rgba(20,8,50,0.9)",   showDots: true  },
+  match:          { color: "#86efac",               bg: "rgba(5,46,22,0.9)",   showDots: false },
+  "no-match":     { color: "#fca5a5",               bg: "rgba(42,10,10,0.9)", showDots: false },
+  error:          { color: "#fca5a5",               bg: "rgba(30,10,10,0.85)",showDots: false },
+  rate_limited:   { color: "#fbbf24",               bg: "rgba(30,15,0,0.9)",   showDots: false },
 };
 
 function getBannerText(
@@ -59,6 +68,10 @@ function getBannerText(
       return liveLabel ? `I see: ${liveLabel}` : "Point at an object";
     case "converting":
       return "Focusing the Lexi-Lens…";
+    case "looking-up":
+      // v6.2 Phase 2 — CC1 in flight. Bridge copy that points to "I'm
+      // figuring out what this is" without naming the underlying step.
+      return "Spotting the magic…";
     case "evaluating":
       return detectedLabel ? `Reading "${detectedLabel}"…` : "Consulting the tomes…";
     case "match":

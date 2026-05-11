@@ -23,6 +23,7 @@ export type LumiState =
   | 'idle'
   | 'guide'
   | 'scanning'
+  | 'looking-up'   // v6.2 Phase 2 — CC1 in flight; reuses scanning visuals
   | 'success'
   | 'fail'
   | 'boss-help'
@@ -35,6 +36,7 @@ export type QuoteIntent =
   | 'greeting'
   | 'onboarding'
   | 'scanning'
+  | 'looking-up'   // v6.2 Phase 2 — paired with looking-up state
   | 'success-match'
   | 'success-partial'
   | 'fail-mismatch'

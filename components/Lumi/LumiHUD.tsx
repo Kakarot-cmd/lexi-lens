@@ -75,6 +75,7 @@ const SCREEN_PRESETS: Record<LumiScreen, ScreenPreset> = {
 export type LumiEvaluationStatus =
   | 'idle'
   | 'converting'
+  | 'looking-up'   // v6.2 Phase 2 — CC1 in flight
   | 'evaluating'
   | 'match'
   | 'no-match'
@@ -138,6 +139,10 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
   const resolvedState = useMemo<LumiState>(() => {
     if (dailyLimitReached) return 'out-of-juice';
     if (transient) return transient;
+    // v6.2 Phase 2 — looking-up gets its own LumiState (different quote
+    // pool, same animation). The 'converting' | 'evaluating' beats both
+    // still collapse to 'scanning' as before.
+    if (evaluationStatus === 'looking-up') return 'looking-up';
     if (evaluationStatus === 'converting' || evaluationStatus === 'evaluating') {
       return 'scanning';
     }

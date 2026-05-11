@@ -65,6 +65,10 @@ const PROFILES: Record<LumiState, LumiAnimationProfile> = {
   idle:           { bobAmplitude: 4,  bobDurationMs: 2500, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: false, trailRateMs: 0,    scaleBase: 1.00, glowIntensity: 0.5 },
   guide:          { bobAmplitude: 5,  bobDurationMs: 1800, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 200,  scaleBase: 1.00, glowIntensity: 0.7 },
   scanning:       { bobAmplitude: 3,  bobDurationMs: 1400, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 80,   scaleBase: 0.95, glowIntensity: 0.9 },
+  // v6.2 Phase 2 — looking-up reuses the scanning animation profile.
+  // Visual differentiation deferred to a later session per session notes;
+  // the only consumer-visible difference is the speech-bubble quote pool.
+  'looking-up':   { bobAmplitude: 3,  bobDurationMs: 1400, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 80,   scaleBase: 0.95, glowIntensity: 0.9 },
   success:        { bobAmplitude: 8,  bobDurationMs: 700,  wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 50,   scaleBase: 1.10, glowIntensity: 1.0 },
   fail:           { bobAmplitude: 2,  bobDurationMs: 2200, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: false, trailRateMs: 0,    scaleBase: 0.95, glowIntensity: 0.4 },
   'boss-help':    { bobAmplitude: 5,  bobDurationMs: 1600, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 140,  scaleBase: 1.00, glowIntensity: 0.7 },
@@ -76,6 +80,7 @@ const STATE_MOOD: Record<LumiState, LumiMood> = {
   idle:            'happy',
   guide:           'curious',
   scanning:        'curious',
+  'looking-up':    'curious',   // v6.2 Phase 2
   success:         'excited',
   fail:            'thinking',
   'boss-help':     'curious',
@@ -87,6 +92,7 @@ const STATE_INTENT: Record<LumiState, QuoteIntent> = {
   idle:            'idle-flavor',
   guide:           'onboarding',
   scanning:        'scanning',
+  'looking-up':    'looking-up',   // v6.2 Phase 2
   success:         'success-match',
   fail:            'fail-mismatch',
   'boss-help':     'boss-hint',

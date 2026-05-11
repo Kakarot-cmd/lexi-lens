@@ -18,7 +18,7 @@ import { LumiMascot } from './LumiMascot';
 import type { LumiState } from './lumiTypes';
 
 const ALL_STATES: LumiState[] = [
-  'idle', 'guide', 'scanning', 'success',
+  'idle', 'guide', 'scanning', 'looking-up', 'success',
   'fail', 'boss-help', 'out-of-juice', 'cheering',
 ];
 
@@ -31,7 +31,7 @@ export function LumiPlayground(): React.ReactElement {
     <ScrollView style={styles.root} contentContainerStyle={styles.scroll}>
       <Text style={styles.h1}>Lumi Playground</Text>
       <Text style={styles.sub}>
-        All 8 states. Long-press any Lumi to mute her locally.
+        All 9 states. Long-press any Lumi to mute her locally.
       </Text>
 
       <View style={styles.controls}>

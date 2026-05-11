@@ -47,6 +47,20 @@ export const LUMI_QUOTES: Record<QuoteIntent, readonly string[]> = {
     'Steady... steady...',
   ],
 
+  // v6.2 Phase 2 — looking-up pool. Shown briefly while CC1 (canonical
+  // classifier) runs, before the full evaluate kicks in. Quotes lean into
+  // the "I'm peering at this thing" beat without committing to a verdict
+  // yet. Pool kept small (5) — anything CC1 takes long enough to read
+  // more than one quote is a tail-latency outlier we'd rather not draw
+  // attention to.
+  'looking-up': [
+    'Squinting at this one...',
+    'Let me get a closer look ✨',
+    'Hmm, what IS this?',
+    'Recognising the shape...',
+    'Almost got it ✨',
+  ],
+
   'success-match': [
     'You found it! ✨',
     'Magnificent!',

@@ -2,6 +2,22 @@
  * hooks/useLexiEvaluate.ts
  * Lexi-Lens — client-side hook for the evaluate Edge Function.
  *
+ * v6.2 Phase 2 additions (Session B — CC1 architecture):
+ *   • New EvaluateStatus value: "looking-up" — CC1 (canonical classifier)
+ *     in flight. Sits between "converting" and "evaluating" when CC1 is on.
+ *   • CC1 orchestration in evaluate():
+ *       1. Read session-cached cc1Enabled flag (default: false until first
+ *          evaluate response echoes the live value via _cc1Enabled).
+ *       2. If on, call /cc1 with frameBase64. On success, pass result to
+ *          /evaluate as the new cc1Result field. On error or timeout,
+ *          fall through silently to direct /evaluate (logged as Sentry
+ *          breadcrumb).
+ *       3. If off, direct /evaluate as before.
+ *   • Server's _cc1Enabled echo refreshes the session-cached flag on every
+ *     evaluate response. Worst-case client lag on flag flip: 1 scan.
+ *   • No new exposed return fields — looking-up status is the only
+ *     consumer-facing change.
+ *
  * v4.7 additions (Compliance polish — verdict reporting):
  *   • EvaluationResult gains _scanAttemptId — the row id of the
  *     scan_attempts row that backs this verdict. Returned by the Edge
@@ -39,16 +55,6 @@
  *   • After every verdict, calls updateMastery() for the evaluated word.
  *   • Returns masteryResult so VerdictCard can trigger "Word Mastered!" celebration.
  *
- * FIXES applied:
- *   • [BUG] updateMastery() was called with 4 positional arguments but
- *     MasteryService.ts defines it with a single opts object of 6 fields.
- *     The two missing fields were childAge and currentMastery.
- *     currentMastery is now sourced from payload.masteryProfile by matching
- *     on the currentWord; defaults to 0 (novice) if not yet in the profile.
- *   • [LOGS] Removed two development console.log statements:
- *       - "[LexiEvaluate] ⚡ Cache hit"
- *       - "[LexiEvaluate] ⚠ Approaching daily limit"
- *
  * Dependencies:
  *   npm install @supabase/supabase-js
  *   npx expo install expo-file-system
@@ -76,6 +82,7 @@ import {
 export type EvaluateStatus =
   | "idle"
   | "converting"
+  | "looking-up"     // v6.2 Phase 2 — CC1 (canonical classifier) in flight
   | "evaluating"
   | "match"
   | "no-match"
@@ -123,7 +130,22 @@ export interface EvaluationResult {
   _rateLimit?:        RateLimitInfo;
   /** v4.7 — scan_attempts.id for this verdict; null only if the row insert failed */
   _scanAttemptId?:    string | null;
+  /** v6.2 Phase 2 — server-echoed cc1_enabled flag; client refreshes session cache */
+  _cc1Enabled?:       boolean;
 }
+
+/** v6.2 Phase 2 — Shape returned by the /cc1 Edge Function on success. */
+export interface Cc1Result {
+  canonical: string;
+  aliases:   string[];
+  modelId:   string;
+  latencyMs: number;
+}
+
+/** v6.2 Phase 2 — Non-success shapes from /cc1. Client treats both as "skip". */
+type Cc1Disabled = { disabled: true };
+type Cc1Probe    = { enabled: boolean };
+type Cc1Failure  = { error: string };
 
 export interface EvaluatePayload {
   childId:       string;
@@ -182,6 +204,30 @@ const BASE_RETRY_DELAY_MS    = 800;
 const MAX_FRAME_BASE64_CHARS = 1_600_000;
 const EDGE_FUNCTION_NAME     = "evaluate";
 
+// ─── v6.2 Phase 2 — CC1 session cache ────────────────────────────────────────
+//
+// The cc1_enabled flag is server-side (in feature_flags) but feature_flags is
+// RLS-locked for non-service-role readers. Instead of adding a new public
+// flags endpoint, we piggyback the flag value on every /evaluate response
+// (_cc1Enabled field). This module-level mutable holds the most recent value
+// so subsequent scans in the same session don't pay an extra round-trip
+// asking "should I call CC1?".
+//
+// Initial value: false (safe default — direct evaluate). The FIRST scan of
+// every cold session always goes direct-evaluate. Server's _cc1Enabled echo
+// updates this for scans #2 and onward. When the operator flips the flag
+// false→true, every active session needs 1 scan to learn it. Acceptable.
+//
+// CC1_ENDPOINT is the new Edge Function; CC1_FAILSAFE_TIMEOUT_MS is the
+// client-side hard wall for the entire CC1 call. The server-side timeout
+// (per cc1_timeout_ms flag, default 3000ms) is the soft target; the client
+// adds 1.5s headroom for network jitter before giving up and falling
+// through. If CC1 stalls for the full 4500ms, the user has waited that long
+// before evaluate even starts — that's the design trade.
+let cc1EnabledForSession = false;
+const CC1_ENDPOINT             = "cc1";
+const CC1_FAILSAFE_TIMEOUT_MS  = 4500;
+
 // ─── Custom error for structured rate-limit responses ─────────────────────────
 
 class RateLimitResponseError extends Error {
@@ -211,6 +257,134 @@ async function uriToBase64(uri: string): Promise<string | null> {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// ─── v6.2 Phase 2 — CC1 Edge Function caller ─────────────────────────────────
+//
+// Returns:
+//   • Cc1Result on success
+//   • null on any non-success: disabled, malformed response, network error,
+//     timeout, or server-side rate limit. Caller treats all non-success the
+//     same — fall through to direct evaluate.
+//
+// Does NOT throw. CC1 is best-effort instrumentation; throwing here would
+// either need a catch in the call site (which would still fall through) or
+// would surface a fatal error to the user, which would be wrong — the
+// fallthrough path is the safety net.
+//
+// Sentry breadcrumbs help us see in production where CC1 is winning vs
+// losing. The `withSentrySpan` wrap captures the latency distribution.
+async function callCc1Function(
+  childId:     string,
+  frameBase64: string,
+): Promise<Cc1Result | null> {
+  addGameBreadcrumb({
+    category: "cc1",
+    message:  "CC1 call start",
+    data:     { childId },
+  });
+
+  // AbortController gives us a client-side timeout independent of the
+  // server's own timeout. Tracks against CC1_FAILSAFE_TIMEOUT_MS.
+  const controller = new AbortController();
+  const timeoutId  = setTimeout(() => controller.abort(), CC1_FAILSAFE_TIMEOUT_MS);
+
+  try {
+    const { data, error } = await withSentrySpan(
+      "http.client",
+      "cc1 • classify",
+      () =>
+        supabase.functions.invoke<Cc1Result | Cc1Disabled | Cc1Failure>(
+          CC1_ENDPOINT,
+          {
+            body: { childId, frameBase64 },
+          },
+        ),
+    );
+
+    clearTimeout(timeoutId);
+
+    if (error) {
+      addGameBreadcrumb({
+        category: "cc1",
+        message:  "CC1 transport error — falling through",
+        level:    "warning",
+        data:     { error: error.message },
+      });
+      return null;
+    }
+
+    if (!data || typeof data !== "object") {
+      addGameBreadcrumb({
+        category: "cc1",
+        message:  "CC1 returned no data — falling through",
+        level:    "warning",
+      });
+      return null;
+    }
+
+    // Server says CC1 is disabled (flag off). Update session cache so we
+    // skip the round-trip next time.
+    if ((data as Cc1Disabled).disabled === true) {
+      cc1EnabledForSession = false;
+      addGameBreadcrumb({
+        category: "cc1",
+        message:  "CC1 disabled by server flag — caching for session",
+        level:    "info",
+      });
+      return null;
+    }
+
+    // Server returned an error (cc1_not_configured, parse_failed, etc.).
+    if ((data as Cc1Failure).error !== undefined) {
+      addGameBreadcrumb({
+        category: "cc1",
+        message:  "CC1 server error — falling through",
+        level:    "warning",
+        data:     { error: (data as Cc1Failure).error },
+      });
+      return null;
+    }
+
+    // Success path
+    const result = data as Cc1Result;
+    if (
+      typeof result.canonical === "string" &&
+      result.canonical.length > 0 &&
+      Array.isArray(result.aliases) &&
+      typeof result.modelId === "string" &&
+      typeof result.latencyMs === "number"
+    ) {
+      addGameBreadcrumb({
+        category: "cc1",
+        message:  `CC1 ok • canonical="${result.canonical}" • ${result.latencyMs}ms`,
+        data:     {
+          canonical: result.canonical,
+          aliases:   result.aliases,
+          modelId:   result.modelId,
+          latencyMs: result.latencyMs,
+        },
+      });
+      return result;
+    }
+
+    // Malformed response — fall through.
+    addGameBreadcrumb({
+      category: "cc1",
+      message:  "CC1 returned malformed shape — falling through",
+      level:    "warning",
+    });
+    return null;
+  } catch (e) {
+    clearTimeout(timeoutId);
+    const msg = e instanceof Error ? e.message : "unknown";
+    addGameBreadcrumb({
+      category: "cc1",
+      message:  `CC1 threw — falling through (${msg})`,
+      level:    "warning",
+    });
+    return null;
+  }
+}
 
 // ─── Edge Function caller (with Sentry spans + breadcrumbs) ──────────────────
 
@@ -355,7 +529,24 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
         frameBase64 = await uriToBase64(payload.frameUri);
       }
 
-      // ── Step 2: Call Edge Function (IP → quota → Redis → Claude) ────────
+      // ── Step 2: v6.2 Phase 2 — CC1 (canonical classifier) ───────────────
+      //
+      // Called only when:
+      //   • Session cache says cc1_enabled=true (set by prior /evaluate
+      //     response's _cc1Enabled echo)
+      //   • A frame is in hand. CC1 is image-only.
+      //   • Not a retry (retries already bypass cache, so CC1's lookup
+      //     value adds nothing; saves the latency).
+      //
+      // CC1 result is forwarded to /evaluate as cc1Result. On any failure
+      // (null return), we silently fall through — evaluate runs unchanged.
+      let cc1Result: Cc1Result | null = null;
+      if (cc1EnabledForSession && frameBase64 && attempt === 0) {
+        setStatus("looking-up");
+        cc1Result = await callCc1Function(payload.childId, frameBase64);
+      }
+
+      // ── Step 3: Call Edge Function (IP → quota → Redis → Claude) ────────
       setStatus("evaluating");
 
       const evaluationResult = await callEdgeFunction({
@@ -374,13 +565,22 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
         xp_reward_first_try:  payload.xp_reward_first_try  ?? 40,
         xp_reward_retry:      payload.xp_reward_retry      ?? 25,
         xp_reward_third_plus: payload.xp_reward_third_plus ?? 10,
+        // v6.2 Phase 2 — pass CC1 result to evaluate when available
+        cc1Result,
       });
 
-      // ── Step 3: Record cache hit flag + scan attempt id (v4.7) ──────────
+      // ── Step 4: Record cache hit flag + scan attempt id (v4.7) ──────────
       setCacheHit(evaluationResult._cacheHit === true);
       setScanAttemptId(evaluationResult._scanAttemptId ?? null);
 
-      // ── Step 4: v3.5 — Update rate-limit telemetry from server ──────────
+      // ── Step 4a: v6.2 Phase 2 — refresh session-cached CC1 flag ─────────
+      // Server echoes the live flag value. Cheaper than a separate flag
+      // endpoint and propagates within one scan of a flag flip.
+      if (typeof evaluationResult._cc1Enabled === "boolean") {
+        cc1EnabledForSession = evaluationResult._cc1Enabled;
+      }
+
+      // ── Step 5: v3.5 — Update rate-limit telemetry from server ──────────
       if (evaluationResult._rateLimit) {
         const rl = evaluationResult._rateLimit;
         setScansToday(rl.scansToday);
@@ -391,7 +591,7 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
       setResult(evaluationResult);
       setStatus(evaluationResult.overallMatch ? "match" : "no-match");
 
-      // ── Step 5: Update mastery for the evaluated word (v1.5) ─────────────
+      // ── Step 6: Update mastery for the evaluated word (v1.5) ─────────────
       //
       // FIX: The previous call used 4 positional arguments and was missing
       //   `childAge` and `currentMastery`. MasteryService.updateMastery()

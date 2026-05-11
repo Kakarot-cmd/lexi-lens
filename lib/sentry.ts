@@ -296,6 +296,7 @@ export function clearQuestContext(): void {
 export type GameBreadcrumbCategory =
   | "scan"          // ML Kit label detection
   | "evaluate"      // Edge Function call lifecycle
+  | "cc1"           // v6.2 Phase 2 — canonical classifier call lifecycle
   | "verdict"       // match / no-match / rate_limited
   | "quest"         // quest start / complete / hard-mode
   | "navigation"    // screen transitions

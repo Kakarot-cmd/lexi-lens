@@ -1,6 +1,32 @@
 /**
  * supabase/functions/evaluate/index.ts
- * Lexi-Lens — Supabase Edge Function entry point (v6.0)
+ * Lexi-Lens — Supabase Edge Function entry point (v6.2 Phase 2)
+ *
+ * v6.2 Phase 2 (Session B) — CC1 integration
+ *
+ *   1. Accepts optional `cc1Result` field in the request body:
+ *
+ *        cc1Result?: { canonical: string; aliases: string[];
+ *                      modelId: string; latencyMs: number }
+ *
+ *      When present, evaluate uses cc1Result.canonical as the cache lookup
+ *      key — bypassing the alias-map resolution layer for forward lookups.
+ *      cc1Result.aliases are still seeded into the alias map after a
+ *      successful model call (alongside model-introspected aliases).
+ *
+ *   2. scan_attempts now writes four CC1 fields per row:
+ *        cc1_model_id   — CC1's modelId, or NULL on skip/fallthrough
+ *        cc1_latency_ms — CC1's measured latency, NULL when skipped
+ *        cc1_skipped    — true=flag off; false=CC1 attempted (success or fallthrough)
+ *        cc1_canonical  — CC1's reported canonical, for agreement analysis
+ *
+ *   3. Response now includes _cc1Enabled: boolean — piggybacked flag value
+ *      so the client can update its own session cache without an extra
+ *      round-trip to /cc1?probe=1.
+ *
+ *   4. NO behavioral change when cc1Result is absent — the function is
+ *      drop-in compatible with the pre-Session-B client. Safe to deploy
+ *      ahead of the CC1-aware client build.
  *
  * v6.0 (2026-05-10) — Mistral primary + cache v6
  *
@@ -747,7 +773,50 @@ async function fetchQuestFlavorTemplate(
 
 // ─── scan_attempts logging ────────────────────────────────────────────────────
 
-interface LogScanArgs {
+// v6.2 Phase 2 — cc1_enabled flag reader (60s in-process cache).
+// Pattern mirrors tierRouting.ts's readGlobalProviderFlag. Keeps the
+// per-request evaluate flow from re-fetching the same flag on every scan.
+const CC1_FLAG_TTL_MS = 60_000;
+let cc1EnabledCache: { value: boolean; expiresAt: number } | null = null;
+
+async function readCc1EnabledFlag(supabase: SupabaseClient): Promise<boolean> {
+  const now = Date.now();
+  if (cc1EnabledCache && cc1EnabledCache.expiresAt > now) {
+    return cc1EnabledCache.value;
+  }
+  try {
+    const { data } = await supabase
+      .from("feature_flags")
+      .select("value")
+      .eq("key", "cc1_enabled")
+      .maybeSingle();
+    const raw = (data as { value?: unknown } | null)?.value;
+    const value = typeof raw === "string" && raw.trim().toLowerCase() === "true";
+    cc1EnabledCache = { value, expiresAt: now + CC1_FLAG_TTL_MS };
+    return value;
+  } catch {
+    cc1EnabledCache = { value: false, expiresAt: now + CC1_FLAG_TTL_MS };
+    return false;
+  }
+}
+
+/**
+ * v6.2 Phase 2 — CC1 telemetry fields included in every log call.
+ *
+ *   cc1Skipped=true  → cc1_enabled was off; cc1Result not provided by client.
+ *   cc1Skipped=false → CC1 was attempted. cc1ModelId is non-null on success,
+ *                      null on CC1 error/timeout (client fell through).
+ *   cc1Skipped=null  → caller didn't supply CC1 state (defensive default).
+ *                      Should not happen with the v6.2 client.
+ */
+interface CC1Fields {
+  cc1ModelId?:   string | null;
+  cc1LatencyMs?: number  | null;
+  cc1Skipped?:   boolean | null;
+  cc1Canonical?: string  | null;
+}
+
+interface LogScanArgs extends CC1Fields {
   childId:       string;
   questId?:      string;
   detectedLabel: string;
@@ -776,6 +845,10 @@ async function logScanResult(
       claude_latency_ms: opts.claudeLatencyMs,
       cache_hit:         false,
       model_id:          opts.modelId,
+      cc1_model_id:      opts.cc1ModelId    ?? null,
+      cc1_latency_ms:    opts.cc1LatencyMs  ?? null,
+      cc1_skipped:       opts.cc1Skipped    ?? null,
+      cc1_canonical:     opts.cc1Canonical  ?? null,
     }).select("id").single();
     if (error) {
       console.error("[evaluate] logScanResult INSERT error:", error.message);
@@ -808,6 +881,10 @@ async function logScanCacheHit(
       claude_latency_ms: null,
       cache_hit:         true,
       model_id:          null,
+      cc1_model_id:      opts.cc1ModelId    ?? null,
+      cc1_latency_ms:    opts.cc1LatencyMs  ?? null,
+      cc1_skipped:       opts.cc1Skipped    ?? null,
+      cc1_canonical:     opts.cc1Canonical  ?? null,
     }).select("id").single();
     if (error) {
       console.error("[evaluate] logScanCacheHit INSERT error:", error.message);
@@ -829,7 +906,7 @@ async function logScanBlocked(
     confidence?:   number;
     ipHash?:       string;
     isRateLimited: boolean;
-  },
+  } & CC1Fields,
 ): Promise<void> {
   try {
     await supabase.from("scan_attempts").insert({
@@ -847,6 +924,10 @@ async function logScanBlocked(
       claude_latency_ms: null,
       cache_hit:         false,
       model_id:          null,
+      cc1_model_id:      opts.cc1ModelId    ?? null,
+      cc1_latency_ms:    opts.cc1LatencyMs  ?? null,
+      cc1_skipped:       opts.cc1Skipped    ?? null,
+      cc1_canonical:     opts.cc1Canonical  ?? null,
     });
   } catch (e) {
     console.error("[evaluate] logScanBlocked INSERT failed:", e);
@@ -946,7 +1027,37 @@ serve(async (req: Request) => {
     frameBase64, requiredProperties, childAge, failedAttempts,
     masteryProfile, alreadyFoundWords,
     xp_reward_first_try, xp_reward_retry, xp_reward_third_plus,
+    cc1Result,
   } = body as Record<string, unknown>;
+
+  // v6.2 Phase 2 — extract and validate CC1 result if present
+  const cc1: { canonical: string; aliases: string[]; modelId: string; latencyMs: number } | null = (() => {
+    if (!cc1Result || typeof cc1Result !== "object") return null;
+    const r = cc1Result as Record<string, unknown>;
+    if (typeof r.canonical !== "string" || r.canonical.length === 0) return null;
+    if (typeof r.modelId !== "string") return null;
+    if (typeof r.latencyMs !== "number") return null;
+    const aliases = Array.isArray(r.aliases)
+      ? (r.aliases as unknown[]).filter((a): a is string => typeof a === "string")
+      : [];
+    return {
+      canonical: r.canonical.toLowerCase().trim(),
+      aliases:   aliases.map((a) => a.toLowerCase().trim()).filter((a) => a.length > 0),
+      modelId:   r.modelId,
+      latencyMs: r.latencyMs,
+    };
+  })();
+
+  // v6.2 Phase 2 — pre-built CC1 telemetry fields, shared by every log call.
+  // cc1_skipped semantics:
+  //   • cc1Result present → CC1 ran (cc1_skipped=false). cc1_model_id populated
+  //     from cc1.modelId. On parse failure here we treat it as a malformed
+  //     request and fall through with cc1_skipped=null (defensive).
+  //   • cc1Result absent → either the flag is off OR an old client. Both
+  //     map to cc1_skipped=true (CC1 didn't run by design for this scan).
+  const cc1LogFields: CC1Fields = cc1
+    ? { cc1ModelId: cc1.modelId, cc1LatencyMs: cc1.latencyMs, cc1Skipped: false, cc1Canonical: cc1.canonical }
+    : { cc1ModelId: null,        cc1LatencyMs: null,          cc1Skipped: true,  cc1Canonical: null };
 
   const xpRates: XpRates = {
     firstTry:  typeof xp_reward_first_try   === "number" ? xp_reward_first_try   : 40,
@@ -957,6 +1068,12 @@ serve(async (req: Request) => {
   if (typeof childId !== "string" || typeof detectedLabel !== "string" || typeof childAge !== "number") {
     return jsonResponse({ error: "Missing required fields" }, 400);
   }
+
+  // v6.2 Phase 2 — Snapshot the cc1_enabled flag so the response can echo
+  // it back to the client. Client uses this to refresh its session-bound
+  // CC1-on/off cache without a separate /cc1?probe=1 round-trip. Cheap:
+  // module-level 60s in-process cache (same pattern as tierRouting).
+  const cc1EnabledFlagSnapshot = await readCc1EnabledFlag(supabase);
 
   // ── 2. IP rate limit ─────────────────────────────────────────────────────
   const ip     = extractIp(req.headers);
@@ -1010,6 +1127,7 @@ serve(async (req: Request) => {
     await logScanBlocked(supabase, {
       childId, questId: questId as string | undefined, detectedLabel,
       confidence: confidence as number | undefined, ipHash, isRateLimited: true,
+      ...cc1LogFields,
     });
     return jsonResponse({
       error: "daily_limit_reached",
@@ -1063,17 +1181,57 @@ serve(async (req: Request) => {
       })).filter((p) => p.word.length > 0)
     : [];
 
+  // v6.2 Phase 2: If CC1 provided a canonical, use it directly as the cache
+  // lookup key. CC1 supersedes the alias-map for forward resolution — the
+  // alias-map remains in use for non-CC1 clients and for ratchet-up of
+  // observed alias confidences after a successful model call.
+  //
+  // When CC1 provides a canonical:
+  //   • shouldReadCache is forced true (CC1 canonicals are by definition
+  //     not "object"/"thing" — sanitization in cc1/index.ts already
+  //     redirected those to canonical="object" which we still treat as
+  //     generic via the GENERIC_LABELS check below).
+  //   • CC1's canonical is checked against GENERIC_LABELS to preserve the
+  //     bypass behavior for cases where CC1 punted to "object".
+  //
+  // When CC1 didn't provide one (old client, or flag off on client):
+  //   • Existing alias-map resolution path runs (line 1066-style).
+  const cc1CanonicalIsGeneric = cc1 ? GENERIC_LABELS.has(cc1.canonical) : false;
+  const cc1CanonicalIsBasket  = cc1 ? BASKET_LABELS.has(cc1.canonical)  : false;
+  const cc1CanonicalUsable    = cc1 !== null && !cc1CanonicalIsGeneric && !cc1CanonicalIsBasket;
+
   // v6.1: Resolve detected label to canonical name via the alias map BEFORE
   // verdict cache lookups. If ML Kit said "tableware" but we've previously
   // observed Mistral resolving that to "biscuit packet", we look up under
   // "biscuit packet" so this scan benefits from prior cache writes.
   // Falls back to detectedLabel when no confident alias exists.
   // Skipped for generic labels and retries (those bypass cache anyway).
-  const aliasResolution = shouldUseCache
-    ? await resolveCanonicalLabel(detectedLabel)
-    : { canonical: detectedLabel, aliasUsed: false, aliasEntry: null as CachedAliasV6 | null };
+  //
+  // v6.2 Phase 2: CC1's canonical takes precedence when provided. The
+  // alias-map call is short-circuited to avoid the Redis round-trip.
+  const aliasResolution = cc1CanonicalUsable
+    ? { canonical: cc1!.canonical, aliasUsed: false, aliasEntry: null as CachedAliasV6 | null }
+    : shouldUseCache
+      ? await resolveCanonicalLabel(detectedLabel)
+      : { canonical: detectedLabel, aliasUsed: false, aliasEntry: null as CachedAliasV6 | null };
 
-  if (shouldUseCache) {
+  // v6.2 Phase 2: With CC1's canonical in hand, cache reads are safe even
+  // when detectedLabel="object" (the v6.2 Phase 1 bypass case). Override
+  // shouldReadCache locally for this branch.
+  const effectiveShouldReadCache = cc1CanonicalUsable ? true : shouldUseCache;
+
+  if (cc1CanonicalUsable) {
+    console.log(
+      `[evaluate] cc1-canonical: "${cc1!.canonical}" aliases=${JSON.stringify(cc1!.aliases)} ` +
+      `cc1_model=${cc1!.modelId} cc1_latency_ms=${cc1!.latencyMs} childId=${childId}`,
+    );
+  } else if (cc1 && !cc1CanonicalUsable) {
+    console.log(
+      `[evaluate] cc1-canonical-rejected: "${cc1.canonical}" ` +
+      `reason=${cc1CanonicalIsGeneric ? "generic" : "basket"} ` +
+      `falling back to alias-map. childId=${childId}`,
+    );
+  } else if (shouldUseCache) {
     console.log(
       `[evaluate] alias-resolve: detected="${normalizeForKey(detectedLabel)}" ` +
       `→ canonical="${normalizeForKey(aliasResolution.canonical)}" ` +
@@ -1089,7 +1247,7 @@ serve(async (req: Request) => {
   let cachedV6Properties: PropertyScoreV6[] = [];
   let missingProperties:  PropertyRequirement[] = pendingProperties;
 
-  if (shouldUseCache && pendingProperties.length > 0) {
+  if (effectiveShouldReadCache && pendingProperties.length > 0) {
     const lookups = await Promise.all(
       pendingProperties.map(async (prop) => ({
         prop,
@@ -1127,7 +1285,7 @@ serve(async (req: Request) => {
   const questFlavorTemplate = await fetchQuestFlavorTemplate(supabase, questId as string | undefined);
 
   // ── 6. FULL CACHE HIT — skip model entirely ───────────────────────────────
-  if (shouldUseCache && missingProperties.length === 0 && cachedV6Properties.length > 0) {
+  if (effectiveShouldReadCache && missingProperties.length === 0 && cachedV6Properties.length > 0) {
     const cachedResolvedRow = await cacheGetResolvedName(buildResolvedNameCacheKey(aliasResolution.canonical));
     const resolvedName      = cachedResolvedRow?.name;
 
@@ -1153,6 +1311,7 @@ serve(async (req: Request) => {
     const scanAttemptId = await logScanCacheHit(supabase, {
       childId, questId: questId as string | undefined, detectedLabel,
       confidence: confidence as number | undefined, ipHash, result: composed,
+      ...cc1LogFields,
     });
 
     return jsonResponse({
@@ -1160,6 +1319,7 @@ serve(async (req: Request) => {
       _cacheHit:      true,
       _scanAttemptId: scanAttemptId,
       _rateLimit:     buildAlertFlags(ctx.scans_today, dailyLimit, ctx.subscription_tier),
+      _cc1Enabled:    cc1EnabledFlagSnapshot,
     });
   }
 
@@ -1206,6 +1366,7 @@ serve(async (req: Request) => {
     await logScanBlocked(supabase, {
       childId, questId: questId as string | undefined, detectedLabel,
       confidence: confidence as number | undefined, ipHash, isRateLimited: false,
+      ...cc1LogFields,
     });
     return jsonResponse({ error: msg }, 500);
   }
@@ -1361,7 +1522,66 @@ serve(async (req: Request) => {
           );
         }
       }
+
+      // v6.2 Phase 2 — CC1-supplied aliases (alongside model-introspected).
+      //
+      // When CC1 returned aliases ("bottle" + ["water bottle", "drink bottle"]),
+      // those are evidence that downstream scans of the same object MIGHT
+      // arrive with any of those alias names as the resolvedObjectName (e.g.,
+      // a different evaluate call with a slightly different angle resolves
+      // it as "drink bottle"). Seeding them now means future ML-Kit-less
+      // scans that happen to fall back to detectedLabel→alias-map can still
+      // find this canonical via "drink bottle"→"water bottle".
+      //
+      // Same low confidence as model-seed (these are also guesses, not
+      // observed); same block-list. Only seeds when there's nothing
+      // already at that alias key.
+      if (cc1 && cc1.aliases.length > 0 && canonicalNormalized === cc1.canonical) {
+        for (const aliasRaw of cc1.aliases) {
+          const aliasNorm = aliasRaw.toLowerCase().trim();
+          if (aliasNorm.length < 3)                continue;
+          if (aliasNorm === canonicalNormalized)   continue;
+          if (GENERIC_LABELS.has(aliasNorm))       continue;
+          if (BASKET_LABELS.has(aliasNorm))        continue;
+
+          const aliasKeyForRead = buildAliasCacheKey(aliasRaw);
+          const existing = await cacheGetAlias(aliasKeyForRead);
+          if (existing) continue;
+
+          const seededPayload: CachedAliasV6 = {
+            v:               6,
+            canonical:       canonicalNormalized,
+            confidence:      ALIAS_MODEL_SEED_CONFIDENCE,
+            observed_count:  0,
+            first_seen:      new Date().toISOString(),
+            last_seen:       new Date().toISOString(),
+            meta: {
+              model_id:   cc1.modelId,
+              schema:     6,
+              written_at: new Date().toISOString(),
+              source:     "model-seed",
+            },
+          };
+          await cacheSetAlias(aliasKeyForRead, seededPayload);
+          console.log(
+            `[evaluate] alias seeded (CC1): alias="${aliasNorm}" → canonical="${canonicalNormalized}" ` +
+            `confidence=${ALIAS_MODEL_SEED_CONFIDENCE} source=cc1-seed cc1_model=${cc1.modelId}`,
+          );
+        }
+      }
     }
+  }
+
+  // v6.2 Phase 2 — CC1/evaluate disagreement signal (log only; no UX impact).
+  // Useful for measuring whether CC1's cheap-canonical step is accurate enough
+  // to be the cache key. Frequent disagreement = CC1 over-generalizing or
+  // mis-classifying. The actual scan is logged below regardless; this is
+  // just a greppable signal for post-launch SQL.
+  if (cc1 && cc1.canonical !== canonicalNormalized && !cc1CanonicalIsGeneric) {
+    console.warn(
+      `[evaluate] cc1-disagreement cc1="${cc1.canonical}" evaluate="${canonicalNormalized}" ` +
+      `cc1_model=${cc1.modelId} eval_model=${modelId} childId=${childId}`,
+    );
   }
 
   // ── 10. Log scan_attempts and respond ─────────────────────────────────────
@@ -1369,6 +1589,7 @@ serve(async (req: Request) => {
     childId, questId: questId as string | undefined, detectedLabel,
     confidence: confidence as number | undefined, ipHash,
     result: evaluation.result, claudeLatencyMs: modelLatencyMs, modelId,
+    ...cc1LogFields,
   });
 
   return jsonResponse({
@@ -1377,6 +1598,7 @@ serve(async (req: Request) => {
     _scanAttemptId: scanAttemptId,
     _rateLimit:     buildAlertFlags(ctx.scans_today, dailyLimit, ctx.subscription_tier),
     _routing:       { reason: routing.reason, modelId },
+    _cc1Enabled:    cc1EnabledFlagSnapshot,
   });
 });
 
