@@ -1,0 +1,71 @@
+From: Lumi Upgrade v1 (orbit-reticle, larger+faster scan-wait mascot)
+Subject: [PATCH 4/4] ScanScreen.tsx — compute reticleCenter, wire LumiHUD
+
+The reticle is the rectangle between styles.tl/tr (top:80) and styles.bl/br
+(bottom:290). The visual center is the midpoint between those two horizontal
+lines. We compute it from useWindowDimensions and hand it to LumiHUD with the
+new orbit-reticle movement mode during evaluation.
+
+Three-branch movement: wander while framing, orbit-reticle while evaluating,
+anchor during success/fail/rate-limit beats. Size jumps 64 → 96 during
+evaluation for the "larger" half of "larger and faster".
+
+---
+ screens/ScanScreen.tsx | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/screens/ScanScreen.tsx b/screens/ScanScreen.tsx
+--- a/screens/ScanScreen.tsx
++++ b/screens/ScanScreen.tsx
+@@ -7,6 +7,7 @@ import {
+   StyleSheet,
+   Animated,
+   Linking,
++  useWindowDimensions,
+ } from "react-native";
+ import { Camera } from "react-native-vision-camera";
+ import { useSafeAreaInsets } from "react-native-safe-area-context";
+@@ -52,6 +53,15 @@ export function ScanScreen({ navigation }: Props) {
+ 
+   const insets = useSafeAreaInsets();
+ 
++  // v6.5 — reticle center for Lumi's orbit-reticle motion during evaluation.
++  // Matches styles.tl/tr (top:80) and styles.bl/br (bottom:290) — Lumi orbits
++  // the midpoint between those bounds. If the viewfinder layout changes,
++  // update both this calc and the styles together.
++  const { width: scanW, height: scanH } = useWindowDimensions();
++  const reticleCenter = useMemo(
++    () => ({ x: scanW / 2, y: (80 + (scanH - 290)) / 2 }),
++    [scanW, scanH],
++  );
++
+   // ... existing component body unchanged ...
+ 
+       {/* ── Lumi mascot ─────────────────────────────────────────────────────
+@@ -180,8 +190,9 @@ export function ScanScreen({ navigation }: Props) {
+        */}
+       <LumiHUD
+         screen="scan"
+         evaluationStatus={status}
+         hardMode={isHardMode}
+         dailyLimitReached={status === "rate_limited"}
+         failureStreak={currentAttempts}
+         hidden={phase === "quest_victory"}
+-        movement={status === "idle" ? "wander" : "anchor"}
+-        size={64}
++        // v6.5 — three-branch movement: wander while framing, orbit the
++        // viewfinder reticle during evaluation (larger + faster), anchor
++        // during success/fail/rate-limit beats.
++        movement={
++          status === "idle"
++            ? "wander"
++            : status === "converting" || status === "evaluating" || status === "looking-up"
++              ? "orbit-reticle"
++              : "anchor"
++        }
++        size={status === "converting" || status === "evaluating" || status === "looking-up" ? 96 : 64}
++        reticleCenter={reticleCenter}
+       />
+     </View>
+   );
+ }
