@@ -260,12 +260,19 @@ export function composeChildFeedback(
     const flavor = (questFlavorTemplate ?? "").trim();
     if (flavor.length > 0) msg = msg + " " + flavor;
   } else if (failing.length > 0) {
-    // Pick one failing message — don't pile on. Highest-confidence-FAIL goes
-    // first (lowest score). Stable across retries because the model is
-    // prompted to make kid_msg deterministic-ish for the same input.
+    // v6.2.1 (Session D) — mirror the pass-branch pattern: include EVERY
+    // failing property's kid_msg rather than picking one. Earlier "don't
+    // pile on" comment was overruled by user feedback that a child reading
+    // a single-property failure cannot tell which other properties also
+    // need attention. Sort by score so the most-confident-fail comes first
+    // (reads as the strongest evidence). joinSentences is the same helper
+    // the pass branch uses — single-space concatenation of grammatical
+    // sentences the model is already prompted to produce.
     const sortedFails = [...failing].sort((a, b) => a.score - b.score);
-    const candidate   = sortedFails[0]?.kid_msg?.[ageBand];
-    msg = candidate && candidate.trim().length > 0 ? candidate.trim() : FALLBACK_FAIL_FEEDBACK;
+    const failMsgs = sortedFails
+      .map((p) => p.kid_msg?.[ageBand] ?? "")
+      .filter((s) => typeof s === "string" && s.trim().length > 0);
+    msg = failMsgs.length > 0 ? joinSentences(failMsgs) : FALLBACK_FAIL_FEEDBACK;
   } else {
     msg = FALLBACK_FAIL_FEEDBACK;
   }

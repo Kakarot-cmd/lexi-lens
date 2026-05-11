@@ -1,0 +1,482 @@
+[33mcommit 0915f292ee64bccdeec75ed31575ba568430c302[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 11 09:01:47 2026 +0530
+
+    feat : CC1 testing
+
+[33mcommit 12c3664e9d493b66cf509340ee240dc63c360212[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sun May 10 23:05:49 2026 +0530
+
+    feat:MLKill Session 1
+
+[33mcommit 55902f92a9d9c8cb0343f461d4185ccac1f69a2b[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sun May 10 19:11:16 2026 +0530
+
+    feat: Cahce check and Model finilaziation
+
+[33mcommit 3d187c337e98daa8b4935f17b7fad144d0162a2a[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sun May 10 12:12:48 2026 +0530
+
+    feat:Parent View Modifications
+
+[33mcommit a9454ce4f4b78c0e132447fd07d1754705370da9[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sun May 10 10:38:07 2026 +0530
+
+    feat:Cache Removal
+
+[33mcommit ce07aedf32afcb59628b3ddd95150569c3ce6d9e[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 9 22:31:34 2026 +0530
+
+    feat: Clean up  post Model Switch
+
+[33mcommit b5d8dfaa23edce12e09b9c8e3231390d1e0defe5[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 9 21:19:19 2026 +0530
+
+    feat: Model Evals
+
+[33mcommit c8df47a6fa808dbd122df30617ec28c0948ecaa4[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 9 07:00:38 2026 +0530
+
+    feat:Tier Segregation
+
+[33mcommit 28d7c4ceccaf06dc649dd61ac32175c854004aef[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Fri May 8 16:39:41 2026 +0530
+
+    feat: tier: Addition
+
+[33mcommit 353a5174b8d5ec86b7443fe491bf5b3a3ef1fb99[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Fri May 8 13:29:58 2026 +0530
+
+    feat: CostReductions
+
+[33mcommit 2cd81a4d893e02a9362265e75073446dc834670d[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Thu May 7 23:12:11 2026 +0530
+
+    feat: Compliance polish Ts Issue
+
+[33mcommit e46702e805d0eada2b6835a72cd69d01199c3122[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Thu May 7 20:22:31 2026 +0530
+
+    feat: Compliance polish closed
+
+[33mcommit 11a83a50f298e1fe4f1bceaf02d50de40ce475d8[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Thu May 7 11:44:30 2026 +0530
+
+    feat: Env split testing
+
+[33mcommit 0a667e51aa4a82c9d776c7b99edcbfc06baf3c51[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Wed May 6 22:55:20 2026 +0530
+
+    feat:4.0 · Environment split-- Done
+
+[33mcommit e7b3d00293543a0440164dded4bdea183a9e5bdd[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Wed May 6 22:24:24 2026 +0530
+
+    feat: env split
+
+[33mcommit d3785416f7be8a7e33948b3a7bc02692740c659a[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Wed May 6 17:26:06 2026 +0530
+
+    Phase 4.0: schema reconciliation + bootstrap rewrite
+
+[33mcommit 891e3db17843f7dd678c55c26f6220b13d6158f7[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Wed May 6 12:21:00 2026 +0530
+
+    feat: Money Flow Cahnges
+
+[33mcommit c64704800dbb4fe4206b01c2dc5932a480ed4988[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Wed May 6 10:34:45 2026 +0530
+
+    feat: Cahce Observability
+
+[33mcommit 79f90e44c2c789679f7002e0dbd61a870f7753cf[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Wed May 6 08:55:34 2026 +0530
+
+    feat: env split wiring (W1a) + forgot password (N10)
+
+[33mcommit 766cd6e4367f4caf94e316725ab4b8a1e8cd64c3[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Wed May 6 07:20:20 2026 +0530
+
+    feat: Reset Password  Addition
+
+[33mcommit 9353bb6147712e5bf5f9e189984f2645ead92fd3[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Tue May 5 17:06:52 2026 +0530
+
+    feat: Mascot V1 fix
+
+[33mcommit de6a27046d032ed5419b1072642494a3e3af5153[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Tue May 5 14:01:34 2026 +0530
+
+    feat: LumiMascot V1
+
+[33mcommit fe163d84cd42b2851f1eae97a25eba4172297d6c[m[33m ([m[1;33mtag: [m[1;33mv1.1.11[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 23:12:03 2026 +0530
+
+    chore: bump to v1.1.0 — v4.4 (9 fixes)
+
+[33mcommit b81d17a774fd9374d4621068d4e4a0dc0b3d67da[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 23:03:24 2026 +0530
+
+    feat : IOS and Android compatability Fixes
+
+[33mcommit 535820f8baa7d77b24ba9621be2af207b50b4c42[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 22:00:51 2026 +0530
+
+    feat(db): add bootstrap.sql for fresh-clone provisioning (Bug F)
+
+[33mcommit 5fed22ee5889b4865bcbf8db46a59ca6f7c79483[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 21:39:25 2026 +0530
+
+    feat: Bug Fixes 4
+
+[33mcommit 30a0e591c4ba02e658f8745d7d9fcc41af58c4d2[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 18:36:29 2026 +0530
+
+    feat:Modal Fix
+
+[33mcommit 6a8a4e8022cbb474d1151d76b29ace8004d7b21f[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 17:53:43 2026 +0530
+
+    feat:Evaluate changes
+
+[33mcommit 20fbb478b82c542a2cb71f83779ee740746f150a[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 17:41:32 2026 +0530
+
+    feat:BugFixes 3
+
+[33mcommit f8dbe21d80080f338bfaeac916b942ce2ed19f26[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 13:42:08 2026 +0530
+
+    feat:ios fix
+
+[33mcommit 4314cfdafe3c0dc45e91c41695d589b478d45230[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 13:23:38 2026 +0530
+
+    Feat:  IOS Scan fix
+
+[33mcommit 33a839aacf330458a8b86e60c825a8da31d465a7[m[33m ([m[1;33mtag: [m[1;33mv1.0.10-ios[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 09:46:59 2026 +0530
+
+    fix: set iOS deploymentTarget 16.0
+
+[33mcommit a98ef87d84968e390833532987bb39875ac15cba[m[33m ([m[1;33mtag: [m[1;33mv1.0.10[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 09:07:49 2026 +0530
+
+    Feat: forTag
+
+[33mcommit 205cce7f517abbe3669a9aed668b55adf71d1730[m[33m ([m[1;33mtag: [m[1;33mv1.0.9[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 08:52:50 2026 +0530
+
+    Feat:Version changes
+
+[33mcommit 46f2081a6d6d54eb034976941c916dd96f7c001a[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Mon May 4 00:07:52 2026 +0530
+
+    feat: Bug Fixes
+
+[33mcommit 4b102cf105be64de7f71744a2a613acc2e4fa982[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sun May 3 18:57:21 2026 +0530
+
+    Scan fix
+
+[33mcommit e13fd20de2df0edb878dc82b89d6021f1d7fc025[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sun May 3 16:54:47 2026 +0530
+
+    feat:Last Issue fix
+
+[33mcommit 827a6ff9c2e66d6ef03d2fc0c0737e4a683099eb[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sun May 3 16:25:09 2026 +0530
+
+    feat: Issue Fixing
+
+[33mcommit eee554d04215eadaf268a3782fa4daf2c1fee787[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sun May 3 12:58:44 2026 +0530
+
+    feat: Scan, XP and ML fixes
+
+[33mcommit 3edeb0cbe702d59ba66a16350357bee8ddc84b7d[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 17:50:26 2026 +0530
+
+    feat:just before IOS
+
+[33mcommit 3c0d9b9e9f781118cb0cc13faf4898cd74ac66f9[m[33m ([m[1;33mtag: [m[1;33mv1.0.7[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 17:12:33 2026 +0530
+
+    fix: quote 'on' key and fix tag glob in EAS workflow
+
+[33mcommit bd7c684783ea9d3a790367b1bd58b87d54d48bf2[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 17:05:32 2026 +0530
+
+    fix: correct tag glob pattern in EAS build workflow
+
+[33mcommit e0c2c9b6bfd837897869ad2707e2bbe7b021dee6[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 16:54:58 2026 +0530
+
+    fix: iOS build config, secrets to EAS
+
+[33mcommit af5a5682eae494a06e77a876423d6cc9c042e7e9[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 16:19:22 2026 +0530
+
+    feat:Duplicate Words Guard
+
+[33mcommit 4bca89d7b6594ee0f94a229a7dac966ca81834c2[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 15:38:18 2026 +0530
+
+    feat:N2 and N4
+
+[33mcommit f60cd8180d4e0fdc1078108f923f3638c171caf6[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 14:51:33 2026 +0530
+
+    feat:Sibling Dashboard
+
+[33mcommit cf1f9f4a28dda1e9039f218c00ec7a0d12aa711f[m[33m ([m[1;32mci/3.6-cicd-pipeline[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 14:14:19 2026 +0530
+
+    feat:Scanscreen
+
+[33mcommit a5cf9c6ee9a76390562192e4ce45dc71e2d7e4e4[m
+Merge: a2e923c 9d5f9e4
+Author: Kakarot-cmd <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 10:30:06 2026 +0530
+
+    Merge pull request #6 from Kakarot-cmd/ci/3.6-cicd-pipeline
+    
+    feat(ci): GitHub Actions typecheck on PR + EAS build on version tag
+
+[33mcommit 9d5f9e4ed3a0b6ff9a106c9dcd73f3b97c045a35[m[33m ([m[1;33mtag: [m[1;33mv1.0.0[m[33m, [m[1;31morigin/ci/3.6-cicd-pipeline[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 10:28:22 2026 +0530
+
+    fix(types): Re run
+
+[33mcommit afed58e80e23dbdf0ab501bfcdc527804ae9a6f3[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 10:22:13 2026 +0530
+
+    fix(types): QuestGeneratorScreen modal props, EncodingType literal, xp_reward_third_plus cast, CVE scan soft-fail
+
+[33mcommit a8b821b44f5cf7972a8245d994de804b1e8a68da[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 10:14:15 2026 +0530
+
+    fix(types): resolve all tsc --noEmit strict errors
+
+[33mcommit 9ef11a927519e9b151c3d2cebab1686165dabc73[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 09:37:35 2026 +0530
+
+    fix(ci): exclude supabase/functions from RN typecheck (Deno files)
+
+[33mcommit 95f55f63b6b61b3742a02b264177d9add3c53df1[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 09:29:07 2026 +0530
+
+    fix(ci): typed navigators, QuestGeneratorScreen default import, CVE scan soft-fail
+
+[33mcommit 60bc5a4e9f0be4123f3a1b30c12d74ede30e008d[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 08:59:52 2026 +0530
+
+    feat(ci): GitHub Actions typecheck on PR + EAS build on version tag
+
+[33mcommit a2e923c142061db3e9dcbf8c340849646c063f76[m
+Author: Kakarot-cmd <lexi-lens@kakarot-cmd.dev>
+Date:   Sat May 2 02:46:19 2026 +0000
+
+    feat(2.6): wire PDF export button into ParentDashboard
+    
+    - Import usePdfExport hook
+    - Instantiate hook (exportPdf, isExporting, statusMessage,
+      exportStatus, exportError, resetExport)
+    - Export button in Word Tome section header:
+        • Disabled when wordTome.length === 0
+        • ActivityIndicator spinner while isExporting
+        • Haptic feedback on tap
+        • Full accessibilityLabel for screen readers
+    - Status feedback strip (amber → green on done, orange on error)
+        • Step messages: 'Gathering Word Tome...' / 'Crafting portfolio...'
+        • Dismiss / Retry tap targets with hitSlop
+    - 11 new StyleSheet entries for button + status strip
+    
+    No new dependencies — expo-print + expo-sharing already installed
+
+[33mcommit 2fa10f12ccc54a5bf2b15165c4355e7272cffef5[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 08:13:59 2026 +0530
+
+    feat:For WordPDF
+
+[33mcommit 14c5de5ecf158e8d1efc5d71f3d8d10aee0dba44[m
+Author: Kakarot-cmd <lexi-lens@kakarot-cmd.dev>
+Date:   Sat May 2 02:38:42 2026 +0000
+
+    feat(2.6): Word Tome PDF export
+    
+    - supabase/functions/export-word-tome/index.ts
+      New Edge Function. Authenticates parent JWT, verifies child ownership,
+      fetches word_tome + quest_completions via service role, calls Claude
+      haiku to generate a teacher-facing portfolio summary paragraph with
+      real word names. Graceful fallback summary if Anthropic is unavailable.
+      Pattern matches request-deletion / cancel-deletion exactly.
+    
+    - services/pdfExportService.ts
+      Full export pipeline: invoke Edge Function → build illuminated-manuscript
+      HTML template (parchment/amber palette matching ParentDashboard) →
+      expo-print converts HTML to PDF on-device → expo-sharing opens OS share
+      sheet. Includes mastery tier visualisation, word catalogue with mastery
+      bars, quest history, AI summary block, and auto-filename
+      {Name}_WordTome_{Month}_{Year}.pdf.
+      Architecture note: HTML→PDF via expo-print chosen over pdfmake-in-Deno
+      to avoid the esm.sh bundle timeout risk documented in evaluate EF.
+    
+    - hooks/usePdfExport.ts
+      5-state machine (fetching→generating→sharing→done/error). Non-throwing,
+      Sentry breadcrumb at every step, isInFlight ref prevents double-taps.
+      Exposes statusMessage strings for step-by-step loading UI.
+    
+    ParentDashboard.tsx changes: see ParentDashboard_2_6_patch.md
+    Install: npx expo install expo-print expo-sharing
+    Deploy: supabase functions deploy export-word-tome --no-verify-jwt
+    
+    Roadmap: 2.6 DONE — must ship before iOS TestFlight (Week 3-4)
+
+[33mcommit 5c291383d60400d737dd0cf663f3809ff059c8e2[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 00:55:53 2026 +0530
+
+    fix(retire-word)
+
+[33mcommit ad4c9d46613cae3747c5c502d4ec3f98145662b0[m
+Merge: 8f9bf10 c1873a9
+Author: Kakarot-cmd <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 00:20:32 2026 +0530
+
+    Merge pull request #5 from Kakarot-cmd/n3-mastery-radar
+    
+    N3: Mastery Radar chart in ParentDashboard
+
+[33mcommit c1873a9c4b8b72375dbfa0d3f1bad46868d9440d[m[33m ([m[1;31morigin/n3-mastery-radar[m[33m, [m[1;32mn3-mastery-radar[m[33m)[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 00:13:59 2026 +0530
+
+    Added gitIgone for CLi Cache
+
+[33mcommit 8f9bf100d7e441986f780c6df218aa52f75bbff3[m
+Merge: 2372334 1613c16
+Author: Kakarot-cmd <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 00:08:27 2026 +0530
+
+    Merge pull request #4 from Kakarot-cmd/n3-mastery-radar
+    
+    N3: Mastery Radar chart in ParentDashboard
+
+[33mcommit 1613c1618955d3763e4343f104ec20b1620dd813[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Sat May 2 00:07:22 2026 +0530
+
+    N3: Mastery Radar chart in ParentDashboard
+
+[33mcommit 2372334e56ae77c03374eabc164975e210feaaa4[m
+Merge: a517fc2 8866960
+Author: Kakarot-cmd <beautifulhearts.n@gmail.com>
+Date:   Fri May 1 23:00:17 2026 +0530
+
+    Merge pull request #3 from Kakarot-cmd/n5-recent-sessions-panel
+    
+    N5 recent sessions panel
+
+[33mcommit 8866960c4a1de1fd0a61090068c39d8e8a1841b0[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Fri May 1 22:57:56 2026 +0530
+
+    N5: Recent Sessions panel in ParentDashboard
+
+[33mcommit 8580b5efee3390c6470a2b87bdf45d71b31fe39e[m
+Merge: 633d36a a517fc2
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Fri May 1 21:53:17 2026 +0530
+
+    Merge branch 'main' of https://github.com/Kakarot-cmd/lexi-lens
+
+[33mcommit a517fc2467082e8369857185f88b3fa0bff8e073[m
+Author: Claude <claude@anthropic.com>
+Date:   Fri May 1 16:12:56 2026 +0000
+
+    fix: email redirect + daily quest word mismatch
+    
+    Bug 1 — Supabase email confirmation pointing to localhost:
+    - app.json: add scheme 'lexilens' so Android can intercept deep links
+    - AuthScreen: pass emailRedirectTo: 'lexilens://auth/confirm' in signUp()
+    - AuthScreen: show a '✅ Email confirmed!' banner + auto-switch to sign-in
+      when app is opened via the confirmation link (both cold and warm start)
+    - App.tsx: handleDeepLink() handles PKCE code exchange (Supabase v2 default)
+      and legacy fragment-based setSession(); bound to both getInitialURL and
+      addEventListener so the session is established in all launch scenarios
+    
+    Bug 2 — Daily quest word chips showing required_properties instead of
+    the age-band-specific words the child actually has to scan:
+    - gameStore: export getDisplayProperties(quest, ageBand) — mirrors the
+      exact priority logic in beginQuest() so callers always get the right list
+    - DailyQuestBanner: derive word chips from getDisplayProperties (not .required_properties)
+    - QuestMapScreen QuestCard: same fix; propCount now reflects the real word count
+    
+    Note: add 'lexilens://auth/confirm' to Supabase Dashboard →
+    Authentication → URL Configuration → Redirect URLs allowlist.
+
+[33mcommit 633d36a79caee0aee7dfb8158bb932baf67f31f0[m
+Author: NJ <beautifulhearts.n@gmail.com>
+Date:   Fri May 1 21:27:18 2026 +0530
+
+    feat: Initial Tour
+
+[33mcommit 6145c64778f8934710a1ffa428324e49e784ca52[m
+Author: Kakarot-cmd <beautifulhearts.n@gmail.com>
+Date:   Fri May 1 13:27:09 2026 +0530
+
+    Create admin-dashboard.html

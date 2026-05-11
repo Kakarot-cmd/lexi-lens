@@ -186,7 +186,13 @@ function ComponentsStrip({
               key={comp.propertyWord}
               style={[
                 styles.chipHintWrap,
-                isHinted && { borderColor: "#f59e0b" },
+                isHinted  && { borderColor: "#f59e0b" },
+                // v6.2.1 (Session D) — visible border when the user taps a chip
+                // to read its definition. Distinct from isHinted (orange =
+                // "the system hints try this") and from chipActive (gold inner
+                // = "this is the current target"). Cyan reads as "I'm
+                // exploring this" without competing with the other two states.
+                isBrowsed && !isHinted && !comp.found && { borderColor: "#67e8f9" },
               ]}
             >
               <TouchableOpacity
