@@ -69,46 +69,74 @@ export type RoutingReason =
 export interface RoutingDecision {
   adapter: ModelAdapter;
   reason:  RoutingReason;
+  /**
+   * v6.3 — true if `adapter` matches the configured primary provider
+   * (evaluate_primary_provider). False when routed to fallback. Used by
+   * evaluate to write scan_attempts.is_primary_call, which feeds back into
+   * get_evaluate_context.primary_calls_today. NOT a tautology: the
+   * kill-switch can pick a fallback-class adapter (e.g. Gemini) even though
+   * the configured primary is Mistral — that's isPrimary=false.
+   */
+  isPrimary: boolean;
   /** Effective cap and current count for log line / response telemetry. */
   primaryCallsPerDay: number;
   primaryCallsToday:  number;
 }
 
-// ─── Internal: feature_flags.evaluate_model_provider read ────────────────────
+// ─── Internal: feature_flags reader (generic, per-key cached) ────────────────
 //
-// 60s in-process cache. Doesn't reuse the model factory's getModelAdapter
-// because that would couple the cold-start cache to per-request routing
-// in confusing ways.
+// 60s in-process cache per key. Doesn't reuse the model factory's
+// getModelAdapter because that would couple the cold-start cache to
+// per-request routing in confusing ways. Three keys read per request:
+//   - evaluate_model_provider     (kill-switch — overrides both primary and fallback)
+//   - evaluate_primary_provider   (which adapter to use for primary slot)
+//   - evaluate_fallback_provider  (which adapter to use for fallback slot)
 
 const FLAG_TTL_MS = 60_000;
-let cachedFlag: { value: string | null; expiresAt: number } | null = null;
+const flagCache = new Map<string, { value: string | null; expiresAt: number }>();
 
-async function readGlobalProviderFlag(
+async function readFlag(
   supabase: SupabaseClient,
+  key:      string,
 ): Promise<string | null> {
-  const now = Date.now();
-  if (cachedFlag && cachedFlag.expiresAt > now) return cachedFlag.value;
+  const now    = Date.now();
+  const cached = flagCache.get(key);
+  if (cached && cached.expiresAt > now) return cached.value;
 
   try {
     const { data, error } = await supabase
       .from("feature_flags")
       .select("value")
-      .eq("key", "evaluate_model_provider")
+      .eq("key", key)
       .maybeSingle();
 
     if (error) {
-      cachedFlag = { value: null, expiresAt: now + FLAG_TTL_MS };
+      flagCache.set(key, { value: null, expiresAt: now + FLAG_TTL_MS });
       return null;
     }
 
     const raw   = (data as { value?: unknown } | null)?.value;
     const value = typeof raw === "string" ? raw.trim().toLowerCase() : null;
-    cachedFlag  = { value, expiresAt: now + FLAG_TTL_MS };
+    flagCache.set(key, { value, expiresAt: now + FLAG_TTL_MS });
     return value;
   } catch {
-    cachedFlag = { value: null, expiresAt: now + FLAG_TTL_MS };
+    flagCache.set(key, { value: null, expiresAt: now + FLAG_TTL_MS });
     return null;
   }
+}
+
+// ─── Internal: provider string → adapter mapping ─────────────────────────────
+//
+// Centralised in one place so primary/fallback/kill-switch all interpret the
+// same vocabulary identically. Returns null on unknown values; callers default
+// to mistralAdapter (primary) or geminiAdapter (fallback) when null comes back.
+
+function providerToAdapter(provider: string | null): ModelAdapter | null {
+  const p = (provider ?? "").trim().toLowerCase();
+  if (p === "mistral")   return mistralAdapter;
+  if (p === "gemini")    return geminiAdapter;
+  if (p === "anthropic") return anthropicHaikuAdapter;
+  return null;
 }
 
 // ─── Internal: fallback chain ────────────────────────────────────────────────
@@ -132,9 +160,10 @@ const FALLBACK_CHAIN: readonly ModelAdapter[] = [
  * @param supabase           Service-role Supabase client.
  * @param subscriptionTier   Parent's tier (free | tier1 | tier2 | family | paid).
  * @param primaryCallsToday  Already-used primary calls today (parent-aggregated).
- *                           Source: get_evaluate_context RPC's haiku_calls_today
- *                           field; the field name is residual from v5 and
- *                           is corrected by the caller's variable name.
+ *                           Source: get_evaluate_context RPC's
+ *                           primary_calls_today field (v6.3 rename from
+ *                           haiku_calls_today). Counts scan_attempts rows
+ *                           with is_primary_call=true.
  */
 export async function pickAdapterForRequest(
   supabase:           SupabaseClient,
@@ -143,50 +172,67 @@ export async function pickAdapterForRequest(
 ): Promise<RoutingDecision> {
   const limits = await getTierLimits(supabase, subscriptionTier);
 
-  // 1. Global kill switch — overrides everything except adapter availability.
-  const globalFlag = await readGlobalProviderFlag(supabase);
-  if (globalFlag === "anthropic") {
+  // Read all three routing flags in parallel. Each is independently cached
+  // 60s; first call after deploy reads from DB, rest hit the in-process map.
+  const [killSwitch, primaryFlag, fallbackFlag] = await Promise.all([
+    readFlag(supabase, "evaluate_model_provider"),
+    readFlag(supabase, "evaluate_primary_provider"),
+    readFlag(supabase, "evaluate_fallback_provider"),
+  ]);
+
+  const primaryAdapter  = providerToAdapter(primaryFlag)  ?? mistralAdapter;
+  const fallbackAdapter = providerToAdapter(fallbackFlag) ?? geminiAdapter;
+
+  // 1. Global kill switch — overrides primary/fallback flags entirely.
+  // isPrimary is true ONLY if the kill-switch happens to land on the same
+  // adapter the primary flag would have picked. Usually false.
+  if (killSwitch === "anthropic") {
     return finalize({
       adapter:            anthropicHaikuAdapter,
       reason:             "kill-switch-anthropic",
+      isPrimary:          anthropicHaikuAdapter.id === primaryAdapter.id,
       primaryCallsPerDay: limits.primaryCallsPerDay,
       primaryCallsToday,
     });
   }
-  if (globalFlag === "gemini") {
+  if (killSwitch === "gemini") {
     return finalize({
       adapter:            geminiAdapter,
       reason:             "kill-switch-gemini",
+      isPrimary:          geminiAdapter.id === primaryAdapter.id,
       primaryCallsPerDay: limits.primaryCallsPerDay,
       primaryCallsToday,
     });
   }
-  // globalFlag === "mistral" or null → continue with normal routing.
+  // killSwitch === "mistral", "" or null → continue with normal routing.
 
-  // 2. Tier explicitly configured for zero primary calls.
+  // 2. Tier explicitly configured for zero primary calls — always fallback.
   if (limits.primaryCallsPerDay === 0) {
     return finalize({
-      adapter:            geminiAdapter,
+      adapter:            fallbackAdapter,
       reason:             "tier-primary-zero",
+      isPrimary:          false,
       primaryCallsPerDay: limits.primaryCallsPerDay,
       primaryCallsToday,
     });
   }
 
-  // 3. Parent's daily primary budget exhausted.
+  // 3. Parent's daily primary budget exhausted — fallback for the rest of the day.
   if (primaryCallsToday >= limits.primaryCallsPerDay) {
     return finalize({
-      adapter:            geminiAdapter,
+      adapter:            fallbackAdapter,
       reason:             "primary-exhausted",
+      isPrimary:          false,
       primaryCallsPerDay: limits.primaryCallsPerDay,
       primaryCallsToday,
     });
   }
 
-  // 4. Within primary budget — route to Mistral.
+  // 4. Within primary budget — route to the configured primary.
   return finalize({
-    adapter:            mistralAdapter,
+    adapter:            primaryAdapter,
     reason:             "primary-budget",
+    isPrimary:          true,
     primaryCallsPerDay: limits.primaryCallsPerDay,
     primaryCallsToday,
   });
@@ -221,7 +267,7 @@ function finalize(decision: RoutingDecision): RoutingDecision {
   return decision; // .call() will throw a clear ModelCallError
 }
 
-/** Test-only helper: reset the global flag cache. */
+/** Test-only helper: reset the flag cache. */
 export function _resetTierRoutingCacheForTests(): void {
-  cachedFlag = null;
+  flagCache.clear();
 }

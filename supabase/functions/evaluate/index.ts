@@ -827,7 +827,11 @@ interface LogScanArgs extends CC1Fields {
 
 async function logScanResult(
   supabase: SupabaseClient,
-  opts:     LogScanArgs & { claudeLatencyMs: number; modelId: string },
+  opts:     LogScanArgs & {
+    claudeLatencyMs: number;
+    modelId:         string;
+    isPrimaryCall:   boolean;  // v6.3 — true if routed to evaluate_primary_provider
+  },
 ): Promise<string | null> {
   try {
     const { data, error } = await supabase.from("scan_attempts").insert({
@@ -845,6 +849,7 @@ async function logScanResult(
       claude_latency_ms: opts.claudeLatencyMs,
       cache_hit:         false,
       model_id:          opts.modelId,
+      is_primary_call:   opts.isPrimaryCall,   // v6.3 — drives get_evaluate_context.primary_calls_today
       cc1_model_id:      opts.cc1ModelId    ?? null,
       cc1_latency_ms:    opts.cc1LatencyMs  ?? null,
       cc1_skipped:       opts.cc1Skipped    ?? null,
@@ -1096,14 +1101,14 @@ serve(async (req: Request) => {
   }
 
   const ctx = ctxData as {
-    scans_today:        number;
-    haiku_calls_today:  number;  // RPC field name retained from v5; semantically "primary_calls_today"
-    subscription_tier:  string;
-    quest_min_tier:     string | null;
-    quest_exists:       boolean;
+    scans_today:         number;
+    primary_calls_today: number;  // v6.3: renamed from haiku_calls_today
+    subscription_tier:   string;
+    quest_min_tier:      string | null;
+    quest_exists:        boolean;
   };
 
-  const primaryCallsToday = ctx.haiku_calls_today; // local rename, see file header
+  const primaryCallsToday = ctx.primary_calls_today;
 
   // Quest tier validation (preserved from v5.4)
   if (questId && ctx.quest_exists && ctx.quest_min_tier) {
@@ -1328,7 +1333,7 @@ serve(async (req: Request) => {
   console.log(
     `[evaluate] routing: model=${routing.adapter.id} reason=${routing.reason} ` +
     `parent_tier=${ctx.subscription_tier} primary_today=${primaryCallsToday}/${routing.primaryCallsPerDay} ` +
-    `childId=${childId}`,
+    `is_primary=${routing.isPrimary} childId=${childId}`,
   );
 
   // ── 8. Call the model (full miss or partial hit) ─────────────────────────
@@ -1589,6 +1594,7 @@ serve(async (req: Request) => {
     childId, questId: questId as string | undefined, detectedLabel,
     confidence: confidence as number | undefined, ipHash,
     result: evaluation.result, claudeLatencyMs: modelLatencyMs, modelId,
+    isPrimaryCall: routing.isPrimary,
     ...cc1LogFields,
   });
 
