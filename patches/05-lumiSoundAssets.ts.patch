@@ -1,0 +1,51 @@
+--- a/components/Lumi/lumiSoundAssets.ts	2026-05-11 18:49:25.142722296 +0000
++++ b/components/Lumi/lumiSoundAssets.ts	2026-05-11 18:49:39.376507220 +0000
+@@ -34,12 +34,40 @@
+ import type { LumiSoundKey } from './lumiSounds';
+ 
+ export const LUMI_SOUND_ASSETS: Partial<Record<LumiSoundKey, number>> = {
+-  // ── Uncomment after files are in place ──────────────────────────────────
+-   appear:  require('../../assets/sounds/lumi/lumi-appear.mp3'),
+-   scan:    require('../../assets/sounds/lumi/lumi-scan.mp3'),
+-   success: require('../../assets/sounds/lumi/lumi-success.mp3'),
+-   fail:    require('../../assets/sounds/lumi/lumi-fail.mp3'),
+-   sleep:   require('../../assets/sounds/lumi/lumi-sleep.mp3'),
+-   cheer:   require('../../assets/sounds/lumi/lumi-cheer.mp3'),
+-   greet:   require('../../assets/sounds/lumi/lumi-greet.mp3'),
++  // ── v6.5 — full rotating-pool asset map (23 clips) ──────────────────────
++
++  // Single-shot SFX
++  appear:                require('../../assets/sounds/lumi/lumi-appear.mp3'),
++  scan:                  require('../../assets/sounds/lumi/lumi-scan.mp3'),
++  sleep:                 require('../../assets/sounds/lumi/lumi-sleep.mp3'),
++  cheer:                 require('../../assets/sounds/lumi/lumi-cheer.mp3'),
++
++  // Greet pool (5 — one picked per first-open-of-day)
++  greet_01:              require('../../assets/sounds/lumi/lumi-greet-01.mp3'),
++  greet_02:              require('../../assets/sounds/lumi/lumi-greet-02.mp3'),
++  greet_03:              require('../../assets/sounds/lumi/lumi-greet-03.mp3'),
++  greet_04:              require('../../assets/sounds/lumi/lumi-greet-04.mp3'),
++  greet_05:              require('../../assets/sounds/lumi/lumi-greet-05.mp3'),
++
++  // Scan-dialogue pool (5 — voiced "Hmm... let me see..." rotation during evaluation)
++  scan_dialogue_01:      require('../../assets/sounds/lumi/lumi-scan-dialogue-01.mp3'),
++  scan_dialogue_02:      require('../../assets/sounds/lumi/lumi-scan-dialogue-02.mp3'),
++  scan_dialogue_03:      require('../../assets/sounds/lumi/lumi-scan-dialogue-03.mp3'),
++  scan_dialogue_04:      require('../../assets/sounds/lumi/lumi-scan-dialogue-04.mp3'),
++  scan_dialogue_05:      require('../../assets/sounds/lumi/lumi-scan-dialogue-05.mp3'),
++
++  // Success pool (3 — main + 2 alts)
++  success:               require('../../assets/sounds/lumi/lumi-success.mp3'),
++  success_alt_01:        require('../../assets/sounds/lumi/lumi-success-alt-01.mp3'),
++  success_alt_02:        require('../../assets/sounds/lumi/lumi-success-alt-02.mp3'),
++
++  // Fail pool (3 — encouraging only, never punitive)
++  fail:                  require('../../assets/sounds/lumi/lumi-fail.mp3'),
++  fail_encourage_01:     require('../../assets/sounds/lumi/lumi-fail-encourage-01.mp3'),
++  fail_encourage_02:     require('../../assets/sounds/lumi/lumi-fail-encourage-02.mp3'),
++
++  // Boss-help pool (3 — gentle hint after 3 failed attempts)
++  boss_hint_01:          require('../../assets/sounds/lumi/lumi-boss-hint-01.mp3'),
++  boss_hint_02:          require('../../assets/sounds/lumi/lumi-boss-hint-02.mp3'),
++  boss_hint_03:          require('../../assets/sounds/lumi/lumi-boss-hint-03.mp3'),
+ };

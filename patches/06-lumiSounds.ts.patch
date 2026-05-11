@@ -1,0 +1,171 @@
+--- a/components/Lumi/lumiSounds.ts	2026-05-11 18:49:25.144208367 +0000
++++ b/components/Lumi/lumiSounds.ts	2026-05-11 18:50:27.044114216 +0000
+@@ -55,34 +55,108 @@
+ const KEY_SOUND   = 'lumi:soundEnabled';
+ const KEY_HAPTICS = 'lumi:hapticsEnabled';
+ 
+-let _soundEnabled   = false;   // default OFF — parent opt-in
++let _soundEnabled   = true;    // default ON — kids hear Lumi immediately; parent can long-press to mute or toggle in ParentDashboard
+ let _hapticsEnabled = true;    // default ON  — silent, no bystander cost
+ let _initialized    = false;
+ let _players: Record<string, any> = {};
+ 
+ // ─── Sound key namespace ──────────────────────────────────────────────────────
++// v6.5 — extended to cover all rotating pool members. Singletons (appear,
++// scan, sleep, cheer) keep their original keys. Pools use suffixed keys:
++//   greet_01..05         (daily greeting rotation)
++//   scan_dialogue_01..05 (voiced rotation during evaluation)
++//   success / success_alt_01..02
++//   fail   / fail_encourage_01..02
++//   boss_hint_01..03
+ 
+ export type LumiSoundKey =
+   | 'appear'
+   | 'scan'
+-  | 'success'
+-  | 'fail'
+   | 'sleep'
+   | 'cheer'
+-  | 'greet';
++  // Greet pool
++  | 'greet_01' | 'greet_02' | 'greet_03' | 'greet_04' | 'greet_05'
++  // Scan-dialogue pool (fires after scan SFX during evaluation)
++  | 'scan_dialogue_01' | 'scan_dialogue_02' | 'scan_dialogue_03'
++  | 'scan_dialogue_04' | 'scan_dialogue_05'
++  // Success pool
++  | 'success' | 'success_alt_01' | 'success_alt_02'
++  // Fail pool (encouraging only)
++  | 'fail' | 'fail_encourage_01' | 'fail_encourage_02'
++  // Boss-help pool (gentle hint after 3 failed attempts)
++  | 'boss_hint_01' | 'boss_hint_02' | 'boss_hint_03';
++
++// ─── Pool definitions ─────────────────────────────────────────────────────────
++// Pool name → array of LumiSoundKeys. The rotation picker chooses one per call
++// with no-repeat-of-last-played logic so kids never hear the same line twice
++// in a row. Single-element pools just return their only key.
++
++type PoolName =
++  | 'greet'
++  | 'scan_dialogue'
++  | 'success'
++  | 'fail'
++  | 'boss_hint';
++
++const SOUND_POOLS: Record<PoolName, LumiSoundKey[]> = {
++  greet:         ['greet_01', 'greet_02', 'greet_03', 'greet_04', 'greet_05'],
++  scan_dialogue: ['scan_dialogue_01', 'scan_dialogue_02', 'scan_dialogue_03',
++                  'scan_dialogue_04', 'scan_dialogue_05'],
++  success:       ['success', 'success_alt_01', 'success_alt_02'],
++  fail:          ['fail', 'fail_encourage_01', 'fail_encourage_02'],
++  boss_hint:     ['boss_hint_01', 'boss_hint_02', 'boss_hint_03'],
++};
++
++// Tracks the most recent pick per pool so we can avoid back-to-back repeats.
++// Module-level, resets on app reload — that's fine, the kid won't notice.
++const _lastPlayed: Partial<Record<PoolName, LumiSoundKey>> = {};
++
++/**
++ * Random no-repeat picker. For a pool of length N, returns one of the N keys
++ * uniformly at random EXCLUDING the most-recently-played one. Kids hear
++ * variety without ever hearing the same line twice in a row.
++ */
++function pickFromPool(pool: PoolName): LumiSoundKey | null {
++  const keys = SOUND_POOLS[pool];
++  if (!keys || keys.length === 0) return null;
++  if (keys.length === 1) {
++    _lastPlayed[pool] = keys[0];
++    return keys[0];
++  }
++  const last = _lastPlayed[pool];
++  const candidates = last ? keys.filter(k => k !== last) : keys;
++  const choice = candidates[Math.floor(Math.random() * candidates.length)];
++  _lastPlayed[pool] = choice;
++  return choice;
++}
+ 
+-// ─── State → sound + haptic mapping ───────────────────────────────────────────
++// Delay between the ambient scan SFX and the voiced scan-dialogue. The SFX
++// leads (sparkle/wind-chime), then Lumi talks. 400ms feels natural — long
++// enough that the two cues don't muddy each other.
++const SCAN_DIALOGUE_DELAY_MS = 400;
++
++// ─── State → pool + lead-SFX mapping ──────────────────────────────────────────
++// Each state maps to (a) an optional lead SFX (single-shot ambient cue that
++// fires immediately) and (b) an optional pool (rotating voice clip that fires
++// after the SFX with SCAN_DIALOGUE_DELAY_MS, or immediately if no lead).
+ 
+-const STATE_TO_SOUND: Partial<Record<LumiState, LumiSoundKey>> = {
++const STATE_TO_LEAD_SFX: Partial<Record<LumiState, LumiSoundKey>> = {
+   guide:           'appear',
+-  scanning:        'scan',
+-  success:         'success',
+-  // 'fail':       intentionally absent — no "wrong" sound for kids
++  scanning:        'scan',         // wind-chime sparkle leads the voice
++  // 'looking-up' shares scanning behavior — handled in playLumiForState
+   'boss-help':     'appear',
+   'out-of-juice':  'sleep',
+   cheering:        'cheer',
+ };
+ 
++const STATE_TO_POOL: Partial<Record<LumiState, PoolName>> = {
++  scanning:        'scan_dialogue',
++  'looking-up':    'scan_dialogue',
++  success:         'success',
++  fail:            'fail',           // encouraging variants, NOT punitive
++  'boss-help':     'boss_hint',
++};
++
+ type HapticFn = () => Promise<void> | void;
+ 
+ const STATE_TO_HAPTIC: Partial<Record<LumiState, HapticFn>> = {
+@@ -150,6 +224,13 @@
+ /**
+  * Fire the sound + haptic mapped to a Lumi state.
+  * Safe to call on every state change — guarded against missing assets.
++ *
++ * v6.5 — two-layer audio:
++ *   1. Lead SFX (e.g. 'scan' wind-chime) fires immediately for ambient cue
++ *   2. Voice from the rotating pool (e.g. 'scan_dialogue') fires after
++ *      SCAN_DIALOGUE_DELAY_MS so the two cues don't muddy each other
++ *   3. States with no lead SFX play the pool clip immediately
++ *   4. States with neither (e.g. 'idle') silently no-op
+  */
+ export function playLumiForState(state: LumiState): void {
+   if (_hapticsEnabled) {
+@@ -158,9 +239,21 @@
+       try { void fn(); } catch { /* no-op */ }
+     }
+   }
+-  if (_soundEnabled && audio) {
+-    const key = STATE_TO_SOUND[state];
+-    if (key) playSoundKey(key);
++  if (!_soundEnabled || !audio) return;
++
++  const leadSfx = STATE_TO_LEAD_SFX[state];
++  const pool    = STATE_TO_POOL[state];
++  const poolKey = pool ? pickFromPool(pool) : null;
++
++  if (leadSfx) playSoundKey(leadSfx);
++
++  if (poolKey) {
++    if (leadSfx) {
++      // Delay voice so the SFX leads cleanly
++      setTimeout(() => playSoundKey(poolKey), SCAN_DIALOGUE_DELAY_MS);
++    } else {
++      playSoundKey(poolKey);
++    }
+   }
+ }
+ 
+@@ -170,7 +263,10 @@
+     try { void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } catch {}
+   }
+   if (_soundEnabled && audio) {
+-    playSoundKey('greet');
++    // v6.5 — rotates through 5 greeting clips. Last-played guard ensures
++    // no kid hears the same greeting two mornings in a row.
++    const key = pickFromPool('greet');
++    if (key) playSoundKey(key);
+   }
+ }
+ 
