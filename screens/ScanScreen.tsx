@@ -192,14 +192,16 @@ function ComponentsStrip({
               <TouchableOpacity
                 style={[
                   styles.chip,
-                  // v6.2.2 (Session D refinement) — browse highlight now reuses
-                  // the chipActive gold-on-inner-chip styling instead of a
-                  // separate cyan outer ring. Visually subtler and consistent
-                  // with the "active component" treatment the user already
-                  // recognizes. Browse + active states share the same focal
-                  // visual; in practice they're often the same chip anyway
-                  // (browsedWord initialises to currentComponent.propertyWord).
-                  (isActive || (isBrowsed && !comp.found)) && styles.chipActive,
+                  // v6.2.3 (Session D fix) — browse highlight reuses chipActive
+                  // gold-on-inner-chip styling for visual consistency. CRITICAL:
+                  // isBrowsed is the SOLE driver. Earlier (v6.2.2) condition
+                  // included `isActive` too, which lit up two chips at once
+                  // (quest target AND the chip the user tapped to view).
+                  // browsedWord initialises to currentComponent.propertyWord
+                  // via the sync useEffect, so the highlight starts on the
+                  // active chip by default and follows the user's taps.
+                  // Single source of truth = single chip highlighted.
+                  isBrowsed && !comp.found && styles.chipActive,
                   comp.found && styles.chipDone,
                 ]}
                 onPress={() => !comp.found && onSelectWord(comp.propertyWord)}

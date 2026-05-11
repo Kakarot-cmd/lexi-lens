@@ -1,22 +1,27 @@
 diff --git a/screens/ScanScreen.tsx b/screens/ScanScreen.tsx
-index 1eb73e8..d985150 100644
+index 1eb73e8..2e87274 100644
 --- a/screens/ScanScreen.tsx
 +++ b/screens/ScanScreen.tsx
-@@ -186,7 +186,13 @@ function ComponentsStrip({
-               key={comp.propertyWord}
-               style={[
-                 styles.chipHintWrap,
--                isHinted && { borderColor: "#f59e0b" },
-+                isHinted  && { borderColor: "#f59e0b" },
-+                // v6.2.1 (Session D) — visible border when the user taps a chip
-+                // to read its definition. Distinct from isHinted (orange =
-+                // "the system hints try this") and from chipActive (gold inner
-+                // = "this is the current target"). Cyan reads as "I'm
-+                // exploring this" without competing with the other two states.
-+                isBrowsed && !isHinted && !comp.found && { borderColor: "#67e8f9" },
-               ]}
-             >
+@@ -192,7 +192,18 @@ function ComponentsStrip({
                <TouchableOpacity
+                 style={[
+                   styles.chip,
+-                  isActive  && styles.chipActive,
++                  // v6.2.2 (Session D) — browse highlight reuses the chipActive
++                  // gold-on-inner-chip styling for visual consistency with the
++                  // existing "active component" treatment. CRITICAL: isBrowsed
++                  // is the SOLE driver — `isActive` is intentionally NOT in
++                  // the condition. Including both would light up two chips at
++                  // once (the quest target AND whichever chip the user
++                  // tapped to view). browsedWord initialises to
++                  // currentComponent.propertyWord via the sync useEffect, so
++                  // the highlight starts on the active chip by default and
++                  // follows the user's taps. Single source of truth = single
++                  // chip highlighted at any moment.
++                  isBrowsed && !comp.found && styles.chipActive,
+                   comp.found && styles.chipDone,
+                 ]}
+                 onPress={() => !comp.found && onSelectWord(comp.propertyWord)}
 diff --git a/supabase/functions/evaluate/evaluateObject.ts b/supabase/functions/evaluate/evaluateObject.ts
 index 9846163..ebc3b9e 100644
 --- a/supabase/functions/evaluate/evaluateObject.ts
