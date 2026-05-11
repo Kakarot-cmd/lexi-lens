@@ -1,38 +1,18 @@
-From: Lumi Upgrade v1 (orbit-reticle, larger+faster scan-wait mascot)
-Subject: [PATCH 3/4] LumiHUD.tsx — reticleCenter prop + hard-mode orbit allowance
-
-Two additive changes:
-
-  1. Add `reticleCenter?: {x, y}` to LumiHUDProps so callers (ScanScreen) can
-     hand a screen-coord center to orbit around. Forwarded to LumiMascot as
-     `freePosition` so the existing freePosition plumbing in LumiMascot picks
-     it up.
-
-  2. Relax the existing "hard mode forces anchor" override to specifically
-     ALLOW 'orbit-reticle'. The red-crown Lumi spinning during a hard quest
-     reinforces "this is intense" — it doesn't hide the crown because the
-     orbit radius keeps Lumi within the reticle, fully on-screen.
-
----
- components/Lumi/LumiHUD.tsx | 14 +++++++++++++-
- 1 file changed, 13 insertions(+), 1 deletion(-)
-
-diff --git a/components/Lumi/LumiHUD.tsx b/components/Lumi/LumiHUD.tsx
---- a/components/Lumi/LumiHUD.tsx
-+++ b/components/Lumi/LumiHUD.tsx
-@@ -83,6 +83,11 @@ export interface LumiHUDProps {
+--- a/components/Lumi/LumiHUD.tsx	2026-05-11 16:41:40.714186544 +0000
++++ b/components/Lumi/LumiHUD.tsx	2026-05-11 16:43:00.948468871 +0000
+@@ -98,6 +98,11 @@
    muted?:               boolean;
    hidden?:              boolean;
    zIndex?:              number;
 +  /**
 +   * v6.5 — when set with movement='orbit-reticle', Lumi orbits this
-+   * screen-coord center at the active state's orbitRadius/orbitSpeedRpm.
++   * screen-coord center at the active state's orbitRadius / orbitSpeedRpm.
 +   */
 +  reticleCenter?:       { x: number; y: number };
  }
  
  export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
-@@ -100,6 +105,7 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
+@@ -115,6 +120,7 @@
      muted             = false,
      hidden            = false,
      zIndex            = 100,
@@ -40,13 +20,13 @@ diff --git a/components/Lumi/LumiHUD.tsx b/components/Lumi/LumiHUD.tsx
    } = props;
  
    const preset = SCREEN_PRESETS[screen];
-@@ -135,9 +141,13 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
+@@ -151,9 +157,13 @@
      return preset.defaultState;
    }, [dailyLimitReached, transient, evaluationStatus, failureStreak, preset.defaultState]);
  
 -  // Hard-mode forces anchor (so kids see the crown clearly without it darting around)
-+  // Hard-mode forces anchor for wander/drift (so kids see the crown clearly
-+  // without it darting all over the screen). 'orbit-reticle' is exempt — the
++  // Hard-mode forces anchor for wander/drift so kids see the crown clearly
++  // without it darting across the screen. 'orbit-reticle' is exempt — the
 +  // orbit stays bounded inside the viewfinder, the crown stays readable, and
 +  // a spinning red Lumi reinforces "this quest is intense".
 +  const requestedMovement: LumiMovementMode = movement ?? preset.movement;
@@ -56,11 +36,10 @@ diff --git a/components/Lumi/LumiHUD.tsx b/components/Lumi/LumiHUD.tsx
  
    // Hard-mode also forces non-rainbow (red crown is the brand cue)
    const resolvedRainbow = hardMode ? false : (rainbow ?? preset.rainbow);
-@@ -156,6 +166,8 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
+@@ -172,6 +182,7 @@
        rainbow={resolvedRainbow}
        muted={muted}
        zIndex={zIndex}
-+      // v6.5 — forwarded to LumiMascot's freePosition for orbit-reticle math.
 +      freePosition={reticleCenter}
      />
    );

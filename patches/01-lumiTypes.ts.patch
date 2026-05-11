@@ -1,29 +1,14 @@
-From: Lumi Upgrade v1 (orbit-reticle, larger+faster scan-wait mascot)
-Subject: [PATCH 1/4] lumiTypes.ts — add 'orbit-reticle' movement mode
-
-Adds a new value to LumiMovementMode so LumiMascot can orbit a screen-coord
-center (passed via freePosition) at orbitRadius/orbitSpeedRpm from the state
-profile. Used by ScanScreen during evaluation to orbit the viewfinder reticle.
-
-Pure additive change. Existing 'anchor' | 'wander' | 'drift' callers unaffected.
-
----
- components/Lumi/lumiTypes.ts | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
-
-diff --git a/components/Lumi/lumiTypes.ts b/components/Lumi/lumiTypes.ts
---- a/components/Lumi/lumiTypes.ts
-+++ b/components/Lumi/lumiTypes.ts
-@@ -50,7 +50,11 @@ export type LumiPosition =
+--- a/components/Lumi/lumiTypes.ts	2026-05-11 16:41:40.710524733 +0000
++++ b/components/Lumi/lumiTypes.ts	2026-05-11 16:41:50.791816995 +0000
+@@ -61,7 +61,10 @@
  export type LumiMovementMode =
    | 'anchor'       // stay at preset position (original behavior)
    | 'wander'       // smooth figure-8 across upper portion of screen
 -  | 'drift';       // gentle horizontal drift along an edge
 +  | 'drift'        // gentle horizontal drift along an edge
-+  | 'orbit-reticle'; // v6.5 — orbit a screen-coord center (passed via
-+                   //         freePosition) at orbitRadius/orbitSpeedRpm
-+                   //         from the active state's animation profile.
-+                   //         Used during scan-evaluation to orbit the viewfinder.
++  | 'orbit-reticle'; // v6.5 — orbit a screen-coord center (freePosition) at
++                   //         orbitRadius / orbitSpeedRpm from the active
++                   //         state profile. Used during scan-evaluation.
  
  // ─── Theme variants ───────────────────────────────────────────────────────────
  

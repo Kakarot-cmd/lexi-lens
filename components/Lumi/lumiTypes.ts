@@ -61,7 +61,10 @@ export type LumiPosition =
 export type LumiMovementMode =
   | 'anchor'       // stay at preset position (original behavior)
   | 'wander'       // smooth figure-8 across upper portion of screen
-  | 'drift';       // gentle horizontal drift along an edge
+  | 'drift'        // gentle horizontal drift along an edge
+  | 'orbit-reticle'; // v6.5 — orbit a screen-coord center (freePosition) at
+                   //         orbitRadius / orbitSpeedRpm from the active
+                   //         state profile. Used during scan-evaluation.
 
 // ─── Theme variants ───────────────────────────────────────────────────────────
 

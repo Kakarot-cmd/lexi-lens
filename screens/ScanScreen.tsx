@@ -34,6 +34,7 @@ import {
   StyleSheet,
   Animated,
   Linking,
+  useWindowDimensions,
 } from "react-native";
 import { Camera } from "react-native-vision-camera";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -440,6 +441,16 @@ function ScanButton({
 export function ScanScreen({ route, navigation }: Props) {
   const insets = useSafeAreaInsets();
   const { questId, hardMode: routeHardMode = false } = route.params;
+
+  // v6.5 — reticle center for Lumi's orbit-reticle motion during evaluation.
+  // Matches styles.tl/tr (top:80) and styles.bl/br (bottom:290). Lumi orbits
+  // the midpoint between those bounds. If the viewfinder layout changes,
+  // update both this calc and the styles together.
+  const { width: scanW, height: scanH } = useWindowDimensions();
+  const reticleCenter = useMemo(
+    () => ({ x: scanW / 2, y: (80 + (scanH - 290)) / 2 }),
+    [scanW, scanH],
+  );
 
   const activeChild      = useGameStore((s) => s.activeChild);
   const activeQuest      = useGameStore((s) => s.activeQuest);
@@ -996,8 +1007,22 @@ export function ScanScreen({ route, navigation }: Props) {
         dailyLimitReached={status === "rate_limited"}
         failureStreak={currentAttempts}
         hidden={phase === "quest_victory"}
-        movement={status === "idle" ? "wander" : "anchor"}
-        size={64}
+        // v6.5 — three-branch movement: wander while framing, orbit the
+        // viewfinder reticle during evaluation (larger + faster), anchor
+        // during success/fail/rate-limit beats.
+        movement={
+          status === "idle"
+            ? "wander"
+            : status === "converting" || status === "evaluating" || status === "looking-up"
+              ? "orbit-reticle"
+              : "anchor"
+        }
+        size={
+          status === "converting" || status === "evaluating" || status === "looking-up"
+            ? 96
+            : 64
+        }
+        reticleCenter={reticleCenter}
       />
     </View>
   );

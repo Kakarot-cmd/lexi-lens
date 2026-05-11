@@ -35,11 +35,11 @@ import type { LumiSoundKey } from './lumiSounds';
 
 export const LUMI_SOUND_ASSETS: Partial<Record<LumiSoundKey, number>> = {
   // ── Uncomment after files are in place ──────────────────────────────────
-  // appear:  require('../../assets/sounds/lumi/lumi-appear.mp3'),
-  // scan:    require('../../assets/sounds/lumi/lumi-scan.mp3'),
-  // success: require('../../assets/sounds/lumi/lumi-success.mp3'),
-  // fail:    require('../../assets/sounds/lumi/lumi-fail.mp3'),
-  // sleep:   require('../../assets/sounds/lumi/lumi-sleep.mp3'),
-  // cheer:   require('../../assets/sounds/lumi/lumi-cheer.mp3'),
-  // greet:   require('../../assets/sounds/lumi/lumi-greet.mp3'),
+   appear:  require('../../assets/sounds/lumi/lumi-appear.mp3'),
+   scan:    require('../../assets/sounds/lumi/lumi-scan.mp3'),
+   success: require('../../assets/sounds/lumi/lumi-success.mp3'),
+   fail:    require('../../assets/sounds/lumi/lumi-fail.mp3'),
+   sleep:   require('../../assets/sounds/lumi/lumi-sleep.mp3'),
+   cheer:   require('../../assets/sounds/lumi/lumi-cheer.mp3'),
+   greet:   require('../../assets/sounds/lumi/lumi-greet.mp3'),
 };

@@ -1,50 +1,25 @@
-From: Lumi Upgrade v1 (orbit-reticle, larger+faster scan-wait mascot)
-Subject: [PATCH 2/4] LumiMascot.tsx — orbit math + profile tune + bubble-style split
-
-Three coordinated changes inside the orchestrator:
-
-  1. PROFILES.scanning and PROFILES['looking-up'] get non-zero orbit values
-     (radius 90, 28 RPM) so 'orbit-reticle' has work to do during evaluation.
-     Trail rate tightens 80ms → 50ms for denser sparkle. scaleBase 0.95 → 1.00
-     so Lumi reads at full size during the wait.
-
-  2. New orbit shared-value + animation effect, gated on movement='orbit-reticle'
-     AND reduceMotion=false AND non-zero profile orbit values. Linear loop
-     around 2π over (60_000 / orbitSpeedRpm) ms.
-
-  3. Anchor resolution gets an early branch for orbit-reticle: uses freePosition
-     as the orbit center. bodyAnimStyle composes orbit translate FIRST, then bob,
-     then scale. Speech bubble splits off into bubbleAnimStyle (scale only) so
-     the bubble stays put while Lumi spins around it.
-
-Reduce Motion: the existing useReducedMotion gate kills the orbit effect, so
-Lumi falls back to a static anchor at the reticle center. Honored automatically.
-
----
- components/Lumi/LumiMascot.tsx | 84 ++++++++++++++++++++++++++++++++++--
- 1 file changed, 80 insertions(+), 4 deletions(-)
-
-diff --git a/components/Lumi/LumiMascot.tsx b/components/Lumi/LumiMascot.tsx
---- a/components/Lumi/LumiMascot.tsx
-+++ b/components/Lumi/LumiMascot.tsx
-@@ -49,8 +49,8 @@ import { playLumiForState } from './lumiSounds';
+--- a/components/Lumi/LumiMascot.tsx	2026-05-11 16:41:40.712480023 +0000
++++ b/components/Lumi/LumiMascot.tsx	2026-05-11 16:42:40.116364314 +0000
+@@ -64,11 +64,11 @@
  const PROFILES: Record<LumiState, LumiAnimationProfile> = {
    idle:           { bobAmplitude: 4,  bobDurationMs: 2500, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: false, trailRateMs: 0,    scaleBase: 1.00, glowIntensity: 0.5 },
    guide:          { bobAmplitude: 5,  bobDurationMs: 1800, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 200,  scaleBase: 1.00, glowIntensity: 0.7 },
 -  scanning:       { bobAmplitude: 3,  bobDurationMs: 1400, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 80,   scaleBase: 0.95, glowIntensity: 0.9 },
++  scanning:       { bobAmplitude: 3,  bobDurationMs: 1400, wingFlapRateHz: 0, orbitRadius: 90, orbitSpeedRpm: 28, blinkChance: 0, trailEnabled: true,  trailRateMs: 50,   scaleBase: 1.00, glowIntensity: 1.0 },
+   // v6.2 Phase 2 — looking-up reuses the scanning animation profile.
+   // Visual differentiation deferred to a later session per session notes;
+   // the only consumer-visible difference is the speech-bubble quote pool.
 -  'looking-up':   { bobAmplitude: 3,  bobDurationMs: 1400, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 80,   scaleBase: 0.95, glowIntensity: 0.9 },
-+  scanning:       { bobAmplitude: 3,  bobDurationMs: 1400, wingFlapRateHz: 0, orbitRadius: 90, orbitSpeedRpm: 28, blinkChance: 0, trailEnabled: true,  trailRateMs: 50, scaleBase: 1.00, glowIntensity: 1.0 },
-+  'looking-up':   { bobAmplitude: 3,  bobDurationMs: 1400, wingFlapRateHz: 0, orbitRadius: 90, orbitSpeedRpm: 28, blinkChance: 0, trailEnabled: true,  trailRateMs: 50, scaleBase: 1.00, glowIntensity: 1.0 },
-   success:        { bobAmplitude: 6,  bobDurationMs: 1000, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 60,   scaleBase: 1.05, glowIntensity: 1.0 },
-   fail:           { bobAmplitude: 2,  bobDurationMs: 2200, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: false, trailRateMs: 0,    scaleBase: 0.95, glowIntensity: 0.5 },
-   'boss-help':    { bobAmplitude: 4,  bobDurationMs: 1600, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 220,  scaleBase: 1.00, glowIntensity: 0.7 },
-@@ -218,9 +218,21 @@ export function LumiMascot(props: LumiMascotProps): React.ReactElement | null {
-   // For wander mode we OVERRIDE to a center-top anchor so the figure-8 stays
++  'looking-up':   { bobAmplitude: 3,  bobDurationMs: 1400, wingFlapRateHz: 0, orbitRadius: 90, orbitSpeedRpm: 28, blinkChance: 0, trailEnabled: true,  trailRateMs: 50,   scaleBase: 1.00, glowIntensity: 1.0 },
+   success:        { bobAmplitude: 8,  bobDurationMs: 700,  wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 50,   scaleBase: 1.10, glowIntensity: 1.0 },
+   fail:           { bobAmplitude: 2,  bobDurationMs: 2200, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: false, trailRateMs: 0,    scaleBase: 0.95, glowIntensity: 0.4 },
+   'boss-help':    { bobAmplitude: 5,  bobDurationMs: 1600, wingFlapRateHz: 0, orbitRadius: 0, orbitSpeedRpm: 0, blinkChance: 0, trailEnabled: true,  trailRateMs: 140,  scaleBase: 1.00, glowIntensity: 0.7 },
+@@ -173,8 +173,24 @@
    // in the upper portion of the screen.
    const wanderEnabled = movement === 'wander' && !reduceMotion;
    const driftEnabled  = movement === 'drift'  && !reduceMotion;
 +  // v6.5 — orbit-reticle: orbit a freePosition center on a circle defined by
-+  // the active profile's orbitRadius / orbitSpeedRpm.
++  // the active state profile's orbitRadius / orbitSpeedRpm.
 +  const orbitEnabled  =
 +    movement === 'orbit-reticle'
 +    && !reduceMotion
@@ -53,8 +28,9 @@ diff --git a/components/Lumi/LumiMascot.tsx b/components/Lumi/LumiMascot.tsx
 +    && !!freePosition;
  
    const anchor = useMemo(() => {
-+    // v6.5 — orbit-reticle: anchor sits at freePosition; orbit math lives in
-+    // bodyAnimStyle below. Bubble uses this same anchor so it doesn't spin.
++    // v6.5 — orbit-reticle: anchor sits at freePosition; the orbit math
++    // lives in bodyAnimStyle so the bubble (which uses anchor directly)
++    // stays put while Lumi spins around it.
 +    if (orbitEnabled && freePosition) {
 +      const cx = freePosition.x;
 +      const cy = freePosition.y;
@@ -63,7 +39,7 @@ diff --git a/components/Lumi/LumiMascot.tsx b/components/Lumi/LumiMascot.tsx
      if (wanderEnabled) {
        const left = window.width / 2 - size / 2;
        const top  = insets.top + edgeInset + size; // upper third
-@@ -233,6 +245,7 @@ export function LumiMascot(props: LumiMascotProps): React.ReactElement | null {
+@@ -188,6 +204,7 @@
      }
      return resolveAnchor(position, freePosition, size, window, insets, edgeInset);
    }, [
@@ -71,22 +47,22 @@ diff --git a/components/Lumi/LumiMascot.tsx b/components/Lumi/LumiMascot.tsx
      wanderEnabled, driftEnabled, position,
      freePosition?.x, freePosition?.y, size,
      window.width, window.height,
-@@ -244,6 +257,7 @@ export function LumiMascot(props: LumiMascotProps): React.ReactElement | null {
+@@ -200,6 +217,8 @@
    const scaleSV = useSharedValue(profile.scaleBase);
    const wanderX = useSharedValue(0);
    const wanderY = useSharedValue(0);
++  // v6.5 — orbit angle (radians). Animated 0 → 2π linearly while orbitEnabled.
 +  const orbitAngle = useSharedValue(0);
  
    // Bob (subtle vertical idle motion)
    useEffect(() => {
-@@ -276,6 +290,32 @@ export function LumiMascot(props: LumiMascotProps): React.ReactElement | null {
+@@ -231,6 +250,23 @@
      }
    }, [state, profile.scaleBase]);
  
-+  // v6.5 — Orbit (orbit-reticle movement)
-+  // Linear loop 0 → 2π over (60_000 / orbitSpeedRpm) ms. cos/sin in the
-+  // animated style produce the circular translate. Min period 800ms so
-+  // unreasonable RPM values don't seizure the kid.
++  // v6.5 — Orbit (orbit-reticle movement). Linear 0 → 2π over
++  // (60_000 / orbitSpeedRpm) ms. cos/sin in the animated style render the
++  // circular translate. 800ms min period prevents seizure-tier RPM values.
 +  useEffect(() => {
 +    if (!orbitEnabled) {
 +      orbitAngle.value = withTiming(0, { duration: 200 });
@@ -104,38 +80,38 @@ diff --git a/components/Lumi/LumiMascot.tsx b/components/Lumi/LumiMascot.tsx
    // Sound + haptic on state change
    useEffect(() => {
      if (effectiveMuted) return;
-@@ -288,11 +328,29 @@ export function LumiMascot(props: LumiMascotProps): React.ReactElement | null {
+@@ -286,12 +322,24 @@
+   }, [wanderEnabled, driftEnabled, window.width, size, edgeInset]);
  
-   // ── Animated styles ───────────────────────────────────────────────────────
- 
-+  // v6.5 — orbit transforms compose FIRST so bob rides ON the orbiting body,
-+  // not the other way round. Body sees: orbit translate → bob translate → scale.
-   const bodyAnimStyle = useAnimatedStyle(() => {
--    return {
--      transform: [
--        { translateY: bobY.value },
--        { scale:      scaleSV.value },
--      ],
--    };
+   // Combined transform on the body's outer wrapper.
+-  const bodyAnimStyle = useAnimatedStyle(() => ({
+-    transform: [
+-      { translateX: wanderX.value },
+-      { translateY: wanderY.value + bobY.value },
+-      { scale:      scaleSV.value },
+-    ],
++  // v6.5 — orbit translate composes first so bob rides ON the orbiting body.
++  const bodyAnimStyle = useAnimatedStyle(() => {
 +    const transforms: any[] = [];
 +    if (orbitEnabled) {
 +      transforms.push({ translateX: Math.cos(orbitAngle.value) * profile.orbitRadius });
 +      transforms.push({ translateY: Math.sin(orbitAngle.value) * profile.orbitRadius });
 +    }
-+    transforms.push({ translateY: bobY.value });
++    transforms.push({ translateX: wanderX.value });
++    transforms.push({ translateY: wanderY.value + bobY.value });
 +    transforms.push({ scale: scaleSV.value });
 +    return { transform: transforms };
 +  });
 +
-+  // v6.5 — bubble style is JUST scale. The bubble stays anchored at the reticle
-+  // center while Lumi orbits around it. Without this split, the bubble would
-+  // spin with Lumi and be unreadable.
-+  const bubbleAnimStyle = useAnimatedStyle(() => {
-+    return { transform: [{ scale: scaleSV.value }] };
-   });
++  // v6.5 — bubble style is JUST scale. The bubble stays anchored at the
++  // reticle center while Lumi orbits around it. Without this split, the
++  // bubble would spin with Lumi and be unreadable.
++  const bubbleAnimStyle = useAnimatedStyle(() => ({
++    transform: [{ scale: scaleSV.value }],
+   }));
  
-   // ── Render ────────────────────────────────────────────────────────────────
-@@ -334,7 +392,7 @@ export function LumiMascot(props: LumiMascotProps): React.ReactElement | null {
+   // Trail enabled when state's profile says so AND not in motion modes that
+@@ -387,7 +435,7 @@
        {bubbleVisible && bubbleText ? (
          <Animated.View
            pointerEvents="none"

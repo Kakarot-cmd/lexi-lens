@@ -98,6 +98,11 @@ export interface LumiHUDProps {
   muted?:               boolean;
   hidden?:              boolean;
   zIndex?:              number;
+  /**
+   * v6.5 — when set with movement='orbit-reticle', Lumi orbits this
+   * screen-coord center at the active state's orbitRadius / orbitSpeedRpm.
+   */
+  reticleCenter?:       { x: number; y: number };
 }
 
 export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
@@ -115,6 +120,7 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
     muted             = false,
     hidden            = false,
     zIndex            = 100,
+    reticleCenter,
   } = props;
 
   const preset = SCREEN_PRESETS[screen];
@@ -151,9 +157,13 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
     return preset.defaultState;
   }, [dailyLimitReached, transient, evaluationStatus, failureStreak, preset.defaultState]);
 
-  // Hard-mode forces anchor (so kids see the crown clearly without it darting around)
+  // Hard-mode forces anchor for wander/drift so kids see the crown clearly
+  // without it darting across the screen. 'orbit-reticle' is exempt — the
+  // orbit stays bounded inside the viewfinder, the crown stays readable, and
+  // a spinning red Lumi reinforces "this quest is intense".
+  const requestedMovement: LumiMovementMode = movement ?? preset.movement;
   const resolvedMovement: LumiMovementMode =
-    hardMode ? 'anchor' : (movement ?? preset.movement);
+    hardMode && requestedMovement !== 'orbit-reticle' ? 'anchor' : requestedMovement;
 
   // Hard-mode also forces non-rainbow (red crown is the brand cue)
   const resolvedRainbow = hardMode ? false : (rainbow ?? preset.rainbow);
@@ -172,6 +182,7 @@ export function LumiHUD(props: LumiHUDProps): React.ReactElement | null {
       rainbow={resolvedRainbow}
       muted={muted}
       zIndex={zIndex}
+      freePosition={reticleCenter}
     />
   );
 }
