@@ -63,6 +63,7 @@
 
 import { useState, useCallback, useRef } from "react";
 import * as FileSystem from "expo-file-system";
+import { compressImageToBase64 } from "../lib/imageCompress";
 // EncodingType is not re-exported from expo-file-system 19.x namespace;
 // use the string literal "base64" which the API accepts directly.
 import { supabase } from "../lib/supabase";
@@ -242,6 +243,21 @@ class RateLimitResponseError extends Error {
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 async function uriToBase64(uri: string): Promise<string | null> {
+  // v6.5 — try compressed path first (saves upload time on retries).
+  // Falls back to raw FileSystem read if compression fails.
+  try {
+    const compressed = await compressImageToBase64(uri);
+    if (compressed) {
+      if (compressed.length > MAX_FRAME_BASE64_CHARS) {
+        console.warn("[LexiEvaluate] Compressed frame too large — sending without image");
+        return null;
+      }
+      return compressed;
+    }
+  } catch {
+    // Fall through to raw read
+  }
+
   try {
     const base64 = await FileSystem.readAsStringAsync(uri, {
       encoding: "base64",
