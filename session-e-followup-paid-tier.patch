@@ -1,0 +1,24 @@
+diff --git a/store/gameStore.ts b/store/gameStore.ts
+index 880fe13..e053baf 100644
+--- a/store/gameStore.ts
++++ b/store/gameStore.ts
+@@ -589,7 +589,18 @@ export const useGameStore = create<GameState>()(
+           }
+ 
+           const raw = (data as { subscription_tier?: string } | null)?.subscription_tier;
+-          set({ parentSubscriptionTier: raw === "paid" ? "paid" : "free" });
++          // v6.3.1: paid-equivalent tier collapse. Any of the 4 v6.0 tiers OR
++          // the legacy 'paid' value counts as paid-tier capability for UI
++          // gating purposes. Keeps parentSubscriptionTier as a binary field
++          // (free | paid | null) — callers like selectIsQuestLocked stay
++          // simple; the SQL-side equivalent is the is_paid_tier() function.
++          // Mirrors the same vocabulary; update both if the tier list changes.
++          const isPaidEquivalent =
++            raw === "paid"  ||
++            raw === "tier1" ||
++            raw === "tier2" ||
++            raw === "family";
++          set({ parentSubscriptionTier: isPaidEquivalent ? "paid" : "free" });
+         } catch {
+           set({ parentSubscriptionTier: "free" });
+         }
