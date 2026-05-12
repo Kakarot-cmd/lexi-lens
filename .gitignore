@@ -51,3 +51,4 @@ node_modules/
 "supabase/.temp/" 
 "supabase/.temp/" 
 "supabase/.temp/" 
+.tmp/  
