@@ -65,14 +65,21 @@
     }
   },
   "submit": {
-    "staging": {
-      "android": {
-        "track": "internal"
-      }
-    },
     "production": {
       "android": {
-        "track": "production"
+        "track": "production",
+        "serviceAccountKeyPath": "../lexi-lens-secrets/play-service-account.json"
+      },
+      "ios": {
+        "ascAppId": "6766159881",
+        "appleId": "beautifulhearts.n@gmail.com",
+        "appleTeamId": "9A8R9ZM546"
+      }
+    },
+    "staging": {
+      "extends": "production",
+      "android": {
+        "track": "internal"
       }
     }
   }
