@@ -1,50 +1,59 @@
 /**
- * app.config.js — Lexi-Lens dynamic Expo config (v4.5.3)
+ * app.config.js — Lexi-Lens dynamic Expo config (v4.5.4)
  *
- * v4.5.3 (May 12, 2026) — Three changes, all driven by the v1.0.13 staging
- *                          crash on tester devices.
+ * v4.5.4 (May 13, 2026) — iOS SIGABRT fix + Apple ITMS-90683 warning preempt.
  *
- *   1. OTA startup check disabled (`checkAutomatically: 'NEVER'`).
- *      v1.0.13 staging build crashed every cold start with no Sentry events
- *      (crash is in expo-updates' Kotlin StartupProcedure, before JS init).
- *      Logcat: `dev.expo.updates: "Loaded new update but it failed to
- *      launch", "code":"UpdateFailedToLoad"`. Stacktrace path:
- *        StartupProcedure.run → LoaderTask.start → launchRemoteUpdate
- *        → DatabaseLauncher.launch (kt:79)
+ *   Diagnosis from .ips crash report (LexiLens-2026-05-12-220346.ips):
+ *     type:     EXC_CRASH / SIGABRT
+ *     proc:     "abort() called" from libsystem_c.dylib
+ *     queue:    "expo.controller.errorRecoveryQueue"
+ *     thread:   faulting thread 4, NSException bubbled to objc_exception_throw
+ *               → __cxa_throw → abort
  *
- *      Default expo-updates behaviour fetches + applies an OTA every cold
- *      start. We haven't been publishing OTAs deliberately, so the local
- *      update DB drifted into a bad state from earlier experiments / auto-
- *      publishes, and DatabaseLauncher.launch() threw on every launch.
- *      With 'NEVER', the embedded JS bundle always wins at startup. Manual
- *      `Updates.fetchUpdateAsync()` is still available the day we want OTAs
- *      intentionally (probably post-launch for JS-only hotfixes). To re-
- *      enable later: change this back to 'ON_LOAD' (default) or 'WIFI_ONLY'.
+ *   The Expo error-recovery handler itself threw an uncaught NSException
+ *   during cold-start init. checkAutomatically: 'NEVER' (v4.5.3) prevents
+ *   the network fetch but does NOT disarm the iOS error-recovery code path,
+ *   which still runs and crashes on stale/corrupt expo-updates DB state
+ *   left by earlier iOS submission attempts.
  *
- *   2. Version bumped 1.0.13 → 1.0.14.
- *      `runtimeVersion.policy: 'appVersion'` ties OTA runtime compatibility
- *      to the `version` field. Bumping the version invalidates any cached
- *      1.0.13 OTA bundle on tester devices. Without the bump, the bad
- *      cache could persist across the reinstall and re-crash even after
- *      the `checkAutomatically` fix.
+ *   Android dev validated the same Lumi 2.0 native deps work end-to-end,
+ *   so the iOS crash is iOS-specific (Android uses a different error
+ *   recovery code path that did NOT trigger).
  *
- *   3. IDENTIFIERS.staging cleaned up — single-application design.
- *      Previously the staging entry had `.staging` suffixes on iosBundle
- *      AND androidPackage. That was dead code at build time (EAS staging
- *      profile sets APP_VARIANT="production", which picks IDENTIFIERS.
- *      production), but the mismatch documented a two-application design
- *      that was explicitly rejected. Now: iosBundle and androidPackage
- *      match production. Only `name` ("Lexi-Lens (Staging)") and `scheme`
- *      ("lexilensstaging") differ — both safe per-build distinctions that
- *      don't create a second App Store / Play Console listing.
+ *   Fix: remove the `updates` block entirely. expo-updates is still
+ *   transitively in the binary (it's a default Expo SDK package) but with
+ *   no URL configured, the startup procedure short-circuits and the error
+ *   recovery queue is never armed.
  *
- *      Concrete intent: ONE Play Console listing for com.navinj.lexilore,
- *      ONE App Store Connect record for com.navinj.lexilens (ascAppId
- *      6766159881). Staging vs production distinguished by:
- *        • EAS channel (`staging` vs `production`)
- *        • Bundled Supabase env vars (`_STAGING` vs `_PROD` secrets)
- *        • Play Console track / TestFlight group
- *      NOT by bundle/package identity.
+ *   When we want OTAs back (probably post-launch for JS-only hotfixes):
+ *     1. Re-add the updates block with `checkAutomatically: 'ON_LOAD'`
+ *     2. Re-add the `runtimeVersion` block
+ *     3. Ship a fresh build at a new version number
+ *     4. Adopt smoke-test discipline before propagating each `eas update`
+ *
+ *   Also added (same drop, Apple ITMS-90683 warning preempt):
+ *     - NSLocationWhenInUseUsageDescription purpose string
+ *     - NSMicrophoneUsageDescription purpose string
+ *
+ *   Lexi-Lens does NOT use location or microphone APIs, but one of the
+ *   bundled native libraries (probably vision-camera or a transitive dep)
+ *   references CoreLocation symbols at the static analysis level. Apple
+ *   warned about this on the v1.0.14 (6) iOS submission. Adding honest
+ *   purpose strings satisfies the static check without prompting users —
+ *   the APIs are never actually called, so the prompts never appear.
+ *
+ *   Version bumped 1.0.14 → 1.0.15.
+ *     Without the updates block, the runtimeVersion policy is gone, but
+ *     a version bump is still good hygiene: Play Console / TestFlight
+ *     need monotonically increasing buildNumber, and a fresh installable
+ *     binary helps testers know they have the v4.5.4 fix.
+ *
+ * ─── v4.5.3 (rolled forward) — single-application design, retained ────────
+ *
+ *   The staging entry in IDENTIFIERS still has iosBundle and androidPackage
+ *   matching production. Only `name` ("Lexi-Lens (Staging)") and `scheme`
+ *   ("lexilensstaging") differ. ONE Play Console listing, ONE App Store
+ *   Connect record (ascAppId 6766159881).
  *
  * ─── Variant model ──────────────────────────────────────────────────────────
  *
@@ -52,48 +61,22 @@
  *   APP_VARIANT=staging      → com.navinj.lexilens      / com.navinj.lexilore   (same as prod; name+scheme differ)
  *   APP_VARIANT=development  → com.navinj.lexilens.dev  / com.navinj.lexilore.dev
  *
- *   IMPORTANT: production identifiers are FROZEN. The existing v1.0.11
- *   build lives in Play Console and Apple App Store Connect under those
- *   exact names. Renaming would create new app records and orphan testers.
+ *   Production identifiers FROZEN — renaming would orphan testers.
  *
- *   The URL scheme stays `lexilensstaging` for the staging variant —
- *   Info.plist is per-build, so deep-link routing (Supabase password reset
- *   emails, etc.) remains scoped per-environment even though the bundle ID
- *   is shared with production.
+ *   On Windows CMD, `eas submit` reads app.config.js locally with your
+ *   shell env. Always prefix submit commands with `set APP_VARIANT=production`
+ *   so the Android package resolves to com.navinj.lexilore (not .dev).
  *
- *   Android package `com.navinj.lexilore` is a typo of `lexilens`, but it
- *   has shipped — we keep it. Development variant uses the same typo for
- *   consistency.
+ * ─── EAS Secrets ──────────────────────────────────────────────────────────
  *
- * ─── Local development ─────────────────────────────────────────────────────
+ *   Two Supabase projects (env split is operational as of May 2026):
+ *     - zhnaxafmacygbhpvtwvf → staging (dev + tester builds bundle this)
+ *     - vwlfzvabvlcozqpepsoi → production (public launch bundles this)
  *
- *   The default fallback when APP_VARIANT is unset is 'development'. That
- *   means `eas submit` (which runs locally and reads app.config.js with
- *   your shell env) defaults to dev identifiers — which won't match the
- *   built AAB's identifiers. Workaround until we decide to flip the
- *   default: `set APP_VARIANT=production` in Windows CMD before running
- *   any `eas submit` command. See lexi-lens-eas-command-reference.docx §7.
- *
- *   For local Metro dev: copy `.env.example` → `.env.local` and set
- *   APP_VARIANT=development there. Expo loads .env.local automatically
- *   when you run `npm start`.
- *
- * ─── EAS Secrets setup (run once per profile) ─────────────────────────────
- *
- *   eas secret:create --scope project --name EXPO_PUBLIC_SUPABASE_URL_PROD       --value "https://<prod-ref>.supabase.co"
- *   eas secret:create --scope project --name EXPO_PUBLIC_SUPABASE_ANON_KEY_PROD  --value "eyJ..."
- *   eas secret:create --scope project --name EXPO_PUBLIC_SUPABASE_URL_STAGING    --value "https://<staging-ref>.supabase.co"
- *   eas secret:create --scope project --name EXPO_PUBLIC_SUPABASE_ANON_KEY_STAGING --value "eyJ..."
- *   eas secret:create --scope project --name EXPO_PUBLIC_SENTRY_DSN              --value "https://...@sentry.io/..."
- *
- *   Verify: eas secret:list
- *
- *   Current operational state (May 12, 2026): the env split is code-wired
- *   but the prod Supabase project has not been created. Both _STAGING and
- *   _PROD secrets point at the same project (zhnaxafmacygbhpvtwvf). The
- *   `production` build profile is therefore not yet shippable to public
- *   stores — staging-profile builds are the only safe path until the env
- *   split is operationally complete.
+ *   EAS env vars (clean state):
+ *     _STAGING suffix in development + preview + production EAS environments
+ *     _PROD suffix in production EAS environment only
+ *     SENTRY_AUTH_TOKEN (Secret) in all three for sourcemap upload
  */
 
 const VARIANT = (process.env.APP_VARIANT ?? 'development').trim();
@@ -109,9 +92,6 @@ const IDENTIFIERS = {
   },
   staging: {
     name:               'Lexi-Lens (Staging)',
-    // Single-application design — iOS bundle and Android package match
-    // production. See v4.5.3 header note #3. The "(Staging)" name and the
-    // distinct URL scheme are the only per-build distinctions.
     iosBundle:          'com.navinj.lexilens',
     androidPackage:     'com.navinj.lexilore',
     scheme:             'lexilensstaging',
@@ -138,7 +118,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.14',
+    version: '1.0.15',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -159,6 +139,16 @@ export default {
       infoPlist: {
         NSCameraUsageDescription:
           'Lexi-Lens uses your camera to scan real-world objects and bring vocabulary quests to life.',
+        // Required by Apple static analysis (ITMS-90683). A bundled native
+        // library references location APIs; Lexi-Lens does not actually
+        // request or use location. No user prompt will appear.
+        NSLocationWhenInUseUsageDescription:
+          'Lexi-Lens does not use your location. This declaration is required by a bundled library and the API is never actually called.',
+        // Required defensively. expo-audio iOS may probe microphone APIs
+        // via AVAudioSession even though Lexi-Lens only plays audio (Lumi
+        // sound cues). Lexi-Lens does not record audio.
+        NSMicrophoneUsageDescription:
+          'Lexi-Lens does not record audio. This declaration is required by a bundled audio library and the API is never actually called.',
         ITSAppUsesNonExemptEncryption: false,
         CFBundleURLTypes: [
           {
@@ -204,27 +194,36 @@ export default {
     ],
 
     extra: {
+      // extra.eas.projectId is the EAS project identifier — used by EAS
+      // Build, push notifications, and (when re-enabled) expo-updates.
+      // Same projectId across all variants; identifies the EAS project
+      // (@navinj/lexi-lens) not a specific environment. Do not remove.
       eas: {
         projectId: '7fe2d61b-242a-4de3-91a7-1422f6876164',
       },
       appVariant: VARIANT,
     },
 
-    // ── EAS Update ────────────────────────────────────────────────────────
-    // checkAutomatically: 'NEVER' added in v4.5.3 — see header for full
-    // reasoning. Embedded bundle always wins at startup. Flip back to
-    // 'ON_LOAD' (or remove the line, default is 'ON_LOAD') the day you
-    // start publishing OTAs intentionally. Until then, expo-updates is
-    // effectively dormant — no server pings, no auto-applied cached
-    // bundles on cold start.
-    updates: {
-      url: 'https://u.expo.dev/7fe2d61b-242a-4de3-91a7-1422f6876164',
-      fallbackToCacheTimeout: 0,
-      checkAutomatically: 'NEVER',
-    },
-    runtimeVersion: {
-      policy: 'appVersion',
-    },
+    // ── No updates block ─────────────────────────────────────────────────
+    //
+    // Removed in v4.5.4 to stop iOS expo-updates' error-recovery queue from
+    // arming on cold start (root cause of v1.0.14 iOS SIGABRT). See header
+    // for full context.
+    //
+    // To re-enable OTAs in a future release:
+    //
+    //   updates: {
+    //     url: 'https://u.expo.dev/7fe2d61b-242a-4de3-91a7-1422f6876164',
+    //     fallbackToCacheTimeout: 0,
+    //     checkAutomatically: 'ON_LOAD',  // or 'WIFI_ONLY'
+    //   },
+    //   runtimeVersion: {
+    //     policy: 'appVersion',
+    //   },
+    //
+    // Ship a fresh build, adopt the discipline of smoke-testing each
+    // `eas update` publish on a real tester device before letting the
+    // channel propagate.
 
     owner: 'navinj',
     scheme: id.scheme,
