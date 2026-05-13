@@ -1,90 +1,89 @@
 /**
- * app.config.js — Lexi-Lens dynamic Expo config (v4.5.4)
+ * app.config.js — Lexi-Lens dynamic Expo config (v4.5.5)
  *
- * v4.5.4 (May 13, 2026) — Five changes, all driven by definitive logcat
- *                          evidence that expo-updates is the root cause
- *                          on BOTH Android and iOS.
+ * v4.5.5 (May 13, 2026 evening) — Corrects v4.5.4. Reinstalls expo-updates
+ *                                  and disables it via `updates.enabled: false`
+ *                                  instead of uninstalling.
  *
- *   Smoking gun (Android logcat from v1.0.14 release build):
- *     E dev.expo.updates: "UpdatesController onBackgroundUpdateFinished"
- *     E dev.expo.updates: "Loaded new update but it failed to launch"
- *                         code: UpdateFailedToLoad
- *     E dev.expo.updates: "Failed to download remote update"
- *     E dev.expo.updates: "Unexpected error encountered while loading"
- *     E dev.expo.updates: "Failed to launch embedded or launchable update"
- *     E unknown:ReactHost: awaitDelayLoadAppWhenReady →
- *                          UpdatesPackage$invokeReadyRunnable
+ *   Why this matters:
+ *     v4.5.4 uninstalled expo-updates entirely (`npm uninstall expo-updates`).
+ *     This SHOULD have worked but did not — v1.0.15 iOS launched to a white
+ *     screen on TestFlight with no native crash and no .ips file generated.
  *
- *   What this proves:
- *     - `checkAutomatically: 'NEVER'` (v4.5.3) does NOT disable the
- *       expo-updates StartupProcedure. The procedure still runs,
- *       still goes to network, still fails.
- *     - The Expo ReactActivity's onCreate waits for expo-updates'
- *       invokeReadyRunnable to signal "app ready". When the procedure
- *       fails at every fallback, the signal never fires.
- *     - Android v1.0.14: black screen forever (ReactHost waits, app
- *       never advances past splash).
- *     - iOS v1.0.14: same root cause, different surface — iOS error
- *       recovery queue throws uncaught NSException → SIGABRT abort.
+ *   Root cause (per official expo-updates README):
+ *     Uninstalling the npm package alone is not enough. Per Expo's docs, you
+ *     must ALSO remove the build phase entry that runs:
+ *       ../node_modules/expo-updates/scripts/create-manifest-ios.sh
+ *     from the "Bundle React Native code and images" phase in Xcode.
  *
- *   Why the half-measure failed: `checkAutomatically: 'NEVER'`
- *   controls WHEN expo-updates checks for updates, not WHETHER its
- *   startup procedure integrates into the React boot sequence.
+ *     EAS Cloud's prebuild regenerates the iOS Xcode project on every build.
+ *     We cannot edit the project file from Windows (no Xcode). When the
+ *     build phase ran the missing script, it silently failed at producing
+ *     the expected manifest. AppDelegate's bundleURL() then either returned
+ *     nil or pointed at a non-existent embedded bundle. React Native
+ *     received no JS to execute. App launched, rendered nothing, no crash.
  *
- *   Changes in v4.5.4:
+ *     Symptom triplet confirms this diagnosis:
+ *       1. App launches past iOS sandbox provisioning ✓ (no SIGABRT)
+ *       2. White screen forever ✓ (no JS context, no React tree)
+ *       3. No .ips crash file ✓ (Swift nil-coalescing didn't crash, just no-op'd)
  *
- *   1. Remove `updates` block entirely.
- *      Combined with uninstalling expo-updates from package.json (see
- *      package.json patch), this removes the native module from the
- *      binary, eliminating the startup procedure entirely.
- *      ReactHost no longer waits on UpdatesPackage's ready signal.
+ *   The Expo-documented escape hatch:
+ *     "If you don't intend to use OTA updates, you can disable the module
+ *      by setting EXUpdatesEnabled=NO in Expo.plist and
+ *      expo.modules.updates.ENABLED=false in AndroidManifest.xml.
+ *      The module stays installed, no OTA code paths execute."
+ *     — https://github.com/expo/expo/tree/main/packages/expo-updates#disabling
  *
- *   2. Remove `runtimeVersion` block.
- *      Only meaningful when updates is configured.
+ *   How v4.5.5 implements this:
+ *     1. expo-updates is reinstalled (npm install — already done before edit)
+ *        → native code is back in the binary, AppDelegate references it,
+ *          bundleURL() resolves correctly, main.jsbundle gets embedded.
+ *     2. `updates.enabled: false` in this config
+ *        → Expo's autolinking writes EXUpdatesEnabled=NO into Expo.plist
+ *          and expo.modules.updates.ENABLED=false into AndroidManifest.xml.
+ *        → StartupProcedure short-circuits, errorRecoveryQueue is never armed,
+ *          UpdatesPackage.invokeReadyRunnable signals "ready" immediately
+ *          without going to network.
+ *     3. NO `runtimeVersion` block (only meaningful when enabled=true).
+ *     4. NO `updates.url` (no point if enabled=false).
  *
- *   3. Remove `ios.infoPlist.CFBundleURLTypes`.
- *      EAS prebuild warned: "ios: scheme: 'ios.infoPlist.
- *      CFBundleURLTypes' is set in the config. Ignoring abstract
- *      property 'scheme': lexilensdev". The duplicate was breaking
- *      `npx expo config --json --type introspect`. Top-level `scheme`
- *      property is the canonical way — Expo's plugin generates the
- *      Info.plist CFBundleURLTypes from it automatically.
+ *   What this fixes vs the previous attempts:
+ *     v1.0.13: default expo-updates → SIGABRT crashing cold-start
+ *     v1.0.14: checkAutomatically=NEVER, expo-updates still installed
+ *              → Android: ReactHost stuck waiting on UpdatesPackage.invokeReadyRunnable
+ *              → iOS: errorRecoveryQueue threw uncaught NSException → SIGABRT
+ *     v1.0.15: expo-updates UNINSTALLED, no updates block
+ *              → iOS: white screen (broken bundle embed due to stale Xcode build phase)
+ *              → Android: untested (build quota wall hit)
+ *     v1.0.16: expo-updates INSTALLED + enabled:false
+ *              → Native infrastructure intact, runtime cleanly disabled.
  *
- *   4. Add Info.plist purpose strings (Apple ITMS-90683 preempt).
- *      v1.0.14 (6) iOS submission received warning email:
- *        "ITMS-90683: Missing purpose string in Info.plist —
- *         NSLocationWhenInUseUsageDescription"
- *      A bundled native library (probably vision-camera transitive
- *      dep) references location APIs at static analysis level.
- *      Lexi-Lens does not use location; honest purpose string
- *      satisfies the static check without prompting users since the
- *      API is never actually called. Same for microphone (defensive,
- *      since expo-audio's iOS code paths may probe AVAudioSession).
+ *   Expected behavior after this fix:
+ *     - App launches past splash to auth screen normally
+ *     - No expo-updates errors in logcat / Sentry
+ *     - Sentry begins receiving events with release="staging@1.0.16"
+ *     - Lumi audio + orbit work as in dev validation
  *
- *   5. Version bumped 1.0.14 → 1.0.15.
- *      Fresh APK/IPA buildNumber. Play Console / TestFlight need
- *      monotonically increasing versionCode/buildNumber.
+ *   Rollback path if v1.0.16 still fails:
+ *     If iOS still white-screens after this, the bug is NOT in expo-updates.
+ *     Next investigation would be the Expo plugin chain (vision-camera,
+ *     Sentry plugin) or the @react-native-firebase peer dep (if present).
+ *     Would require WSL2 or Mac access to inspect generated AppDelegate.swift.
  *
- *   IMPORTANT — accompanying change required outside this file:
+ *   To turn OTAs ON later (probably post-launch, JS-only hotfixes):
+ *     1. Change `enabled: false` to `enabled: true` (or remove the field — defaults to true)
+ *     2. Add back `url: 'https://u.expo.dev/7fe2d61b-242a-4de3-91a7-1422f6876164'`
+ *     3. Add back `runtimeVersion: { policy: 'appVersion' }`
+ *     4. Build, then adopt smoke-test discipline before each `eas update` publish
  *
- *     Uninstall expo-updates from package.json:
- *       npm uninstall expo-updates
+ *   Apple ITMS-90683 fixes (carried from v4.5.4):
+ *     - NSLocationWhenInUseUsageDescription (vision-camera transitive)
+ *     - NSMicrophoneUsageDescription (defensive for expo-audio)
  *
- *     Verify after:
- *       grep "expo-updates" package.json     → no match
- *       grep -r "expo-updates" . --include="*.ts" --include="*.tsx"
- *         → no match (already verified: no app code imports it)
+ *   Version bumped 1.0.15 → 1.0.16. Fresh AAB/IPA, monotonic buildNumber.
  *
- *     No code imports expo-updates. Safe to remove.
- *
- *   If/when OTAs are wanted later (probably post-launch, JS-only
- *   hotfixes, with smoke-test discipline):
- *     1. `npm install expo-updates`
- *     2. Re-add `updates` block + `runtimeVersion` block to this file
- *     3. Fresh full rebuild
- *     4. Test on a single tester device before propagating channel
- *
- * ─── v4.5.3 (rolled forward) — single-application design ──────────────────
+ * ─── v4.5.3-v4.5.4 (rolled forward) — single-application design ───────────
  *
  *   IDENTIFIERS.staging.iosBundle and androidPackage match production.
  *   Only `name` ("Lexi-Lens (Staging)") and `scheme` ("lexilensstaging")
@@ -99,9 +98,9 @@
  *
  *   Production identifiers FROZEN — renaming would orphan existing testers.
  *
- *   Windows CMD gotcha: `eas submit` reads app.config.js locally with your
- *   shell env. With APP_VARIANT unset, falls back to 'development' →
- *   resolves to .dev package which doesn't exist on Play Console. Always:
+ *   Windows CMD reminder: `eas submit` reads app.config.js locally with your
+ *   shell env. With APP_VARIANT unset, falls back to 'development' → resolves
+ *   to .dev package which doesn't exist on Play Console. Always:
  *     set APP_VARIANT=production && eas submit ...
  *
  * ─── EAS Secrets (current operational state) ─────────────────────────────
@@ -110,7 +109,7 @@
  *     zhnaxafmacygbhpvtwvf → staging (dev + tester builds)
  *     vwlfzvabvlcozqpepsoi → production (public launch)
  *
- *   EAS environments (cleaned up May 13):
+ *   EAS environments:
  *     _STAGING suffix vars → all three envs (development, preview, production)
  *     _PROD suffix vars → production env only
  *     SENTRY_AUTH_TOKEN (Secret) → all three for sourcemap upload
@@ -155,7 +154,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.15',
+    version: '1.0.16',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -173,20 +172,14 @@ export default {
       entitlements: {
         'aps-environment': VARIANT === 'production' ? 'production' : 'development',
       },
-      // CFBundleURLTypes intentionally NOT set here — top-level `scheme`
-      // property below is the canonical way. Expo's plugin generates the
-      // Info.plist CFBundleURLTypes block from it automatically. Having
-      // both was breaking `npx expo config --type introspect`.
       infoPlist: {
         NSCameraUsageDescription:
           'Lexi-Lens uses your camera to scan real-world objects and bring vocabulary quests to life.',
-        // Required by Apple static analysis (ITMS-90683). A bundled
-        // native library references location APIs. Lexi-Lens does not
-        // use location — API is never called → no user prompt.
+        // Apple ITMS-90683 preempt. Bundled library references location APIs.
+        // Lexi-Lens does not actually use location → no user prompt.
         NSLocationWhenInUseUsageDescription:
           'Lexi-Lens does not use your location. This declaration is required by a bundled library and the API is never actually called.',
-        // Defensive — expo-audio iOS may probe AVAudioSession. Lexi-Lens
-        // plays audio (Lumi sound cues) but does not record audio.
+        // Defensive — expo-audio iOS may probe AVAudioSession.
         NSMicrophoneUsageDescription:
           'Lexi-Lens does not record audio. This declaration is required by a bundled audio library and the API is never actually called.',
         ITSAppUsesNonExemptEncryption: false,
@@ -229,29 +222,38 @@ export default {
     ],
 
     extra: {
-      // EAS project identifier — used by EAS Build, push notifications,
-      // and (if/when reintroduced) expo-updates. Same projectId across
-      // all variants. Identifies the EAS project (@navinj/lexi-lens),
-      // not a specific environment. Do not remove.
       eas: {
         projectId: '7fe2d61b-242a-4de3-91a7-1422f6876164',
       },
       appVariant: VARIANT,
     },
 
-    // ── No `updates` block — see v4.5.4 header note #1 ──────────────────
+    // ── expo-updates: installed but disabled ─────────────────────────────
     //
-    // expo-updates is also uninstalled from package.json. To bring OTAs
-    // back later: `npm install expo-updates`, re-add this block:
+    // expo-updates IS reinstalled in package.json (v1.0.16 onwards). The
+    // `enabled: false` setting tells Expo's plugin to write:
+    //   - EXUpdatesEnabled=NO into ios/Lexi-Lens/Supporting/Expo.plist
+    //   - expo.modules.updates.ENABLED=false into AndroidManifest.xml
     //
+    // Effect: native module compiles into binary (AppDelegate references
+    // remain valid, main.jsbundle embeds correctly), but the runtime
+    // StartupProcedure short-circuits and never goes to network or wait
+    // states. The previous failure modes (Android black-screen-forever,
+    // iOS SIGABRT in errorRecoveryQueue, v1.0.15 white screen) all came
+    // from the runtime side. With runtime disabled, none of them can fire.
+    //
+    // To turn OTAs ON in a future release:
     //   updates: {
     //     url: 'https://u.expo.dev/7fe2d61b-242a-4de3-91a7-1422f6876164',
-    //     fallbackToCacheTimeout: 0,
+    //     enabled: true,  // or omit (defaults to true)
     //     checkAutomatically: 'ON_LOAD',
     //   },
     //   runtimeVersion: {
     //     policy: 'appVersion',
     //   },
+    updates: {
+      enabled: false,
+    },
 
     owner: 'navinj',
     scheme: id.scheme,
