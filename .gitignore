@@ -53,3 +53,6 @@ node_modules/
 "supabase/.temp/" 
 .tmp/  
 supabase/.temp/ 
+credentials/ 
+credentials/ 
+credentials.json 
