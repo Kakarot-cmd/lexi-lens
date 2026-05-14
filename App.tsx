@@ -1,528 +1,526 @@
-// ─── Sentry: must be first import + call before anything else ─────────────────
+/**
+ * App.tsx — DIAGNOSTIC BUILD v1.0.21 (INSTRUMENTED)
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ *
+ * After three days and 9 iOS builds, we still don't know what's actually
+ * killing iOS Release builds on TestFlight. Symptoms:
+ *   • Android: works
+ *   • iOS v1.0.11 (no Lumi, no expo-audio, no react-native-worklets): worked
+ *   • iOS v1.0.13–v1.0.18: white screen, no .ips
+ *   • iOS v1.0.19 (minimal App.tsx): worked (red screen rendered)
+ *   • iOS v1.0.20 (lazy-loaded screens): white screen, no .ips
+ *
+ * Constraint: no Mac available, so we can't read iOS console.log or attach
+ * Xcode. The diagnostic has to be visible IN-APP on the device itself.
+ *
+ * ── Strategy ────────────────────────────────────────────────────────────────
+ *
+ * This file replaces the production App.tsx with a probe harness. It mounts
+ * a single screen showing a numbered checklist. Each item probes one suspect
+ * — a require()/import we believe might be silently failing in iOS Hermes
+ * Release mode. Probes run sequentially after first render so that:
+ *
+ *   1. The shell UI mounts before any risky import is touched (guaranteed
+ *      visible feedback even if a later probe halts JS execution).
+ *   2. Each probe wraps its require() in try/catch + setState — a failure
+ *      shows as a visible row with the error message rather than silently
+ *      crashing the bundle.
+ *   3. Each probe writes its status to AsyncStorage BEFORE attempting
+ *      anything risky, so the last-attempted probe is recoverable later
+ *      even if the entire app dies.
+ *
+ * ── How to read the result on TestFlight ────────────────────────────────────
+ *
+ * IDEAL outcome: app boots, you see a checklist, every row turns green.
+ *   That means the broken thing is NOT in this probe list — and the actual
+ *   bug is in production App.tsx code we haven't tested yet (navigation
+ *   mount, Sentry.wrap, store init, etc).
+ *
+ * MOST LIKELY outcome: probe list partially renders, then either:
+ *   (a) ONE row shows ✗ with an error message → that's the culprit, fix it.
+ *   (b) the screen freezes mid-probe (last visible item is ⏳ pending) →
+ *       the NEXT probe is the culprit.
+ *   (c) the screen never shows anything (white screen) → the failure is
+ *       in the imports above this comment, OR in the React/AsyncStorage
+ *       layer itself.
+ *
+ * WORST CASE: white screen, nothing on screen. Then we know the failure
+ * is in React itself or one of these top-level imports. We comment them
+ * out one at a time across the next build.
+ *
+ * ── What this file deliberately does NOT import at the top level ─────────────
+ *
+ *   ✗ Sentry (would call initSentry at module top — risky)
+ *   ✗ lib/env (calls assertEnvOrWarn at module top)
+ *   ✗ lib/supabase (creates client at module init)
+ *   ✗ NavigationContainer (its own complex init)
+ *   ✗ Any screen files
+ *   ✗ Lumi anything
+ *
+ * The ONLY external imports are:
+ *   • React + React Native primitives (proven to load — v1.0.19 worked)
+ *   • @react-native-async-storage/async-storage (proven to load —
+ *     supabase needed it in v1.0.19)
+ *
+ * Everything else is loaded via dynamic require() inside try/catch.
+ *
+ * ── Restore command after testing ───────────────────────────────────────────
+ *
+ *   git checkout main -- App.tsx
+ *
+ * Or revert just this file from the working tree using the commit hash
+ * before this one.
+ */
 
+import { useEffect, useState } from "react";
 import {
-  initSentry,
-  Sentry,
-  setUserContext,
-  clearUserContext,
-  addGameBreadcrumb,
-} from "./lib/sentry";
+  View,
+  Text,
+  ScrollView,
+  StyleSheet,
+  StatusBar,
+  Platform,
+} from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
-initSentry();
+const BUILD_TAG = "v1.0.21 instrumented · 2026-05-14";
+const STORAGE_KEY = "lexilens:diagnostic:probe-log";
 
-// ─── Env (also fires startup config validation) ──────────────────────────────
-
-import { ENV, assertEnvOrWarn } from "./lib/env";
-assertEnvOrWarn();
-
-// ─── React + RN ───────────────────────────────────────────────────────────────
-
-import { useEffect, useState, useCallback, useRef, lazy, Suspense } from "react";
-import { View, Text, ActivityIndicator, Platform, Linking, AppState } from "react-native";
-
-// ─── Navigation ───────────────────────────────────────────────────────────────
-
-import {
-  NavigationContainer,
-  useNavigationContainerRef,
-} from "@react-navigation/native";
-import { createNativeStackNavigator } from "@react-navigation/native-stack";
-
-// ─── Safe area ────────────────────────────────────────────────────────────────
-
-import { SafeAreaProvider } from "react-native-safe-area-context";
-
-// ─── Supabase ─────────────────────────────────────────────────────────────────
-
-import type { Session } from "@supabase/supabase-js";
-import { supabase } from "./lib/supabase";
-
-// ─── Auth flow store (v4.5: password recovery coordination) ─────────────────
-
-import { useAuthFlow, getAuthFlow } from "./lib/authFlow";
-
-// ─── Navigation param lists ───────────────────────────────────────────────────
-
-import type { RootStackParamList, AuthStackParamList } from "./types/navigation";
-
-// ─── Screens ──────────────────────────────────────────────────────────────────
+// Each probe describes one thing to test. Order matters — they run
+// sequentially so a halt at probe N tells us N+1 is the suspect.
 //
-// v4.5.8 (May 14, 2026) — iOS white-screen mitigation.
-//
-// Screens that transitively import from `../components/Lumi` are LAZY-LOADED.
-// That module pulls in `react-native-reanimated`, `expo-audio` (via lumiSounds),
-// and react-native-svg at module-init time. On iOS bridgeless + new arch
-// (RN 0.81, Hermes Release), at least one of those throws synchronously during
-// the JS bundle's module-resolution pass — Hermes catches it, no React tree
-// ever mounts, and you get a permanent white screen with no .ips crash and no
-// JS error handler to surface anything.
-//
-// v1.0.11 (the last working iOS build) had ZERO Lumi imports anywhere. The
-// regression range fe163d8..6b5e744 added the entire Lumi module + threaded
-// `import { LumiHUD } from '../components/Lumi'` into four screens, plus a
-// top-level `import { initLumiSounds } from './components/Lumi/lumiSounds'`
-// in this file. Android is unaffected because expo-audio's Android backend
-// is older + simpler.
-//
-// Strategy: defer all Lumi-transiting screens behind React.lazy. The Lumi
-// module + expo-audio only initialize when the user actually navigates to
-// one of these screens. AuthScreen renders first (eager, no Lumi) so the
-// app boots to login regardless of any Lumi crash. The crash, if it happens,
-// is now scoped to a single tab — caught by that screen's <ErrorBoundary>.
-//
-// Side benefits regardless of the iOS fix:
-//   • Faster cold start — less JS to parse before first paint.
-//   • Crash isolation — each screen's import tree is independent.
-//   • Diagnostic ergonomics — if a future regression breaks one screen,
-//     the rest of the app keeps working.
-//
-// Eagerly-imported screens (no Lumi in their import tree, proven safe in
-// v1.0.11): AuthScreen, ChildSwitcherScreen, SpellBookScreen,
-// QuestGeneratorScreen.
+// `fn` MUST be synchronous and SHOULD throw on failure. Inside fn it's
+// safe to call require() because we don't reach that code until the
+// component is mounted and we've already painted the row.
+type ProbeResult =
+  | { state: "pending" }
+  | { state: "running" }
+  | { state: "ok"; detail?: string }
+  | { state: "fail"; error: string };
 
-import { AuthScreen }          from "./screens/AuthScreen";
-import { ChildSwitcherScreen } from "./screens/ChildSwitcherScreen";
-import SpellBookScreen         from "./screens/SpellBookScreen";
-import QuestGeneratorScreen    from "./screens/QuestGeneratorScreen";
+type Probe = {
+  id: string;
+  label: string;
+  fn: () => string | void;  // optional detail string on success
+};
 
-// Lazy-loaded screens (import from ../components/Lumi). Each .then maps the
-// named export to .default so React.lazy gets the expected shape.
-const QuestMapScreen   = lazy(() =>
-  import("./screens/QuestMapScreen").then((m) => ({ default: m.QuestMapScreen })),
-);
-const ParentDashboard  = lazy(() =>
-  import("./screens/ParentDashboard").then((m) => ({ default: m.ParentDashboard })),
-);
-const OnboardingScreen = lazy(() =>
-  import("./screens/OnboardingScreen").then((m) => ({ default: m.OnboardingScreen })),
-);
+// Probes are ordered cheapest-and-most-fundamental first.
+// If probe 4 is the bug, probes 1-3 will all be green.
+const PROBES: Probe[] = [
+  {
+    id: "01-react-native",
+    label: "React Native primitives (Platform, View, Text)",
+    fn: () => `Platform.OS=${Platform.OS} v=${Platform.Version}`,
+  },
+  {
+    id: "02-async-storage-write",
+    label: "AsyncStorage write",
+    fn: () => {
+      // Verify the module exists and exposes the API we expect.
+      const has = typeof AsyncStorage?.setItem === "function";
+      if (!has) throw new Error("AsyncStorage.setItem is not a function");
+      return "import OK";
+    },
+  },
+  {
+    id: "03-supabase-import",
+    label: "@supabase/supabase-js import",
+    fn: () => {
+      const mod = require("@supabase/supabase-js");
+      if (!mod?.createClient) throw new Error("createClient missing");
+      return "createClient exported";
+    },
+  },
+  {
+    id: "04-url-polyfill",
+    label: "react-native-url-polyfill/auto",
+    fn: () => {
+      // This polyfill mutates globals at require time. If it crashes,
+      // every subsequent supabase call will be broken.
+      require("react-native-url-polyfill/auto");
+      return "polyfill loaded";
+    },
+  },
+  {
+    id: "05-zustand",
+    label: "zustand store",
+    fn: () => {
+      const { create } = require("zustand");
+      if (typeof create !== "function") throw new Error("create is not a function");
+      const store = create((set: any) => ({ x: 0, inc: () => set({ x: 1 }) }));
+      if (typeof store !== "function") throw new Error("store factory broken");
+      return "store factory OK";
+    },
+  },
+  {
+    id: "06-sentry-import",
+    label: "@sentry/react-native import (no init)",
+    fn: () => {
+      const Sentry = require("@sentry/react-native");
+      if (!Sentry?.init) throw new Error("Sentry.init missing");
+      return "module OK, init NOT called";
+    },
+  },
+  {
+    id: "07-reanimated-import",
+    label: "react-native-reanimated import",
+    fn: () => {
+      const RA = require("react-native-reanimated");
+      if (!RA?.default) throw new Error("Animated default missing");
+      const missing = ["useSharedValue", "withTiming", "withRepeat"].filter(
+        (k) => typeof RA[k] !== "function",
+      );
+      if (missing.length) throw new Error(`missing fns: ${missing.join(",")}`);
+      return "Animated + hook fns exported";
+    },
+  },
+  {
+    id: "08-worklets-import",
+    label: "react-native-worklets import (top suspect)",
+    fn: () => {
+      const W = require("react-native-worklets");
+      // The worklets runtime auto-initializes on require. If iOS Hermes
+      // Release silently halts, THIS is one of the most likely places.
+      const hasFn =
+        typeof W?.runOnJS === "function" ||
+        typeof W?.scheduleOnRN === "function";
+      if (!hasFn) throw new Error("scheduleOnRN/runOnJS missing");
+      return "worklets module OK";
+    },
+  },
+  {
+    id: "09-worklets-core-import",
+    label: "react-native-worklets-core import",
+    fn: () => {
+      const WC = require("react-native-worklets-core");
+      if (!WC) throw new Error("module returned falsy");
+      return "module OK";
+    },
+  },
+  {
+    id: "10-expo-audio-import",
+    label: "expo-audio import",
+    fn: () => {
+      const A = require("expo-audio");
+      if (!A) throw new Error("module returned falsy");
+      return "module OK";
+    },
+  },
+  {
+    id: "11-vision-camera-import",
+    label: "react-native-vision-camera import",
+    fn: () => {
+      const VC = require("react-native-vision-camera");
+      if (!VC?.Camera) throw new Error("Camera component missing");
+      return "Camera exported";
+    },
+  },
+  {
+    id: "12-navigation-container",
+    label: "@react-navigation/native NavigationContainer",
+    fn: () => {
+      const NN = require("@react-navigation/native");
+      if (!NN?.NavigationContainer) throw new Error("NavigationContainer missing");
+      return "import OK";
+    },
+  },
+  {
+    id: "13-native-stack",
+    label: "@react-navigation/native-stack",
+    fn: () => {
+      const NS = require("@react-navigation/native-stack");
+      if (!NS?.createNativeStackNavigator) throw new Error("createNativeStackNavigator missing");
+      return "import OK";
+    },
+  },
+  {
+    id: "14-safe-area",
+    label: "react-native-safe-area-context",
+    fn: () => {
+      const SA = require("react-native-safe-area-context");
+      if (!SA?.SafeAreaProvider) throw new Error("SafeAreaProvider missing");
+      return "import OK";
+    },
+  },
+  {
+    id: "15-lumi-mascot",
+    label: "components/Lumi/LumiMascot",
+    fn: () => {
+      const L = require("./components/Lumi/LumiMascot");
+      if (!L?.LumiMascot) throw new Error("LumiMascot export missing");
+      return "import OK";
+    },
+  },
+  {
+    id: "16-reanimated-runtime-call",
+    label: "Reanimated runtime: useSharedValue() call (THE BIG ONE)",
+    fn: () => {
+      // This is what actually triggers Reanimated's worklet runtime
+      // initialization. If the worklets bytecode is the bug, this is
+      // where it surfaces. Calling useSharedValue outside a component
+      // is technically unsupported — Reanimated may throw a "hook context"
+      // error, which is benign and reported as such. The error we CARE
+      // about is a native-side init failure.
+      const RA = require("react-native-reanimated");
+      try {
+        const sv = RA.useSharedValue(0);
+        return `useSharedValue returned ${typeof sv}`;
+      } catch (e: any) {
+        const msg = String(e?.message || e);
+        if (
+          msg.includes("Reanimated") &&
+          (msg.includes("native") || msg.includes("worklets") || msg.includes("initialize"))
+        ) {
+          throw new Error(`Reanimated native init failed: ${msg}`);
+        }
+        return `(hook context error — benign): ${msg.slice(0, 80)}`;
+      }
+    },
+  },
+];
 
-// ─── Components ───────────────────────────────────────────────────────────────
-
-import { ErrorBoundary }           from "./components/ErrorBoundary";
-import { AchievementToastOverlay } from "./components/AchievementToast";
-
-// ─── Store ────────────────────────────────────────────────────────────────────
-
-import { useGameStore } from "./store/gameStore";
-
-// ─── Analytics ────────────────────────────────────────────────────────────────
-
-import { useAnalytics } from "./hooks/useAnalytics";
-
-// ─── Lumi mascot (lazy) ──────────────────────────────────────────────────────
-//
-// v4.5.8 — Lumi imports are deferred. They previously loaded at module-init
-// time and (probably) crashed iOS Release builds during bundle resolution.
-// Now they load inside useEffect, AFTER the React tree mounts and AFTER
-// `useEffect` runs (i.e. AFTER first paint). Any failure becomes catchable
-// via try/catch, not a silent module-init crash.
-
-// ─── Web placeholder for Scan ─────────────────────────────────────────────────
-
-function ScanPlaceholder() {
-  return (
-    <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 32 }}>
-      <Text style={{ fontSize: 18, color: "#7c3aed", textAlign: "center" }}>
-        Camera scanning is only available on iOS and Android. Try Lexi-Lens on a phone or tablet.
-      </Text>
-    </View>
+export default function App() {
+  const [results, setResults] = useState<Record<string, ProbeResult>>(() =>
+    Object.fromEntries(PROBES.map((p) => [p.id, { state: "pending" }])),
   );
-}
 
-// v4.5.8 — ScanScreen is also lazy-loaded. It imports from ../components/Lumi
-// (LumiHUD) and is the heaviest screen in the tree (react-native-vision-camera,
-// useObjectScanner, useLexiEvaluate, VictoryFusionScreen, etc). Deferring it
-// until the user navigates to Scan keeps cold-start lean and isolates any
-// Lumi/vision-camera crash to that single screen.
-//
-// The Platform.OS === "web" branch keeps the existing placeholder behaviour
-// — we just wrap it as a Promise so React.lazy's contract is satisfied on
-// both branches.
-const ScanScreen = Platform.OS === "web"
-  ? lazy(() => Promise.resolve({ default: ScanPlaceholder }))
-  : lazy(() =>
-      import("./screens/ScanScreen").then((m) => ({ default: m.ScanScreen })),
-    );
-
-// ─── Navigators ───────────────────────────────────────────────────────────────
-
-const AuthNav = createNativeStackNavigator<AuthStackParamList>();
-const AppNav  = createNativeStackNavigator<RootStackParamList>();
-
-function AuthNavigator() {
-  return (
-    <AuthNav.Navigator screenOptions={{ headerShown: false }}>
-      <AuthNav.Screen name="Auth">
-        {() => (
-          <ErrorBoundary screen="AuthScreen">
-            <AuthScreen />
-          </ErrorBoundary>
-        )}
-      </AuthNav.Screen>
-    </AuthNav.Navigator>
-  );
-}
-
-function AppNavigator() {
-  // v4.5.8 — Shared fallback used by every <Suspense> boundary around a
-  // lazy-loaded screen. Minimal, brand-aligned, never visible for more than
-  // a few frames in practice (the screen module resolves on the next tick).
-  // Kept inside AppNavigator so it has no module-init impact.
-  const LazyScreenFallback = () => (
-    <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#0f0620" }}>
-      <ActivityIndicator size="large" color="#a78bfa" />
-    </View>
-  );
-
-  return (
-    <AppNav.Navigator screenOptions={{ headerShown: false }}>
-      <AppNav.Screen name="ChildSwitcher">
-        {(props) => (
-          <ErrorBoundary screen="ChildSwitcherScreen">
-            <ChildSwitcherScreen {...props} />
-          </ErrorBoundary>
-        )}
-      </AppNav.Screen>
-
-      <AppNav.Screen name="QuestMap">
-        {(props) => (
-          <ErrorBoundary screen="QuestMapScreen">
-            <Suspense fallback={<LazyScreenFallback />}>
-              <QuestMapScreen {...props} />
-            </Suspense>
-          </ErrorBoundary>
-        )}
-      </AppNav.Screen>
-
-      <AppNav.Screen name="Scan">
-        {(props) => (
-          <ErrorBoundary screen="ScanScreen">
-            <Suspense fallback={<LazyScreenFallback />}>
-              <ScanScreen {...props} />
-            </Suspense>
-          </ErrorBoundary>
-        )}
-      </AppNav.Screen>
-
-      <AppNav.Screen name="ParentDashboard">
-        {(props) => (
-          <ErrorBoundary screen="ParentDashboard">
-            <Suspense fallback={<LazyScreenFallback />}>
-              <ParentDashboard {...props} />
-            </Suspense>
-          </ErrorBoundary>
-        )}
-      </AppNav.Screen>
-
-      <AppNav.Screen name="SpellBook">
-        {(props) => (
-          <ErrorBoundary screen="SpellBookScreen">
-            <SpellBookScreen {...props} />
-          </ErrorBoundary>
-        )}
-      </AppNav.Screen>
-
-      <AppNav.Screen name="QuestGenerator">
-        {({ navigation }) => (
-          <ErrorBoundary screen="QuestGeneratorScreen">
-            <QuestGeneratorScreen
-              visible={true}
-              onClose={() => navigation.goBack()}
-            />
-          </ErrorBoundary>
-        )}
-      </AppNav.Screen>
-
-      <AppNav.Screen name="Onboarding">
-        {(props) => (
-          <ErrorBoundary screen="OnboardingScreen">
-            <Suspense fallback={<LazyScreenFallback />}>
-              <OnboardingScreen {...props} />
-            </Suspense>
-          </ErrorBoundary>
-        )}
-      </AppNav.Screen>
-    </AppNav.Navigator>
-  );
-}
-
-// ─── Root component ───────────────────────────────────────────────────────────
-
-function App() {
-  const [session, setSession]           = useState<Session | null>(null);
-  const [initialising, setInitialising] = useState(true);
-  const activeChild                     = useGameStore((s) => s.activeChild);
-
-  // v4.5 — password recovery state. Starts false, flipped true by deep link
-  // or PASSWORD_RECOVERY auth event, cleared by AuthScreen after updateUser.
-  const recoveryActive = useAuthFlow((s) => s.recoveryActive);
-
-  const navigationRef = useNavigationContainerRef();
-
-  // ── Lumi sound bootstrap (once at app start) ──────────────────────────────
-  // v4.5.8 — dynamic import so a module-init failure in expo-audio or the
-  // Lumi tree cannot crash the JS bundle. Any error is logged + swallowed;
-  // the app boots regardless of sound init success.
+  // After first paint, run probes sequentially. The setTimeout yields control
+  // back to the renderer between probes so each row visibly updates.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const lumiSounds = await import("./components/Lumi/lumiSounds");
+
+    const log: Array<{ id: string; ok: boolean; detail: string }> = [];
+
+    async function run() {
+      for (const probe of PROBES) {
         if (cancelled) return;
-        await lumiSounds.initLumiSounds();
-      } catch (err) {
-        // Sound init failures are non-fatal — kids still get the game.
-        console.warn("[Lumi] sound init skipped:", err);
+
+        setResults((r) => ({ ...r, [probe.id]: { state: "running" } }));
+
+        await AsyncStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({
+            tag: BUILD_TAG,
+            lastAttempted: probe.id,
+            log,
+            ts: Date.now(),
+          }),
+        ).catch(() => {});
+
+        // Give React one frame to paint the "running" state.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        try {
+          const detail = probe.fn() ?? "";
+          if (cancelled) return;
+          setResults((r) => ({ ...r, [probe.id]: { state: "ok", detail } }));
+          log.push({ id: probe.id, ok: true, detail });
+        } catch (e: any) {
+          if (cancelled) return;
+          const msg = String(e?.message || e);
+          setResults((r) => ({
+            ...r,
+            [probe.id]: { state: "fail", error: msg },
+          }));
+          log.push({ id: probe.id, ok: false, detail: msg });
+        }
+
+        await AsyncStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({
+            tag: BUILD_TAG,
+            lastCompleted: probe.id,
+            log,
+            ts: Date.now(),
+          }),
+        ).catch(() => {});
       }
-    })();
+    }
+
+    run().catch((e) => {
+      console.warn("[probe] runner threw:", e);
+    });
+
     return () => { cancelled = true; };
   }, []);
 
-  // ── Auth listener ──────────────────────────────────────────────────────────
+  const failed = Object.entries(results).find(([, r]) => r.state === "fail");
+  const allDone = Object.values(results).every(
+    (r) => r.state === "ok" || r.state === "fail",
+  );
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session: s } }) => {
-      setSession(s);
-      setInitialising(false);
-    });
+  const bannerColor = failed
+    ? "#dc2626"           // red — found a culprit
+    : allDone
+      ? "#16a34a"         // green — all probes passed
+      : "#0f0620";        // brand dark — still running
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (event, s) => {
-        setSession(s);
-
-        // v4.5 — if Supabase tells us this session was reached via the
-        // password recovery flow, flip authFlow into recovery mode so the
-        // app stays on AuthScreen until the new password is saved.
-        if (event === "PASSWORD_RECOVERY") {
-          getAuthFlow().beginRecovery();
-          addGameBreadcrumb({
-            category: "auth",
-            message:  "PASSWORD_RECOVERY event — entering reset_confirm mode",
-          });
-        }
-
-        if (!s) {
-          clearUserContext();
-          addGameBreadcrumb({ category: "auth", message: "User signed out" });
-        } else {
-          addGameBreadcrumb({
-            category: "auth",
-            message:  "Session established",
-            data:     { userId: s.user.id, event },
-          });
-        }
-      },
-    );
-
-    // ── Deep-link handler ────────────────────────────────────────────────────
-    const handleDeepLink = async ({ url }: { url: string | null }) => {
-      if (!url) return;
-      try {
-        const parsed = new URL(url);
-
-        // v4.5 — recognise the password-reset path BEFORE token exchange so
-        // AuthScreen can route to reset_confirm even if the auth event lags.
-        const isResetPath =
-          url.includes("auth/reset") ||
-          parsed.searchParams.get("type") === "recovery";
-
-        if (isResetPath) {
-          getAuthFlow().beginRecovery();
-        }
-
-        // PKCE code exchange — Supabase JS v2 default
-        const code = parsed.searchParams.get("code");
-        if (code) {
-          const { error } = await supabase.auth.exchangeCodeForSession(code);
-          if (error) {
-            addGameBreadcrumb({
-              category: "auth",
-              message:  "Code exchange failed",
-              data:     { error: error.message, isResetPath },
-            });
-          }
-          return;
-        }
-
-        // Legacy implicit-flow fragment: #access_token=…&refresh_token=…
-        const fragment = parsed.hash.replace(/^#/, "");
-        if (fragment) {
-          const params = new URLSearchParams(fragment);
-          const access_token  = params.get("access_token");
-          const refresh_token = params.get("refresh_token");
-          const type          = params.get("type");
-          if (access_token && refresh_token) {
-            await supabase.auth.setSession({ access_token, refresh_token });
-          }
-          if (type === "recovery") {
-            getAuthFlow().beginRecovery();
-          }
-        }
-      } catch {
-        // Malformed / unrelated URL — ignore
-      }
-    };
-
-    Linking.getInitialURL().then((url) => handleDeepLink({ url }));
-    const linkingSub = Linking.addEventListener("url", handleDeepLink);
-
-    return () => {
-      subscription.unsubscribe();
-      linkingSub.remove();
-    };
-  }, []);
-
-  // ── Sentry user context — sync whenever active child changes ──────────────
-  useEffect(() => {
-    if (activeChild && session?.user) {
-      setUserContext({
-        childId: activeChild.id,
-        parentId: session.user.id,
-        childAge: parseInt(activeChild.age_band?.split("-")[1] ?? "8", 10),
-      });
-      addGameBreadcrumb({
-        category: "auth",
-        message: "Active child set",
-        data: { childId: activeChild.id },
-      });
-    }
-  }, [activeChild?.id, session?.user?.id]);
-
-  // ── Lumi daily greeting ────────────────────────────────────────────────────
-  // v4.5.8 — dynamic imports; same rationale as the sound bootstrap above.
-  useEffect(() => {
-    if (!session || !activeChild?.id) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const [greeting, sounds] = await Promise.all([
-          import("./components/Lumi/lumiGreeting"),
-          import("./components/Lumi/lumiSounds"),
-        ]);
-        if (cancelled) return;
-        const greet = await greeting.shouldGreetToday();
-        if (cancelled || !greet) return;
-        sounds.playLumiGreeting();
-        await greeting.markGreetedToday();
-      } catch {
-        // Non-fatal
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [session?.user?.id, activeChild?.id]);
-
-  // ── Game-session lifecycle — Phase 3.7 ─────────────────────────────────────
-  const { startSession, endSession } = useAnalytics();
-  const screenSequenceRef = useRef<string[]>([]);
-
-  useEffect(() => {
-    if (!activeChild?.id) return;
-
-    screenSequenceRef.current = [];
-    useGameStore.getState().resetSessionCounters();
-
-    const initialRoute = navigationRef.isReady()
-      ? navigationRef.getCurrentRoute()
-      : null;
-    if (initialRoute?.name) {
-      screenSequenceRef.current.push(initialRoute.name);
-    }
-
-    startSession();
-
-    return () => {
-      const c = useGameStore.getState().sessionCounters;
-      endSession({
-        questsStarted:  c.questsStarted,
-        questsFinished: c.questsFinished,
-        xpEarned:       c.xpEarned,
-        screenSequence: screenSequenceRef.current,
-      });
-    };
-  }, [activeChild?.id, startSession, endSession]);
-
-  useEffect(() => {
-    if (!activeChild?.id) return;
-
-    const subscription = AppState.addEventListener("change", (nextState) => {
-      if (nextState === "background" || nextState === "inactive") {
-        const c = useGameStore.getState().sessionCounters;
-        endSession({
-          questsStarted:  c.questsStarted,
-          questsFinished: c.questsFinished,
-          xpEarned:       c.xpEarned,
-          screenSequence: screenSequenceRef.current,
-        });
-      } else if (nextState === "active") {
-        screenSequenceRef.current = [];
-        useGameStore.getState().resetSessionCounters();
-
-        const route = navigationRef.isReady()
-          ? navigationRef.getCurrentRoute()
-          : null;
-        if (route?.name) {
-          screenSequenceRef.current.push(route.name);
-        }
-
-        startSession();
-      }
-    });
-
-    return () => subscription.remove();
-  }, [activeChild?.id, startSession, endSession]);
-
-  // ── Screen-change breadcrumb ───────────────────────────────────────────────
-
-  const handleNavigationStateChange = useCallback(() => {
-    if (!navigationRef.isReady()) return;
-    const route = navigationRef.getCurrentRoute();
-    if (route) {
-      addGameBreadcrumb({
-        category: "navigation",
-        message:  `→ ${route.name}`,
-        data:     { routeName: route.name },
-      });
-      Sentry.setTag("active_screen", route.name);
-
-      const seq = screenSequenceRef.current;
-      if (seq[seq.length - 1] !== route.name) {
-        seq.push(route.name);
-      }
-    }
-  }, []);
-
-  // ── Loading splash ─────────────────────────────────────────────────────────
-
-  if (initialising) {
-    return (
-      <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center" }}>
-        <ActivityIndicator color="#f5c842" size="large" />
+  return (
+    <View style={styles.root}>
+      <StatusBar barStyle="light-content" backgroundColor={bannerColor} />
+      <View style={[styles.banner, { backgroundColor: bannerColor }]}>
+        <Text style={styles.title}>LEXI-LENS DIAGNOSTIC</Text>
+        <Text style={styles.subtitle}>{BUILD_TAG}</Text>
+        <Text style={styles.summary}>
+          {failed
+            ? `✗ FAILED at: ${failed[0]}`
+            : allDone
+              ? `✓ All ${PROBES.length} probes passed`
+              : `Running ${Object.values(results).filter((r) => r.state !== "pending").length}/${PROBES.length}…`}
+        </Text>
       </View>
-    );
-  }
 
-  // v4.5 — show AuthNavigator if there's no session OR if we're in
-  // password-recovery mode (session exists but parent must reset password
-  // before reaching the game).
-  const showAuth = !session || recoveryActive;
+      <ScrollView style={styles.list} contentContainerStyle={{ paddingBottom: 40 }}>
+        {PROBES.map((probe, idx) => {
+          const r = results[probe.id];
+          const icon =
+            r.state === "ok"
+              ? "✓"
+              : r.state === "fail"
+                ? "✗"
+                : r.state === "running"
+                  ? "⏳"
+                  : "·";
+          const color =
+            r.state === "ok"
+              ? "#16a34a"
+              : r.state === "fail"
+                ? "#dc2626"
+                : r.state === "running"
+                  ? "#eab308"
+                  : "#94a3b8";
+          return (
+            <View key={probe.id} style={styles.row}>
+              <View style={styles.rowHeader}>
+                <Text style={[styles.icon, { color }]}>{icon}</Text>
+                <Text style={styles.idx}>
+                  {String(idx + 1).padStart(2, "0")}
+                </Text>
+                <Text style={styles.label} numberOfLines={2}>
+                  {probe.label}
+                </Text>
+              </View>
+              {r.state === "ok" && r.detail ? (
+                <Text style={styles.detail}>  → {r.detail}</Text>
+              ) : null}
+              {r.state === "fail" ? (
+                <Text style={styles.error}>  → {r.error}</Text>
+              ) : null}
+            </View>
+          );
+        })}
 
-  return (
-    <ErrorBoundary screen="App">
-      <SafeAreaProvider>
-        <NavigationContainer
-          ref={navigationRef}
-          onStateChange={handleNavigationStateChange}
-        >
-          {showAuth ? <AuthNavigator /> : <AppNavigator />}
-        </NavigationContainer>
+        {failed ? (
+          <View style={styles.footerBox}>
+            <Text style={styles.footerTitle}>NEXT STEP</Text>
+            <Text style={styles.footerBody}>
+              Send a screenshot of this screen. The row with ✗ is the
+              culprit. The next build fixes that specific thing.
+            </Text>
+          </View>
+        ) : null}
 
-        {/* N4 — Badge toast overlay */}
-        <AchievementToastOverlay />
-
-      </SafeAreaProvider>
-    </ErrorBoundary>
+        {allDone && !failed ? (
+          <View style={[styles.footerBox, { borderColor: "#16a34a" }]}>
+            <Text style={[styles.footerTitle, { color: "#16a34a" }]}>
+              ALL PROBES PASSED
+            </Text>
+            <Text style={styles.footerBody}>
+              Every suspect module imports cleanly on this iOS device. The
+              white screen in v1.0.20 is caused by something downstream of
+              these imports — most likely the NavigationContainer mount,
+              one of the screen components, or Sentry.wrap. The next build
+              probes those.
+            </Text>
+          </View>
+        ) : null}
+      </ScrollView>
+    </View>
   );
 }
 
-export default ENV.sentry.dsn ? Sentry.wrap(App) : App;
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: "#0f0620" },
+  banner: {
+    paddingTop: 60,
+    paddingBottom: 16,
+    paddingHorizontal: 20,
+    alignItems: "center",
+  },
+  title: {
+    color: "#fef2f2",
+    fontSize: 18,
+    fontWeight: "800",
+    letterSpacing: 1.5,
+  },
+  subtitle: {
+    color: "#fecaca",
+    fontSize: 11,
+    letterSpacing: 2,
+    marginTop: 2,
+    textTransform: "uppercase",
+  },
+  summary: {
+    color: "#fef2f2",
+    fontSize: 14,
+    fontWeight: "600",
+    marginTop: 10,
+  },
+  list: { flex: 1 },
+  row: {
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "rgba(255,255,255,0.08)",
+  },
+  rowHeader: { flexDirection: "row", alignItems: "center" },
+  icon: { fontSize: 18, width: 24, textAlign: "center" },
+  idx: {
+    color: "#94a3b8",
+    fontSize: 13,
+    fontVariant: ["tabular-nums"],
+    width: 32,
+    marginLeft: 4,
+  },
+  label: {
+    color: "#e2e8f0",
+    fontSize: 14,
+    flex: 1,
+    marginLeft: 4,
+  },
+  detail: {
+    color: "#86efac",
+    fontSize: 11,
+    marginLeft: 68,
+    marginTop: 2,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+  },
+  error: {
+    color: "#fca5a5",
+    fontSize: 11,
+    marginLeft: 68,
+    marginTop: 2,
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+  },
+  footerBox: {
+    marginTop: 20,
+    marginHorizontal: 20,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "#dc2626",
+    borderRadius: 8,
+  },
+  footerTitle: {
+    color: "#fca5a5",
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 1.5,
+    marginBottom: 8,
+  },
+  footerBody: {
+    color: "#cbd5e1",
+    fontSize: 13,
+    lineHeight: 18,
+  },
+});
