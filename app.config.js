@@ -1,87 +1,103 @@
 /**
- * app.config.js — Lexi-Lens dynamic Expo config (v4.5.5)
+ * app.config.js — Lexi-Lens dynamic Expo config (v4.5.6)
  *
- * v4.5.5 (May 13, 2026 evening) — Corrects v4.5.4. Reinstalls expo-updates
- *                                  and disables it via `updates.enabled: false`
- *                                  instead of uninstalling.
+ * v4.5.6 (May 14, 2026) — iOS Build 17 white-screen root cause hypothesis.
  *
- *   Why this matters:
- *     v4.5.4 uninstalled expo-updates entirely (`npm uninstall expo-updates`).
- *     This SHOULD have worked but did not — v1.0.15 iOS launched to a white
- *     screen on TestFlight with no native crash and no .ips file generated.
+ *   What v4.5.5 / v1.0.16-17 got right:
+ *     The Android-side fix (expo-updates installed + enabled:false) is
+ *     confirmed working — local Gradle AAB boots cleanly on Play Internal.
  *
- *   Root cause (per official expo-updates README):
- *     Uninstalling the npm package alone is not enough. Per Expo's docs, you
- *     must ALSO remove the build phase entry that runs:
- *       ../node_modules/expo-updates/scripts/create-manifest-ios.sh
- *     from the "Bundle React Native code and images" phase in Xcode.
+ *   What v4.5.5 / v1.0.16-17 got wrong:
+ *     The assumption that the same plugin change would propagate cleanly to
+ *     iOS via `EXUpdatesEnabled=NO` in Expo.plist was extrapolation, not
+ *     verification. v1.0.17 (Build 17) on TestFlight: complete white screen,
+ *     no .ips crash file, confirmed across multiple devices.
  *
- *     EAS Cloud's prebuild regenerates the iOS Xcode project on every build.
- *     We cannot edit the project file from Windows (no Xcode). When the
- *     build phase ran the missing script, it silently failed at producing
- *     the expected manifest. AppDelegate's bundleURL() then either returned
- *     nil or pointed at a non-existent embedded bundle. React Native
- *     received no JS to execute. App launched, rendered nothing, no crash.
+ *   The actual iOS-specific issue (separate from the Android updates problem):
  *
- *     Symptom triplet confirms this diagnosis:
- *       1. App launches past iOS sandbox provisioning ✓ (no SIGABRT)
- *       2. White screen forever ✓ (no JS context, no React tree)
- *       3. No .ips crash file ✓ (Swift nil-coalescing didn't crash, just no-op'd)
+ *     React Native 0.81 + Expo SDK 54 introduced precompiled iOS XCFrameworks
+ *     (ReactNativeDependencies, RNCore) shipped as binaries alongside source.
+ *     The auto-generated Podfile from `npx expo prebuild` contains:
  *
- *   The Expo-documented escape hatch:
- *     "If you don't intend to use OTA updates, you can disable the module
- *      by setting EXUpdatesEnabled=NO in Expo.plist and
- *      expo.modules.updates.ENABLED=false in AndroidManifest.xml.
- *      The module stays installed, no OTA code paths execute."
- *     — https://github.com/expo/expo/tree/main/packages/expo-updates#disabling
+ *       ENV['RCT_USE_RN_DEP']        = '1' if buildReactNativeFromSource != 'true'
+ *                                          && newArchEnabled != 'false'
+ *       ENV['RCT_USE_PREBUILT_RNCORE'] = '1' if buildReactNativeFromSource != 'true'
+ *                                          && newArchEnabled != 'false'
  *
- *   How v4.5.5 implements this:
- *     1. expo-updates is reinstalled (npm install — already done before edit)
- *        → native code is back in the binary, AppDelegate references it,
- *          bundleURL() resolves correctly, main.jsbundle gets embedded.
- *     2. `updates.enabled: false` in this config
- *        → Expo's autolinking writes EXUpdatesEnabled=NO into Expo.plist
- *          and expo.modules.updates.ENABLED=false into AndroidManifest.xml.
- *        → StartupProcedure short-circuits, errorRecoveryQueue is never armed,
- *          UpdatesPackage.invokeReadyRunnable signals "ready" immediately
- *          without going to network.
- *     3. NO `runtimeVersion` block (only meaningful when enabled=true).
- *     4. NO `updates.url` (no point if enabled=false).
+ *     Our config:
+ *       newArchEnabled: true             → 2nd clause satisfied
+ *       buildReactNativeFromSource unset → 1st clause satisfied
  *
- *   What this fixes vs the previous attempts:
- *     v1.0.13: default expo-updates → SIGABRT crashing cold-start
- *     v1.0.14: checkAutomatically=NEVER, expo-updates still installed
- *              → Android: ReactHost stuck waiting on UpdatesPackage.invokeReadyRunnable
- *              → iOS: errorRecoveryQueue threw uncaught NSException → SIGABRT
- *     v1.0.15: expo-updates UNINSTALLED, no updates block
- *              → iOS: white screen (broken bundle embed due to stale Xcode build phase)
- *              → Android: untested (build quota wall hit)
- *     v1.0.16: expo-updates INSTALLED + enabled:false
- *              → Native infrastructure intact, runtime cleanly disabled.
+ *     Result: EAS Cloud builds iOS with both precompiled XCFrameworks.
  *
- *   Expected behavior after this fix:
- *     - App launches past splash to auth screen normally
- *     - No expo-updates errors in logcat / Sentry
- *     - Sentry begins receiving events with release="staging@1.0.16"
- *     - Lumi audio + orbit work as in dev validation
+ *     RN 0.81.0 had a known bug: Release builds using these precompiled
+ *     XCFrameworks shipped without proper code signing on the frameworks,
+ *     causing iOS to fail to load them silently at app launch. The reported
+ *     fix shipped in 0.81.1 (we're on 0.81.5), but the community discussion
+ *     thread (RN proposals #923) shows ongoing reports through late 2025/2026
+ *     of precompiled-binary code signing failures with various library
+ *     combinations on Release builds — particularly with autolinked native
+ *     modules that touch React's bridge (Sentry, Vision Camera, Reanimated).
  *
- *   Rollback path if v1.0.16 still fails:
- *     If iOS still white-screens after this, the bug is NOT in expo-updates.
- *     Next investigation would be the Expo plugin chain (vision-camera,
- *     Sentry plugin) or the @react-native-firebase peer dep (if present).
- *     Would require WSL2 or Mac access to inspect generated AppDelegate.swift.
+ *     Symptom triplet matches our Build 17 exactly:
+ *       1. App installs cleanly via TestFlight ✓
+ *       2. App launches, splash dismisses ✓
+ *       3. White screen forever, no .ips, no Sentry events ✓
  *
- *   To turn OTAs ON later (probably post-launch, JS-only hotfixes):
- *     1. Change `enabled: false` to `enabled: true` (or remove the field — defaults to true)
- *     2. Add back `url: 'https://u.expo.dev/7fe2d61b-242a-4de3-91a7-1422f6876164'`
- *     3. Add back `runtimeVersion: { policy: 'appVersion' }`
- *     4. Build, then adopt smoke-test discipline before each `eas update` publish
+ *     This pattern is consistent with: framework loaded into process address
+ *     space but RN's bridgeless init can't find required symbols (code
+ *     signing rejection on launch causes silent symbol resolution failure
+ *     in the bridgeless path on iOS). No exception is thrown — the JS engine
+ *     simply never gets a bundle to execute.
  *
- *   Apple ITMS-90683 fixes (carried from v4.5.4):
- *     - NSLocationWhenInUseUsageDescription (vision-camera transitive)
- *     - NSMicrophoneUsageDescription (defensive for expo-audio)
+ *   The fix:
+ *     Set `expo-build-properties.ios.buildReactNativeFromSource: true`.
  *
- *   Version bumped 1.0.15 → 1.0.16. Fresh AAB/IPA, monotonic buildNumber.
+ *   What this does:
+ *     Disables RCT_USE_RN_DEP and RCT_USE_PREBUILT_RNCORE in the generated
+ *     Podfile. EAS Cloud will compile React Native and its dependencies from
+ *     source instead of pulling the precompiled XCFrameworks. The resulting
+ *     binary embeds RN code signed by EAS's iOS signing keychain — same as
+ *     every other native module in the app, no codesign mismatch possible.
+ *
+ *   Trade-off:
+ *     iOS EAS build time will go up by roughly 5–10 minutes (precompiled was
+ *     introduced specifically to speed builds). Acceptable for now — we're
+ *     not iterating on iOS native code, just shipping JS changes.
+ *
+ *   Confidence:
+ *     Strong but not certain. The hypothesis fits the symptom precisely and
+ *     is grounded in documented Expo/RN behavior. If Build 18 still
+ *     white-screens after this fix, the issue is NOT precompiled XCFrameworks
+ *     and we move to the next hypothesis — likely New Arch + library
+ *     interaction (Reanimated 4 + Worklets + Vision Camera 4.7).
+ *
+ *   Fallback plan if v1.0.18 also fails:
+ *     1. Set `newArchEnabled: false` and build v1.0.19 — eliminates the
+ *        bridgeless code path entirely. Most aggressive isolation.
+ *     2. Comment out `Sentry.wrap(App)` in App.tsx — rules out Sentry SDK
+ *        interaction with bridgeless RN.
+ *     3. Strip App.tsx down to a single colored View rendering "OK" — proves
+ *        whether ANY JS executes on iOS. If yes → app code issue. If no →
+ *        native bundle/framework issue.
+ *
+ *   Version bumped 1.0.17 → 1.0.18.
+ *
+ * ─── v4.5.5 (rolled forward, historical context) ─────────────────────────────
+ *
+ *   v4.5.5 reinstalled expo-updates and set `enabled: false`. This was the
+ *   right call for Android — Android v1.0.16/17 boots cleanly with this
+ *   config. The fix propagates to AndroidManifest.xml as
+ *   `expo.modules.updates.ENABLED=false` which short-circuits the
+ *   StartupProcedure before DatabaseLauncher.launch can hang.
+ *
+ *   The iOS-side propagation (EXUpdatesEnabled=NO in Expo.plist) was
+ *   syntactically correct but did not address the actual iOS white-screen
+ *   root cause, which is the precompiled XCFramework issue documented above.
+ *
+ *   The `updates: { enabled: false }` block remains intact in this version
+ *   for the Android benefit. iOS will additionally get the from-source RN
+ *   build, addressing both issues independently.
  *
  * ─── v4.5.3-v4.5.4 (rolled forward) — single-application design ───────────
  *
@@ -154,7 +170,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.17',
+    version: '1.0.18',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -208,6 +224,22 @@ export default {
         {
           ios: {
             deploymentTarget: '16.0',
+            // ── v4.5.6 (May 14, 2026) — iOS Build 17 white-screen fix ────────
+            //
+            // Forces EAS Cloud to compile React Native from source instead
+            // of using the precompiled XCFrameworks introduced in RN 0.81.
+            // The precompiled binaries (ReactNativeDependencies, RNCore) have
+            // had documented code signing issues on Release builds since RN
+            // 0.81.0 (Expo SDK 54 changelog); the supposed fix in 0.81.1 did
+            // not resolve all cases — community reports through 2026 show
+            // ongoing failures with various library combinations.
+            //
+            // Trade-off: iOS build time +5–10 min. Acceptable for now.
+            //
+            // To revert (faster builds, only safe once RN ships a confirmed
+            // precompiled-binary code signing fix and we've validated it):
+            //   remove the buildReactNativeFromSource line, or set to false.
+            buildReactNativeFromSource: true,
           },
         },
       ],
@@ -228,19 +260,18 @@ export default {
       appVariant: VARIANT,
     },
 
-    // ── expo-updates: installed but disabled ─────────────────────────────
+    // ── expo-updates: installed but disabled (v4.5.5, retained) ──────────
     //
     // expo-updates IS reinstalled in package.json (v1.0.16 onwards). The
     // `enabled: false` setting tells Expo's plugin to write:
     //   - EXUpdatesEnabled=NO into ios/Lexi-Lens/Supporting/Expo.plist
     //   - expo.modules.updates.ENABLED=false into AndroidManifest.xml
     //
-    // Effect: native module compiles into binary (AppDelegate references
-    // remain valid, main.jsbundle embeds correctly), but the runtime
-    // StartupProcedure short-circuits and never goes to network or wait
-    // states. The previous failure modes (Android black-screen-forever,
-    // iOS SIGABRT in errorRecoveryQueue, v1.0.15 white screen) all came
-    // from the runtime side. With runtime disabled, none of them can fire.
+    // Effect: native module compiles into binary, but the runtime
+    // StartupProcedure short-circuits. This fix is verified working on
+    // Android (v1.0.16/17 Gradle build boots clean). On iOS it is necessary
+    // but not sufficient — Build 17 still white-screened, which is what
+    // v4.5.6's buildReactNativeFromSource:true is addressing separately.
     //
     // To turn OTAs ON in a future release:
     //   updates: {
