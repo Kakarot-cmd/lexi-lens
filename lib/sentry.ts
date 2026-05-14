@@ -156,58 +156,63 @@ export function initSentry(): string | null {
   const versionTag  = ENV.appVersion;
   const releaseName = `${variant}@${versionTag}`;
 
+  // v4.5.9 — Conservative init to unblock iOS TestFlight white-screen
+  // (May 14, 2026 — after 9 failed iOS builds).
+  //
+  // Hypothesis (Sentry GitHub issue #3623): setting `tracesSampleRate` in
+  // Sentry.init causes a synchronous production-build crash on certain
+  // platforms. The issue reporter narrowed it to that exact property and
+  // confirmed that passing an empty config object resolved the crash.
+  // Our symptom (white screen, no .ips, no Sentry events) is consistent
+  // with the JS bundle silently halting during Sentry.init's native
+  // bridge call.
+  //
+  // This conservative init:
+  //   • Removes `tracesSampleRate`        ← the documented crash trigger
+  //   • Removes `beforeBreadcrumb` fn     ← native-to-JS callback, could
+  //                                          trip new arch bridgeless
+  //   • Simplifies `beforeSend` to just   ← drops the deep-walk scrubber
+  //     the size guard + scrub on top      that could throw on circular
+  //     fields                              refs in the event payload
+  //   • Keeps `release`, `dist`,          ← strings, can't crash
+  //     `environment`, `ignoreErrors`
+  //
+  // What we lose temporarily:
+  //   • Performance tracing (20% sample) — no traces in Sentry dashboard
+  //     until we re-enable. Crash reporting is UNAFFECTED.
+  //   • XHR breadcrumb filtering — Sentry may log api.anthropic.com URLs
+  //     in breadcrumbs. We accept this for now; revisit post-launch.
+  //   • Deep nested data scrubbing — extras/contexts/tags not scrubbed.
+  //     Top-level message + exception.value strings are still scrubbed.
+  //
+  // What we keep:
+  //   • Crash reporting (the main reason we have Sentry)
+  //   • Release/dist/environment tagging (sourcemaps still symbolicate)
+  //   • ignoreErrors (known noisy categories filtered)
+  //   • Top-level string scrubbing (PII protection on message field)
+  //   • Replay disabled (children's app, privacy first)
+  //
+  // To re-enable after iOS is confirmed working:
+  //   1. Add `tracesSampleRate: 0.2` back, ship one tester build, verify
+  //   2. If OK, add `beforeBreadcrumb` back, ship + verify
+  //   3. If OK, restore the full beforeSend scrubber
   Sentry.init({
     dsn,
-
-    // ── Release tracking ─────────────────────────────────────────────────────
     release:     releaseName,
     dist:        versionTag,
     environment: variant,
 
-    // ── Performance monitoring ───────────────────────────────────────────────
-    // 20 % sample in production — enough to catch slow scans / Edge Fn latency
-    // without burning quota. Staging and dev sample 100 %.
-    tracesSampleRate: variant === "production" ? 0.2 : 1.0,
-
-    // ── Session replay (disabled — children's app, privacy first) ───────────
+    // Session replay disabled (children's app)
     replaysSessionSampleRate: 0,
     replaysOnErrorSampleRate: 0,
 
-    // ── Breadcrumb filtering + scrubbing ─────────────────────────────────────
-    beforeBreadcrumb(breadcrumb) {
-      // Drop the entire breadcrumb if it's a known noisy XHR to Anthropic
-      // (we already log structured breadcrumbs around evaluate calls; the
-      // raw http breadcrumb adds nothing and may carry headers).
-      if (
-        breadcrumb.category === "xhr" &&
-        typeof breadcrumb.data === "object" &&
-        breadcrumb.data &&
-        typeof (breadcrumb.data as Record<string, unknown>).url === "string" &&
-        ((breadcrumb.data as Record<string, string>).url).includes("api.anthropic.com")
-      ) {
-        return null;
-      }
-
-      // Scrub data + message fields.
-      if (breadcrumb.data) {
-        breadcrumb.data = scrubData(breadcrumb.data) as Record<string, unknown>;
-      }
-      if (typeof breadcrumb.message === "string") {
-        breadcrumb.message = scrubString(breadcrumb.message);
-      }
-      return breadcrumb;
-    },
-
-    // ── Event filtering ──────────────────────────────────────────────────────
+    // Minimal beforeSend — size guard + top-level scrub only.
+    // Crucially, no deep object walking.
     beforeSend(event) {
-      // Drop suspiciously large events — likely a base64 frame slipped in.
       const json = JSON.stringify(event);
       if (json.includes("frameBase64") || json.length > 500_000) {
         return null;
       }
-
-      // Scrub free-form text fields where secrets / emails could leak via
-      // captureException(message) calls.
       if (typeof event.message === "string") {
         event.message = scrubString(event.message);
       }
@@ -216,28 +221,13 @@ export function initSentry(): string | null {
           if (ex.value) ex.value = scrubString(ex.value);
         }
       }
-
-      // Scrub all extras / contexts / tags via the deep walker.
-      if (event.extra)    event.extra    = scrubData(event.extra)    as Record<string, unknown>;
-      if (event.contexts) event.contexts = scrubData(event.contexts) as Record<string, Record<string, unknown>>;
-      if (event.tags) {
-        // Tags are flat — only scrub string values.
-        for (const [k, v] of Object.entries(event.tags)) {
-          if (typeof v === "string") event.tags[k] = scrubString(v);
-        }
-      }
       return event;
     },
 
-    // ── Ignored errors ───────────────────────────────────────────────────────
     ignoreErrors: [
-      // Camera permission not yet granted on first launch
       "Camera permission not granted",
-      // ML Kit not available before first EAS build (Expo Go)
       "Module AppRegistry is not a registered callable module",
-      // Network blip on Edge Function retry — handled by callEdgeFunction
       "Network request failed",
-      // Supabase auth token refresh on offline resume
       "AuthSessionMissingError",
     ],
   });

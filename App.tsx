@@ -525,4 +525,19 @@ function App() {
   );
 }
 
-export default ENV.sentry.dsn ? Sentry.wrap(App) : App;
+// ─── iOS safety-net wrapper (v4.5.9) ──────────────────────────────────────
+//
+// Wraps the production App in an ErrorBoundary + mount-deadline detector.
+// If the production tree mounts cleanly within 5 seconds, the wrapper is
+// a no-op pass-through. If it throws or fails to mount, the wrapper
+// shows a live diagnostic UI instead of the silent white screen we saw
+// in v1.0.13–v1.0.20.
+//
+// Once iOS is confirmed working post-v1.0.23:
+//   1. Delete lib/iosSafetyNet.tsx
+//   2. Remove this import + the withIosSafetyNet() call below
+//   3. Restore: export default ENV.sentry.dsn ? Sentry.wrap(App) : App;
+import { withIosSafetyNet } from "./lib/iosSafetyNet";
+
+const RootApp = ENV.sentry.dsn ? Sentry.wrap(App) : App;
+export default withIosSafetyNet(RootApp);
