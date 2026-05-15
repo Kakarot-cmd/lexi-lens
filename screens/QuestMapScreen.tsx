@@ -35,7 +35,6 @@ import {
   StyleSheet,
   Platform,
   ActivityIndicator,
-  Alert,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -211,11 +210,18 @@ function QuestCard({
   quest,
   onBegin,
   onHardMode,
+  onLockedTap,
   isLocked,
 }: {
-  quest:      Quest;
-  onBegin:    () => void;
-  onHardMode: () => void;
+  quest:       Quest;
+  onBegin:     () => void;
+  onHardMode:  () => void;
+  /**
+   * Phase 4.4 — invoked when a free user taps a premium-locked card. Lives
+   * on the parent so it has navigation access for the Paywall modal route.
+   * The pre-RC Alert.alert flow has been retired; this opens PaywallScreen.
+   */
+  onLockedTap: () => void;
   /**
    * v6.0 — true when quest is paid-tier and the parent is on free.
    * Renders a greyed card with a 🔒 Premium CTA instead of Begin.
@@ -244,21 +250,13 @@ function QuestCard({
   const maxXpRetry  = Math.round((quest.xp_reward_retry     ?? 25) * propCount * multiBonus);
 
   // ── v6.0 — Premium-locked tap handler ─────────────────────
-  // Pre-RevenueCat (Phase 4.4): single Alert explaining the lock.
-  // Post-RevenueCat: replace this body with the paywall trigger.
+  // Phase 4.4: tap routes to PaywallScreen modal via the parent's
+  // handleLockedTap (passed in as `onLockedTap`). Haptic warning kept here
+  // so the feedback fires before the navigation transition.
   const handleLockedTap = useCallback(() => {
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-    Alert.alert(
-      "🔒 Premium Quest",
-      `"${quest.name}" is part of the Premium adventure pack.\n\nUpgrade your account to unlock all premium dungeons, harder challenges, and more XP.`,
-      [
-        { text: "Maybe later", style: "cancel" },
-        // TODO Phase 4.4 — replace with RevenueCat paywall presenter.
-        { text: "Tell me more", style: "default", onPress: () => { /* paywall hook */ } },
-      ],
-      { cancelable: true },
-    );
-  }, [quest.name]);
+    onLockedTap();
+  }, [onLockedTap]);
 
   return (
     <View
@@ -478,6 +476,12 @@ export function QuestMapScreen({ navigation }: Props) {
     navigation.navigate("Scan", { questId: dailyQuestObj.id, hardMode: false });
   }, [dailyQuestObj, navigation]);
 
+  // Phase 4.4 — locked premium quest tap → PaywallScreen modal. Lifted here
+  // (vs inside QuestCard) so navigation is in scope. Haptic fires in the card.
+  const handleLockedTap = useCallback(() => {
+    navigation.navigate("Paywall", { reason: "quest-locked" });
+  }, [navigation]);
+
   // Build SectionList sections from tier groups
   const sections = useMemo(() => {
     return tierGroups.map((group: TierGroup) => {
@@ -531,10 +535,11 @@ export function QuestMapScreen({ navigation }: Props) {
           isLocked={isLocked}
           onBegin={() => handleBegin(item.quest, false)}
           onHardMode={() => handleBegin(item.quest, true)}
+          onLockedTap={handleLockedTap}
         />
       );
     },
-    [handleBegin, parentTier]
+    [handleBegin, handleLockedTap, parentTier]
   );
 
   const keyExtractor = useCallback(

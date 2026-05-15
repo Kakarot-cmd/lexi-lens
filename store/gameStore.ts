@@ -60,6 +60,15 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { supabase } from "../lib/supabase";
 import { addGameBreadcrumb } from "../lib/sentry";
 
+// Phase 4.4 — RevenueCat subscription type. Value (FREE_SUBSCRIPTION) and type
+// (SubscriptionDetails) only; the native SDK is NOT loaded by this import
+// (lib/revenueCat lazy-loads `react-native-purchases` to dodge iOS bridgeless
+// module-init crashes — see that file's header for context).
+import {
+  FREE_SUBSCRIPTION,
+  type SubscriptionDetails,
+} from "../lib/revenueCat";
+
 // N4 — Achievement service imports
 import {
   loadEarnedAchievements,
@@ -388,6 +397,32 @@ interface GameState {
    * Idempotent; safe to call from any mount.
    */
   loadParentProfile:     () => Promise<void>;
+
+  // ── Phase 4.4 — RevenueCat granular subscription details ───────────────
+  /**
+   * Granular RC-derived subscription state. Persisted via partialize so the
+   * UI doesn't flash "free" on cold start before getCustomerInfo() resolves.
+   *
+   * The legacy `parentSubscriptionTier` field (above) stays as the binary
+   * free/paid lock-driver used by selectIsQuestLocked. setSubscriptionFromRC
+   * keeps both fields in sync — never set one without the other.
+   *
+   * Source of truth: SERVER (parents.subscription_tier, written by webhook).
+   * This client field is the FRESHNESS layer — RC fires customer-info events
+   * faster than the webhook round-trip, so the UI flips premium the moment
+   * a purchase completes, then re-converges with the DB on next reload.
+   */
+  parentSubscriptionDetails: SubscriptionDetails;
+  /**
+   * Write RC-derived details into the store. Triggered by:
+   *   • PaywallScreen on successful purchase / restore
+   *   • App.tsx RC customer-info listener (renewals, refunds, expirations)
+   *   • ParentDashboard dev-only "Simulate Paid" toggle (__DEV__)
+   *
+   * Also updates the binary parentSubscriptionTier — so existing quest-lock
+   * selectors (selectIsQuestLocked) react without needing to know about RC.
+   */
+  setSubscriptionFromRC: (details: SubscriptionDetails) => void;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -465,6 +500,29 @@ export const useGameStore = create<GameState>()(
 
       // v6.0 — null until loadParentProfile() resolves; render as free meanwhile
       parentSubscriptionTier: null,
+
+      // Phase 4.4 — granular RC details. FREE_SUBSCRIPTION until either the
+      // webhook lands or RC's customer-info listener fires post-purchase.
+      parentSubscriptionDetails: FREE_SUBSCRIPTION,
+
+      setSubscriptionFromRC: (details) => {
+        // Keep the binary tier in sync so legacy selectors (selectIsQuestLocked)
+        // react without needing RC awareness. Active entitlement → 'paid'.
+        const binaryTier: "free" | "paid" = details.isActive ? "paid" : "free";
+        set({
+          parentSubscriptionDetails: details,
+          parentSubscriptionTier:    binaryTier,
+        });
+        addGameBreadcrumb({
+          category: "revenuecat",
+          message:  "Store updated from RC",
+          data: {
+            isActive:  details.isActive,
+            tier:      details.tier,
+            productId: details.productId,
+          },
+        });
+      },
 
       resetSessionCounters: () =>
         set({ sessionCounters: { questsStarted: 0, questsFinished: 0, xpEarned: 0 } }),
@@ -1285,6 +1343,10 @@ export const useGameStore = create<GameState>()(
         // v6.0 — persist parent tier so cold-start QuestMap doesn't flash
         // unlocked content for a beat before loadParentProfile() resolves.
         parentSubscriptionTier: state.parentSubscriptionTier,
+        // Phase 4.4 — persist RC details so the ParentDashboard "Premium"
+        // badge and PaywallScreen entry-state are correct on cold start
+        // before RC's customer-info round-trip completes.
+        parentSubscriptionDetails: state.parentSubscriptionDetails,
       }),
     }
   )

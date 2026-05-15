@@ -97,6 +97,12 @@ const OnboardingScreen = lazy(() =>
   import("./screens/OnboardingScreen").then((m) => ({ default: m.OnboardingScreen })),
 );
 
+// Phase 4.4 — PaywallScreen is lazy-loaded for the same reason as the rest:
+// keeps cold-start lean and isolates any react-native-purchases module-init
+// crash to the moment the paywall is actually opened. The wrapper revenueCat.ts
+// is already lazy at the SDK level — this just defers the SCREEN module too.
+const PaywallScreen = lazy(() => import("./screens/PaywallScreen"));
+
 // ─── Components ───────────────────────────────────────────────────────────────
 
 import { ErrorBoundary }           from "./components/ErrorBoundary";
@@ -239,6 +245,21 @@ function AppNavigator() {
           <ErrorBoundary screen="OnboardingScreen">
             <Suspense fallback={<LazyScreenFallback />}>
               <OnboardingScreen {...props} />
+            </Suspense>
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
+
+      {/* Phase 4.4 — Paywall presented as modal so the underlying QuestMap /
+          ParentDashboard / RateLimitWall remains in the back stack on dismiss. */}
+      <AppNav.Screen
+        name="Paywall"
+        options={{ presentation: "modal", animation: "slide_from_bottom" }}
+      >
+        {(props) => (
+          <ErrorBoundary screen="PaywallScreen">
+            <Suspense fallback={<LazyScreenFallback />}>
+              <PaywallScreen {...props} />
             </Suspense>
           </ErrorBoundary>
         )}
@@ -411,6 +432,83 @@ function App() {
     })();
     return () => { cancelled = true; };
   }, [session?.user?.id, activeChild?.id]);
+
+  // ── RevenueCat lifecycle ───────────────────────────────────────────────────
+  //
+  // Phase 4.4. Wires the RC SDK to the Supabase auth session:
+  //   • session established → initRevenueCat({ appUserId: parentId })
+  //   • signed out         → clearParent()  (anonymise the local RC instance)
+  //   • customer-info update (renewal, refund, expiration, sandbox event)
+  //     → setSubscriptionFromRC() pushes details into the gameStore
+  //   • AppState → 'active' → getCustomerInfo() to refresh, in case the
+  //     webhook fired while the app was backgrounded.
+  //
+  // All RC calls are no-ops in __DEV__ (see lib/revenueCat.ts) — Metro's
+  // log handler collides with RC's emitter setup. Test purchases in EAS
+  // preview/staging builds, never in the dev client.
+  //
+  // Important: this hook DOES NOT block render. RC failures degrade
+  // gracefully to "paywall hidden" — the rest of the game continues to work
+  // and the server-side gate (parents.subscription_tier, written by the
+  // webhook) remains the authoritative tier source.
+  useEffect(() => {
+    let cancelled = false;
+    let unsubscribeRcListener: (() => void) | null = null;
+    let appStateSub: { remove: () => void } | null = null;
+
+    (async () => {
+      try {
+        const rc = await import("./lib/revenueCat");
+        if (cancelled) return;
+
+        if (!session?.user) {
+          // Signed out — clear identity so the next sign-in starts fresh.
+          await rc.clearParent();
+          return;
+        }
+
+        const initialised = await rc.initRevenueCat({ appUserId: session.user.id });
+        if (cancelled || !initialised) return;
+
+        // Live updates: renewals, refunds, expirations, RC-pushed events.
+        unsubscribeRcListener = rc.addCustomerInfoListener((info) => {
+          const details = rc.deriveSubscriptionDetails(info);
+          useGameStore.getState().setSubscriptionFromRC(details);
+        });
+
+        // One-shot initial fetch so the store has accurate state immediately
+        // (the listener only fires on subsequent updates).
+        const snapshot = await rc.getCustomerInfo();
+        if (cancelled) return;
+        if (snapshot) {
+          useGameStore.getState().setSubscriptionFromRC(snapshot.details);
+        }
+
+        // Foreground refresh — webhook may have fired while app was backgrounded.
+        appStateSub = AppState.addEventListener("change", async (next) => {
+          if (next !== "active") return;
+          try {
+            const fresh = await rc.getCustomerInfo();
+            if (fresh) useGameStore.getState().setSubscriptionFromRC(fresh.details);
+          } catch {
+            // Non-fatal — DB tier still reflects truth on next refreshChildFromDB.
+          }
+        });
+      } catch (err) {
+        addGameBreadcrumb({
+          category: "revenuecat",
+          message:  "Lifecycle setup failed (non-fatal)",
+          data:     { error: String(err) },
+        });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (unsubscribeRcListener) unsubscribeRcListener();
+      if (appStateSub) appStateSub.remove();
+    };
+  }, [session?.user?.id]);
 
   // ── Game-session lifecycle — Phase 3.7 ─────────────────────────────────────
   const { startSession, endSession } = useAnalytics();

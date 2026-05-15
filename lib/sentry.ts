@@ -295,7 +295,8 @@ export type GameBreadcrumbCategory =
   | "cache"         // Redis hit / miss
   | "xp"            // XP awarded
   | "report"        // v4.7 — verdict report submitted
-  | "pdf_export";   // Word Tome PDF generation
+  | "pdf_export"    // Word Tome PDF generation
+  | "revenuecat";   // Phase 4.4 — RC SDK lifecycle, purchases, customer-info updates
 
 export function addGameBreadcrumb(opts: {
   category: GameBreadcrumbCategory;

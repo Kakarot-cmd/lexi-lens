@@ -1,0 +1,2642 @@
+diff --git a/App.tsx b/App.tsx
+index 0a49ceb..7d9f1dc 100644
+--- a/App.tsx
++++ b/App.tsx
+@@ -97,6 +97,12 @@ const OnboardingScreen = lazy(() =>
+   import("./screens/OnboardingScreen").then((m) => ({ default: m.OnboardingScreen })),
+ );
+ 
++// Phase 4.4 — PaywallScreen is lazy-loaded for the same reason as the rest:
++// keeps cold-start lean and isolates any react-native-purchases module-init
++// crash to the moment the paywall is actually opened. The wrapper revenueCat.ts
++// is already lazy at the SDK level — this just defers the SCREEN module too.
++const PaywallScreen = lazy(() => import("./screens/PaywallScreen"));
++
+ // ─── Components ───────────────────────────────────────────────────────────────
+ 
+ import { ErrorBoundary }           from "./components/ErrorBoundary";
+@@ -243,6 +249,21 @@ function AppNavigator() {
+           </ErrorBoundary>
+         )}
+       </AppNav.Screen>
++
++      {/* Phase 4.4 — Paywall presented as modal so the underlying QuestMap /
++          ParentDashboard / RateLimitWall remains in the back stack on dismiss. */}
++      <AppNav.Screen
++        name="Paywall"
++        options={{ presentation: "modal", animation: "slide_from_bottom" }}
++      >
++        {(props) => (
++          <ErrorBoundary screen="PaywallScreen">
++            <Suspense fallback={<LazyScreenFallback />}>
++              <PaywallScreen {...props} />
++            </Suspense>
++          </ErrorBoundary>
++        )}
++      </AppNav.Screen>
+     </AppNav.Navigator>
+   );
+ }
+@@ -412,6 +433,83 @@ function App() {
+     return () => { cancelled = true; };
+   }, [session?.user?.id, activeChild?.id]);
+ 
++  // ── RevenueCat lifecycle ───────────────────────────────────────────────────
++  //
++  // Phase 4.4. Wires the RC SDK to the Supabase auth session:
++  //   • session established → initRevenueCat({ appUserId: parentId })
++  //   • signed out         → clearParent()  (anonymise the local RC instance)
++  //   • customer-info update (renewal, refund, expiration, sandbox event)
++  //     → setSubscriptionFromRC() pushes details into the gameStore
++  //   • AppState → 'active' → getCustomerInfo() to refresh, in case the
++  //     webhook fired while the app was backgrounded.
++  //
++  // All RC calls are no-ops in __DEV__ (see lib/revenueCat.ts) — Metro's
++  // log handler collides with RC's emitter setup. Test purchases in EAS
++  // preview/staging builds, never in the dev client.
++  //
++  // Important: this hook DOES NOT block render. RC failures degrade
++  // gracefully to "paywall hidden" — the rest of the game continues to work
++  // and the server-side gate (parents.subscription_tier, written by the
++  // webhook) remains the authoritative tier source.
++  useEffect(() => {
++    let cancelled = false;
++    let unsubscribeRcListener: (() => void) | null = null;
++    let appStateSub: { remove: () => void } | null = null;
++
++    (async () => {
++      try {
++        const rc = await import("./lib/revenueCat");
++        if (cancelled) return;
++
++        if (!session?.user) {
++          // Signed out — clear identity so the next sign-in starts fresh.
++          await rc.clearParent();
++          return;
++        }
++
++        const initialised = await rc.initRevenueCat({ appUserId: session.user.id });
++        if (cancelled || !initialised) return;
++
++        // Live updates: renewals, refunds, expirations, RC-pushed events.
++        unsubscribeRcListener = rc.addCustomerInfoListener((info) => {
++          const details = rc.deriveSubscriptionDetails(info);
++          useGameStore.getState().setSubscriptionFromRC(details);
++        });
++
++        // One-shot initial fetch so the store has accurate state immediately
++        // (the listener only fires on subsequent updates).
++        const snapshot = await rc.getCustomerInfo();
++        if (cancelled) return;
++        if (snapshot) {
++          useGameStore.getState().setSubscriptionFromRC(snapshot.details);
++        }
++
++        // Foreground refresh — webhook may have fired while app was backgrounded.
++        appStateSub = AppState.addEventListener("change", async (next) => {
++          if (next !== "active") return;
++          try {
++            const fresh = await rc.getCustomerInfo();
++            if (fresh) useGameStore.getState().setSubscriptionFromRC(fresh.details);
++          } catch {
++            // Non-fatal — DB tier still reflects truth on next refreshChildFromDB.
++          }
++        });
++      } catch (err) {
++        addGameBreadcrumb({
++          category: "revenuecat",
++          message:  "Lifecycle setup failed (non-fatal)",
++          data:     { error: String(err) },
++        });
++      }
++    })();
++
++    return () => {
++      cancelled = true;
++      if (unsubscribeRcListener) unsubscribeRcListener();
++      if (appStateSub) appStateSub.remove();
++    };
++  }, [session?.user?.id]);
++
+   // ── Game-session lifecycle — Phase 3.7 ─────────────────────────────────────
+   const { startSession, endSession } = useAnalytics();
+   const screenSequenceRef = useRef<string[]>([]);
+diff --git a/docs/REVENUECAT_SETUP.md b/docs/REVENUECAT_SETUP.md
+new file mode 100644
+index 0000000..058bfe6
+--- /dev/null
++++ b/docs/REVENUECAT_SETUP.md
+@@ -0,0 +1,311 @@
++# RevenueCat Setup Runbook
++
++**Phase:** 4.4
++**Last updated:** 2026-05-14
++**Owner:** NJ
++**Status:** Code shipped. Dashboard setup is a manual checklist that must be completed before sandbox testing.
++
++## Scope
++
++This runbook covers everything OUTSIDE the codebase needed to make Phase 4.4 functional:
++
++- RevenueCat Dashboard project + app + entitlement + offerings
++- App Store Connect IAP products + sandbox testers + Small Business Program
++- Google Play Console subscriptions + service account
++- Supabase secrets (webhook secret)
++- EAS secrets (sandbox + prod public keys)
++
++If you reorder anything, the dependency graph is:
++
++```
++Apple SBP enrollment (start NOW — 2-4 week approval) ──────┐
++                                                            │
++ASC IAP products ─── RC iOS app config ─── RC Offerings ───┤
++                                                            ├── End-to-end test
++Play Console subs ── RC Android app config ── (same) ──────┤
++                                                            │
++Supabase secrets + migration apply ── Edge fn deploy ───────┘
++```
++
++## Naming conventions (locked — do not change)
++
++| Concept | Value |
++|---|---|
++| Entitlement ID (RC) | `premium` |
++| Product ID (premium monthly) | `lexilens_premium_monthly` |
++| Product ID (premium yearly) | `lexilens_premium_yearly` |
++| Product ID (family monthly — Phase 4.6) | `lexilens_family_monthly` |
++| Product ID (family yearly — Phase 4.6) | `lexilens_family_yearly` |
++| RevenueCat Offering ID | `default` |
++| App User ID | Supabase parent UUID (from `auth.users.id`) |
++
++Changing any of these later requires coordinated edits in:
++
++- `lib/revenueCat.ts` (entitlement, tier mapping)
++- `supabase/functions/revenuecat-webhook/index.ts` (entitlement, tier mapping)
++- RC Dashboard
++- App Store Connect product config
++- Play Console subscription config
++
++## Step 1 — Apple Small Business Program (longest lead time)
++
++Apply NOW even before iOS builds work. Approval takes 2-4 weeks. Without SBP, Apple takes 30%. With SBP, they take 15% for the first $1M/year. This is a 50% margin improvement on iOS.
++
++1. Apple Developer Account → Membership → Apple Small Business Program → Apply.
++2. Provide business name, address, tax info.
++3. Wait for approval email. SBP discount applies retroactively from the start of the next calendar quarter after approval.
++
++Memory: Apple SBP application is independent of iOS build state. Approval clock starts the day you apply, not the day you launch.
++
++## Step 2 — App Store Connect IAP products
++
++Prerequisites:
++
++- Lexi-Lens app record in App Store Connect (you have one: ASC ID 6766159881, bundle `com.navinj.lexilens`)
++- Active Apple Developer Program membership ($99/yr — already paid)
++- Paid Applications agreement signed in Agreements, Tax, and Banking
++- Banking + tax forms complete (without these, even sandbox purchases fail)
++
++Setup:
++
++1. ASC → My Apps → Lexi-Lens → Subscriptions → Create Subscription Group.
++   - Group reference name: `Lexi-Lens Premium`
++2. Inside the group, create two subscriptions:
++   - **Reference Name:** `Lexi-Lens Premium Monthly` · **Product ID:** `lexilens_premium_monthly`
++   - **Reference Name:** `Lexi-Lens Premium Yearly` · **Product ID:** `lexilens_premium_yearly`
++3. For each subscription:
++   - Subscription duration: 1 Month and 1 Year respectively
++   - Set price in your primary territory (INR for India). Apple will auto-tier other markets, override as needed.
++   - Localization: English (US) + English (India) at minimum
++     - Display name: "Premium"
++     - Description: "Unlock the full Lexi-Lens adventure"
++   - Optional: introductory offer (e.g. 7-day free trial). Apple's matrix shows ~25-35% uplift on free trials.
++4. App Review Information:
++   - Screenshot: provide a 1290×2796 screenshot of the paywall (you'll have one after first build)
++   - Review notes: explain the product is a kids' educational subscription
++5. Status: "Ready to Submit" for sandbox testing. Production requires app submission.
++
++Sandbox testers:
++
++1. ASC → Users and Access → Sandbox Testers → Add.
++2. Use a unique email (Apple disallows real Apple IDs). Format: `nj+sandbox1@yourdomain.com`.
++3. Create at least 3: one fresh-purchase tester, one renewal tester, one cancellation tester.
++4. On the device: Settings → App Store → Sandbox Account → sign in with the sandbox tester credentials. **Do NOT sign in via Settings → Apple ID** — that's the production account and will charge real money.
++
++## Step 3 — Google Play Console subscriptions
++
++Prerequisites:
++
++- Lexi-Lens app record in Play Console (you have one: package `com.navinj.lexilore`)
++- Play Developer registration ($25 one-time — already paid)
++- Closed Testing track with at least one tester active
++
++Setup:
++
++1. Play Console → Lexi-Lens → Monetize → Subscriptions → Create subscription.
++   - **Product ID:** `lexilens_premium_monthly`
++   - Name: "Premium Monthly"
++   - Base plan: monthly auto-renewing, set price
++2. Repeat for `lexilens_premium_yearly` (yearly base plan).
++3. Activate both subscriptions. Status must be "Active" or RC can't list them.
++
++Play service account for RC (required for entitlement verification on Android):
++
++You already created `lexi-lens-play-upload@airy-adapter-249205.iam.gserviceaccount.com` for app upload. You can either:
++
++- (A) Reuse it: grant the service account the additional Play Console permissions needed for subscriptions (View financial data, Manage orders and subscriptions).
++- (B) Create a dedicated `lexi-lens-revenuecat@...` service account for cleaner audit trails.
++
++Recommendation: (B) — separate concerns. The upload SA gets revoked or rotated on a different cadence than the RC SA.
++
++Steps for option B:
++
++1. GCP Console → IAM → Service Accounts → Create.
++2. Name: `lexi-lens-revenuecat`. Grant no project-level roles.
++3. Create a JSON key, download it.
++4. Play Console → Setup → API access → Link the GCP project that hosts this SA.
++5. Grant the SA: "View financial data", "Manage orders and subscriptions" at app level.
++6. Upload the JSON to RC (see step 4).
++
++## Step 4 — RevenueCat Dashboard
++
++1. Create project: app.revenuecat.com → New Project → "Lexi-Lens".
++2. Add iOS app:
++   - Bundle ID: `com.navinj.lexilens`
++   - App Store Connect API key: upload an API key with App Manager role (Settings → Apple Account in RC)
++   - Copy the **iOS Public SDK Key** (starts with `appl_`). This goes into EAS as `EXPO_PUBLIC_REVENUECAT_IOS_KEY_SANDBOX` and `_PROD`.
++3. Add Android app:
++   - Package: `com.navinj.lexilore`
++   - Upload the Play Console service account JSON from step 3
++   - Copy the **Android Public SDK Key** (starts with `goog_`). Goes into EAS as `EXPO_PUBLIC_REVENUECAT_ANDROID_KEY_SANDBOX` and `_PROD`.
++
++   Note: RC uses ONE pair of keys per app — sandbox and production share the same key. The "sandbox" label in your EAS env names refers to which Supabase project the staging build talks to, not to a separate RC key. If you only want to publish your app in one RC project for both sandbox and production purchases, set `EXPO_PUBLIC_REVENUECAT_IOS_KEY_SANDBOX = EXPO_PUBLIC_REVENUECAT_IOS_KEY_PROD`. This is the recommended setup.
++
++4. Import products:
++   - Products tab → Import from App Store / Play Store
++   - All 4 products should appear: monthly + yearly on each platform
++5. Create entitlement:
++   - Entitlements → New entitlement → Identifier: `premium`
++   - Attach all 4 products (the iOS pair AND the Android pair).
++6. Create offering:
++   - Offerings → New offering → Identifier: `default`
++   - Mark as the **Current** offering.
++   - Add two packages:
++     - Package: `$rc_monthly` → attach `lexilens_premium_monthly` (both platforms)
++     - Package: `$rc_annual` → attach `lexilens_premium_yearly` (both platforms)
++   - Note: RC's package identifier `$rc_annual` is a fixed naming convention
++     for "the annual cadence package" — the product attached can be named
++     `_yearly` or `_annual` interchangeably. RC reads PackageType.ANNUAL on
++     the client side via package introspection, not the product ID string.
++7. Configure webhook:
++   - Project Settings → Integrations → Webhooks → Add webhook
++   - URL: `https://<your-supabase-project-ref>.supabase.co/functions/v1/revenuecat-webhook`
++   - Add a custom header: `Authorization: Bearer <shared-secret>` — generate a random 32+ character string. Save this; you'll add it to Supabase secrets next.
++   - Test events: pick "Send test event" → RC's webhook page should show a 200 response. The `revenuecat_webhook_log` table in Supabase should have a row with `event_type='TEST'`.
++
++## Step 5 — Supabase secrets + Edge Function deploy
++
++1. Apply the migration:
++
++   ```
++   supabase db push
++   ```
++
++   Verify:
++
++   ```
++   psql ... -c "SELECT table_name FROM information_schema.tables WHERE table_name='revenuecat_webhook_log';"
++   ```
++
++2. Set the webhook secret (the same string you used in RC Dashboard → webhook → Authorization header):
++
++   ```
++   supabase secrets set REVENUECAT_WEBHOOK_SECRET=<your-secret>
++   ```
++
++3. Deploy the function with `--no-verify-jwt` (RC doesn't sign with a Supabase JWT):
++
++   ```
++   supabase functions deploy revenuecat-webhook --no-verify-jwt
++   ```
++
++4. Test by clicking "Send test event" in RC Dashboard. Confirm:
++   - HTTP 200 response in RC's webhook log
++   - New row in `public.revenuecat_webhook_log` with `event_type='TEST'`, `processing_note='ignored'`
++
++Apply all of this to BOTH Supabase projects (staging and production):
++
++| Step | Staging (`zhnaxafmacygbhpvtwvf`) | Production (`vwlfzvabvlcozqpepsoi`) |
++|---|---|---|
++| Migration | Apply now | Apply at launch |
++| Secret | Set with staging RC project's secret | Set with production RC project's secret |
++| Function deploy | Deploy now | Deploy at launch |
++
++If you only have ONE RC project (recommended for solo dev), you can use the same secret for both Supabase projects, but the webhook URL must be added twice in RC Dashboard (once per Supabase project URL). RC supports multiple webhooks per project.
++
++## Step 6 — EAS secrets
++
++You already have placeholders in `eas.json`. Add the actual values:
++
++```
++eas secret:create --scope project --name EXPO_PUBLIC_REVENUECAT_IOS_KEY_SANDBOX     --value appl_xxx --type STRING --visibility SENSITIVE
++eas secret:create --scope project --name EXPO_PUBLIC_REVENUECAT_ANDROID_KEY_SANDBOX --value goog_xxx --type STRING --visibility SENSITIVE
++eas secret:create --scope project --name EXPO_PUBLIC_REVENUECAT_IOS_KEY_PROD        --value appl_xxx --type STRING --visibility SENSITIVE
++eas secret:create --scope project --name EXPO_PUBLIC_REVENUECAT_ANDROID_KEY_PROD    --value goog_xxx --type STRING --visibility SENSITIVE
++```
++
++If you're using one RC project for both: set `_SANDBOX` and `_PROD` to the same key value.
++
++Note: `EXPO_PUBLIC_*` variables CANNOT be `SECRET` visibility — they bundle into the client. Use `SENSITIVE` (still hidden from non-builder EAS users) or `PLAIN_TEXT`.
++
++## Step 7 — Sandbox end-to-end test
++
++Build:
++
++```
++set APP_VARIANT=staging
++eas build --platform android --profile staging
++```
++
++Install the resulting AAB on a real device via Play Console Internal Testing track. Then:
++
++1. Sign in with a parent account in the app.
++2. Tap a locked premium quest → paywall appears.
++3. Tap "Subscribe" → Google Play (or Apple) purchase sheet appears.
++4. Use sandbox tester credentials. Confirm purchase.
++5. Back in the app, the QuestMap should refresh — locked quests now show as unlocked.
++6. Check Supabase:
++
++   ```sql
++   SELECT subscription_tier FROM parents WHERE id = '<your-parent-uuid>';
++   -- expect: 'tier1'
++
++   SELECT event_type, processing_note, received_at
++   FROM revenuecat_webhook_log
++   WHERE app_user_id = '<your-parent-uuid>'
++   ORDER BY received_at DESC LIMIT 5;
++   -- expect: INITIAL_PURCHASE row with processing_note='applied:tier1'
++   ```
++
++If `parents.subscription_tier` shows `'free'` after a successful sandbox purchase:
++
++- Check the RC Dashboard → Subscriber view for your sandbox parent UUID. Confirm "premium" entitlement is active.
++- Check the webhook log for your event. If `processing_note` is `applied:tier1` but the column is still `'free'`, there's a row-update bug (capture and report).
++- If the event isn't in the log at all, the webhook didn't fire or failed authorization. Check RC Dashboard → Integrations → Webhooks → recent deliveries.
++- If the log shows `processing_note='duplicate'` for the very first event — you have a stale duplicate from a previous run; safe to clear `revenuecat_webhook_log` between full re-tests.
++
++## Step 8 — iOS (deferred until iOS builds work)
++
++When iOS builds are healthy:
++
++- Repeat steps 2 and 7 with `--platform ios --profile staging`
++- Sign in with a sandbox tester via Settings → App Store → Sandbox Account
++- TestFlight handles distribution; the paywall flow is identical to Android
++
++## Known gotchas
++
++- **Subscription paused on Android** — RC sends `SUBSCRIPTION_PAUSED`. The webhook revokes the entitlement. When the user un-pauses, RC sends `RENEWAL`. This works correctly with our event handler.
++- **Refunds** — RC sends `REFUND` and we set tier=free. The user retains historical content (badges, completed quests) but loses ongoing access. This is the intended behavior; revoking historical progress is hostile UX.
++- **Grace period** — Apple subscribers in billing-issue grace get `BILLING_ISSUE` only AFTER the 16-day grace expires. During grace, no event is sent. Our derived `SubscriptionDetails.inGracePeriod` will reflect this from the client SDK; UI should soften the "Premium" badge during grace.
++- **Family sharing (Apple)** — Apple's Family Sharing for Subscriptions: organizer purchases, family members can use the entitlement. RC handles this; we get an event per family member who first accesses the entitlement. No code changes needed; works out of the box.
++- **Promotional offers** — RC supports promo codes via App Store Connect Promotional Offer Codes. Not in 4.4 MVP, but RC will deliver `INITIAL_PURCHASE` events with a discount applied; the webhook handles these the same as full-price purchases.
++
++## Webhook event-type coverage table
++
++| RC Event Type | Webhook Handler Behavior |
++|---|---|
++| `INITIAL_PURCHASE` | Set parent's tier from product ID |
++| `RENEWAL` | Set parent's tier from product ID |
++| `PRODUCT_CHANGE` | Set parent's tier from new product ID |
++| `UNCANCELLATION` | Set parent's tier from product ID |
++| `TEMPORARY_ENTITLEMENT_GRANT` | Set parent's tier from product ID (RC manual grants) |
++| `SUBSCRIPTION_EXTENDED` | Set parent's tier from product ID (Apple grace period extensions) |
++| `CANCELLATION` | No-op (entitlement remains until expiration; wait for EXPIRATION) |
++| `EXPIRATION` | Set parent's tier to `free` |
++| `BILLING_ISSUE` | Set parent's tier to `free` (after grace) |
++| `REFUND` | Set parent's tier to `free` |
++| `SUBSCRIPTION_PAUSED` | Set parent's tier to `free` (Android pause) |
++| `TRANSFER` | Revoke from old UUID(s), grant to new UUID(s) |
++| `TEST` | Log and ignore |
++| `NON_RENEWING_PURCHASE` | Log and ignore (consumables — not in our product line) |
++| Unknown future type | Log with `processing_note='unknown_type'`, return 200 |
++
++## Apple App Review Notes (for first submission)
++
++When submitting Lexi-Lens for review with IAP, the App Review team needs:
++
++- One of your sandbox testers' credentials in App Review notes
++- A short script: "Tap any quest in the second tier (purple). Paywall appears. Tap Subscribe. Use sandbox tester credentials. Purchase completes. The quest is now playable."
++- Explicit mention that this is a subscription with auto-renewal (Apple guideline 3.1.2)
++- Privacy URL: `https://lexilens.app/privacy-policy` (your existing page)
++- Terms URL: `https://lexilens.app/terms` (you need to add this — currently linked in the paywall but the URL must exist before submission)
++
++## Phase 4.6 follow-ups
++
++Not in 4.4 scope but flagged here for next-phase memory:
++
++- Family tier products in ASC + Play + RC
++- Annual bundle prominent placement in paywall UI (currently auto-selects but doesn't ad-feature heavily)
++- Promo code support in paywall ("I have a code" link)
++- Restore-on-foreground (auto-call `Purchases.getCustomerInfo()` when app comes back to foreground; webhook lag mitigation)
++- Per-region pricing optimization with FX hedge (~5% buffer on INR prices)
+diff --git a/eas.json b/eas.json
+index 6c90265..0783e07 100644
+--- a/eas.json
++++ b/eas.json
+@@ -14,7 +14,9 @@
+         "EXPO_PUBLIC_APP_VARIANT": "development",
+         "EXPO_PUBLIC_SUPABASE_URL": "$EXPO_PUBLIC_SUPABASE_URL_STAGING",
+         "EXPO_PUBLIC_SUPABASE_ANON_KEY": "$EXPO_PUBLIC_SUPABASE_ANON_KEY_STAGING",
+-        "EXPO_PUBLIC_SENTRY_DSN": "$EXPO_PUBLIC_SENTRY_DSN_STAGING"
++        "EXPO_PUBLIC_SENTRY_DSN": "$EXPO_PUBLIC_SENTRY_DSN_STAGING",
++        "EXPO_PUBLIC_REVENUECAT_IOS_KEY": "$EXPO_PUBLIC_REVENUECAT_IOS_KEY_SANDBOX",
++        "EXPO_PUBLIC_REVENUECAT_ANDROID_KEY": "$EXPO_PUBLIC_REVENUECAT_ANDROID_KEY_SANDBOX"
+       },
+       "android": {
+         "buildType": "apk"
+diff --git a/lib/revenueCat.ts b/lib/revenueCat.ts
+new file mode 100644
+index 0000000..21c0a8f
+--- /dev/null
++++ b/lib/revenueCat.ts
+@@ -0,0 +1,503 @@
++/**
++ * lib/revenueCat.ts
++ * Lexi-Lens — RevenueCat SDK wrapper.
++ *
++ * Phase 4.4 — paywall integration.
++ *
++ * Design principles
++ * ─────────────────
++ *
++ * 1. **Lazy native-module load.** `react-native-purchases` is dynamically
++ *    `import()`ed inside an async helper, not at module load. This protects
++ *    every file that touches `./revenueCat` from RC's module-init side
++ *    effects (event-emitter attach at line ~72 of purchases.js). Same
++ *    pattern as the Lumi sound bootstrap in App.tsx, for the same reason —
++ *    iOS bridgeless + new arch is unforgiving of synchronous native-module
++ *    init failures during JS bundle resolution.
++ *
++ * 2. **Tolerant of missing keys.** If RC keys are absent (dev profile with
++ *    no SANDBOX vars, misconfigured EAS profile, or unsupported platform
++ *    like web), this module logs a single warning and short-circuits.
++ *    The app boots normally; quest-locking still works against
++ *    parents.subscription_tier in the DB (server-authoritative gate);
++ *    paywall taps just show an informative alert instead of presenting RC.
++ *    No code path throws.
++ *
++ * 3. **Dev-mode guard.** `react-native-purchases@10.x` has a known crash
++ *    in __DEV__ on Expo SDK 54 + RN 0.81 + React 19 (RC issue #1436). RC's
++ *    internal log handler routes a console event through Babel's
++ *    wrapNativeSuper, which collides with @expo/metro-runtime's NamelessError
++ *    capture and throws a Reflect.construct.apply error during emitter setup.
++ *    Workaround: skip `Purchases.configure()` in `__DEV__`. Test paywall
++ *    flows in EAS preview/staging builds, never in Expo Go or dev client.
++ *
++ * 4. **Single entitlement constant.** `ENTITLEMENT_PREMIUM = "premium"` is
++ *    the entitlement identifier that must match RevenueCat Dashboard config.
++ *    All entitlement checks reference this constant — never inline the
++ *    string elsewhere. Phase 4.6 may introduce additional entitlements
++ *    (e.g. "family") but keep this one stable.
++ *
++ * 5. **Source-of-truth strategy.** Server is authoritative
++ *    (parents.subscription_tier updated by webhook). Client UI uses BOTH:
++ *      • DB read (via gameStore.loadParentProfile) for fast initial render
++ *      • RC SDK (Purchases.getCustomerInfo) for freshness — overrides DB
++ *        if RC says active and DB says free (webhook lag is the common
++ *        cause). RC subscribes to update events; gameStore listens and
++ *        re-derives.
++ *
++ * 6. **No PII leakage.** RC `app_user_id` is set to the Supabase parent
++ *    UUID — no email, no name, no child data ever leaves the device via
++ *    RC. RevenueCat is COPPA-friendly when scoped this way.
++ *
++ * Webhook handles backend tier sync separately (see
++ * supabase/functions/revenuecat-webhook/index.ts). This module is purely
++ * client-side: paywall display, purchase initiation, restore, and
++ * entitlement read-back for UI gating.
++ */
++
++import { Platform } from "react-native";
++import { ENV } from "./env";
++import { addGameBreadcrumb, Sentry } from "./sentry";
++
++// Type-only imports — these are erased at compile time, no runtime cost,
++// no module-init side effects. Safe at top level.
++import type {
++  CustomerInfo,
++  PurchasesOffering,
++  PurchasesPackage,
++} from "react-native-purchases";
++
++// Re-export the public types so consumers don't have to depend on the SDK
++// package directly (keeps the swap-out / mock-out path tractable).
++export type { CustomerInfo, PurchasesOffering, PurchasesPackage };
++
++// ─── Public constants ─────────────────────────────────────────────────────
++
++/**
++ * Entitlement identifier configured in the RevenueCat Dashboard.
++ * Every premium product (monthly, annual, family) grants THIS entitlement.
++ *
++ * If this string ever changes, update:
++ *   • RC Dashboard → Entitlements (rename or add new)
++ *   • supabase/functions/revenuecat-webhook/index.ts (ENTITLEMENT_ID const)
++ *   • This file
++ *
++ * Don't rename casually — entitlement renames orphan existing subscribers.
++ */
++export const ENTITLEMENT_PREMIUM = "premium";
++
++/**
++ * Granular subscription state surfaced to UI / store.
++ *
++ * `tier` field maps RC product → our schema vocabulary:
++ *   • free                                                     → 'free'
++ *   • lexilens_premium_monthly | lexilens_premium_yearly        → 'tier1'
++ *   • lexilens_family_monthly  | lexilens_family_yearly         → 'family'
++ *
++ * tier2 reserved for future "pro" plan (matches economics matrix v2.2).
++ * Mapping logic lives in `tierFromProductId()` below; keep in sync with
++ * the webhook handler (supabase/functions/revenuecat-webhook/index.ts).
++ */
++export interface SubscriptionDetails {
++  isActive:        boolean;
++  productId:       string | null;
++  willRenew:       boolean;
++  expirationDate:  number | null;   // ms since epoch
++  managementUrl:   string | null;   // deep link to App Store / Play Store sub mgmt
++  tier:            "free" | "tier1" | "tier2" | "family";
++  /** Active in introductory period (free trial, intro price). */
++  inGracePeriod:   boolean;
++}
++
++/** Default value used before RC has any data. */
++export const FREE_SUBSCRIPTION: SubscriptionDetails = {
++  isActive:       false,
++  productId:      null,
++  willRenew:      false,
++  expirationDate: null,
++  managementUrl:  null,
++  tier:           "free",
++  inGracePeriod:  false,
++};
++
++// ─── Private state ────────────────────────────────────────────────────────
++
++let _configured = false;
++let _identifiedUserId: string | null = null;
++
++// Cache of the loaded module. null sentinel = not yet attempted; false = load
++// failed and won't retry (avoid repeated failures spamming Sentry).
++let _purchasesModule: typeof import("react-native-purchases") | null | false = null;
++
++// Customer info listeners registered by consumers. We hold our own list so we
++// can attach a single listener to the native SDK and fan out — avoids the
++// per-subscriber overhead of binding multiple bridge listeners.
++type InfoListener = (info: CustomerInfo) => void;
++const _infoListeners = new Set<InfoListener>();
++let _nativeListenerAttached = false;
++
++// ─── Module loader ────────────────────────────────────────────────────────
++
++async function loadPurchases(): Promise<typeof import("react-native-purchases") | null> {
++  if (_purchasesModule === false) return null;
++  if (_purchasesModule)            return _purchasesModule;
++  try {
++    const mod = await import("react-native-purchases");
++    _purchasesModule = mod;
++    return mod;
++  } catch (err) {
++    _purchasesModule = false;
++    console.warn("[revenueCat] react-native-purchases failed to load:", err);
++    Sentry.captureException(err, {
++      tags: { component: "revenueCat", phase: "module-load" },
++    });
++    return null;
++  }
++}
++
++function getApiKey(): string | null {
++  if (Platform.OS === "ios")     return ENV.revenueCat.iosKey;
++  if (Platform.OS === "android") return ENV.revenueCat.androidKey;
++  return null;
++}
++
++// ─── Tier mapping ─────────────────────────────────────────────────────────
++//
++// Convention: product identifiers in App Store Connect / Play Console use
++// the pattern `lexilens_<plan>_<cadence>`:
++//
++//   lexilens_premium_monthly    → tier1  (entry paid plan)
++//   lexilens_premium_yearly     → tier1  (same entitlement, ~48% discount)
++//   lexilens_family_monthly     → family
++//   lexilens_family_yearly      → family
++//   lexilens_pro_monthly        → tier2  (RESERVED — not in 4.4 MVP)
++//   lexilens_pro_yearly         → tier2  (RESERVED — not in 4.4 MVP)
++//
++// We also accept `_annual` as a synonym for `_yearly` for legacy / fallback
++// reasons (RC dashboards sometimes still use "annual" terminology in the
++// package identifier). If you ship product IDs that don't match these
++// prefixes, this fallback returns 'tier1' for any active entitlement
++// (safe paid-equivalent).
++
++function tierFromProductId(productId: string | null): SubscriptionDetails["tier"] {
++  if (!productId) return "free";
++  const id = productId.toLowerCase();
++  if (id.includes("family")) return "family";
++  if (id.includes("pro"))    return "tier2";
++  if (
++    id.includes("premium") ||
++    id.includes("monthly") ||
++    id.includes("yearly") ||
++    id.includes("annual")
++  ) {
++    return "tier1";
++  }
++  // Unknown product but entitlement is active → default to tier1 (paid-equiv).
++  return "tier1";
++}
++
++// ─── Derivation from CustomerInfo ─────────────────────────────────────────
++
++export function deriveSubscriptionDetails(info: CustomerInfo | null): SubscriptionDetails {
++  if (!info) return FREE_SUBSCRIPTION;
++
++  const ent = info.entitlements?.active?.[ENTITLEMENT_PREMIUM];
++  if (!ent) return FREE_SUBSCRIPTION;
++
++  const expirationDate = ent.expirationDate ? new Date(ent.expirationDate).getTime() : null;
++
++  return {
++    isActive:       ent.isActive === true,
++    productId:      ent.productIdentifier ?? null,
++    willRenew:      ent.willRenew === true,
++    expirationDate,
++    managementUrl:  info.managementURL ?? null,
++    tier:           tierFromProductId(ent.productIdentifier ?? null),
++    // `periodType` is 'INTRO' or 'TRIAL' during free-trial / intro-price windows.
++    inGracePeriod:  ent.periodType === "INTRO" || ent.periodType === "TRIAL",
++  };
++}
++
++// ─── Public API ───────────────────────────────────────────────────────────
++
++/**
++ * Initialize RevenueCat. Idempotent — safe to call multiple times. Calling
++ * after a previous successful init with a different `appUserId` triggers
++ * a logIn() to switch users.
++ *
++ * Returns true if RC is usable after this call, false otherwise. Never throws.
++ */
++export async function initRevenueCat(opts?: { appUserId?: string }): Promise<boolean> {
++  // Already configured — just update appUserId if it differs.
++  if (_configured) {
++    if (opts?.appUserId && opts.appUserId !== _identifiedUserId) {
++      await identifyParent(opts.appUserId);
++    }
++    return true;
++  }
++
++  // Dev-mode guard. See module-level comment for context.
++  if (__DEV__) {
++    console.log(
++      "[revenueCat] Skipping init in __DEV__ (Metro HMR + RC log handler crash workaround). " +
++      "Test paywall in EAS preview/staging builds.",
++    );
++    return false;
++  }
++
++  const apiKey = getApiKey();
++  if (!apiKey) {
++    console.warn(
++      `[revenueCat] No API key for platform=${Platform.OS}. ` +
++      `Paywall + purchases disabled this session.`,
++    );
++    addGameBreadcrumb({
++      category: "revenuecat",
++      message:  "init skipped — no API key",
++      data:     { platform: Platform.OS },
++    });
++    return false;
++  }
++
++  const mod = await loadPurchases();
++  if (!mod) return false;
++
++  try {
++    const Purchases = mod.default;
++    // WARN level is recommended for production. Set ERROR if RC is too chatty.
++    Purchases.setLogLevel(mod.LOG_LEVEL.WARN);
++
++    if (opts?.appUserId) {
++      await Purchases.configure({ apiKey, appUserID: opts.appUserId });
++      _identifiedUserId = opts.appUserId;
++    } else {
++      await Purchases.configure({ apiKey });
++    }
++
++    _configured = true;
++    attachNativeListener(mod);
++
++    addGameBreadcrumb({
++      category: "revenuecat",
++      message:  "Configured",
++      data:     { hasUserId: !!opts?.appUserId, platform: Platform.OS },
++    });
++    return true;
++  } catch (err) {
++    Sentry.captureException(err, {
++      tags: { component: "revenueCat", phase: "configure" },
++    });
++    return false;
++  }
++}
++
++/**
++ * Switch the RC-tracked user. Call after Supabase auth resolves so the
++ * Supabase parent UUID is the RC app_user_id. Idempotent if the userId
++ * hasn't changed.
++ */
++export async function identifyParent(parentId: string): Promise<void> {
++  if (!_configured) {
++    // initRevenueCat will pick this up.
++    await initRevenueCat({ appUserId: parentId });
++    return;
++  }
++  if (_identifiedUserId === parentId) return;
++
++  const mod = await loadPurchases();
++  if (!mod) return;
++
++  try {
++    await mod.default.logIn(parentId);
++    _identifiedUserId = parentId;
++    addGameBreadcrumb({
++      category: "revenuecat",
++      message:  "Identified",
++      data:     { parentId },
++    });
++  } catch (err) {
++    Sentry.captureException(err, {
++      tags: { component: "revenueCat", phase: "logIn" },
++    });
++  }
++}
++
++/**
++ * Clear identity (e.g. on Supabase sign-out). Future purchases will use an
++ * anonymous RC ID until the next identifyParent() call.
++ */
++export async function clearParent(): Promise<void> {
++  if (!_configured) return;
++  const mod = await loadPurchases();
++  if (!mod) return;
++  try {
++    await mod.default.logOut();
++    _identifiedUserId = null;
++    addGameBreadcrumb({ category: "revenuecat", message: "Logged out" });
++  } catch (err) {
++    // logOut on anonymous user throws; not actionable, swallow.
++    if (__DEV__) console.warn("[revenueCat] logOut:", err);
++  }
++}
++
++/**
++ * Returns the current offering's available packages, or null if RC is
++ * unavailable / no current offering is configured in the RC Dashboard.
++ *
++ * Render the returned packages in the paywall UI. Each package wraps a
++ * StoreProduct with localized price, title, and intro-offer metadata.
++ */
++export async function fetchCurrentOffering(): Promise<PurchasesOffering | null> {
++  if (!_configured) return null;
++  const mod = await loadPurchases();
++  if (!mod) return null;
++  try {
++    const offerings = await mod.default.getOfferings();
++    return offerings.current ?? null;
++  } catch (err) {
++    Sentry.captureException(err, {
++      tags: { component: "revenueCat", phase: "getOfferings" },
++    });
++    return null;
++  }
++}
++
++export type PurchaseOutcome =
++  | { kind: "success";   customerInfo: CustomerInfo; details: SubscriptionDetails }
++  | { kind: "cancelled" }
++  | { kind: "error";     message: string };
++
++/**
++ * Purchase a package. Returns a discriminated outcome instead of throwing.
++ * Caller renders the appropriate UI for each kind.
++ */
++export async function purchasePackage(pkg: PurchasesPackage): Promise<PurchaseOutcome> {
++  if (!_configured) {
++    return { kind: "error", message: "RevenueCat is not configured." };
++  }
++  const mod = await loadPurchases();
++  if (!mod) return { kind: "error", message: "RevenueCat SDK unavailable." };
++
++  try {
++    addGameBreadcrumb({
++      category: "revenuecat",
++      message:  "Purchase initiated",
++      data:     { productId: pkg.product.identifier },
++    });
++    const { customerInfo } = await mod.default.purchasePackage(pkg);
++    const details = deriveSubscriptionDetails(customerInfo);
++    addGameBreadcrumb({
++      category: "revenuecat",
++      message:  "Purchase succeeded",
++      data:     { productId: pkg.product.identifier, tier: details.tier },
++    });
++    return { kind: "success", customerInfo, details };
++  } catch (err: any) {
++    // RC throws with `userCancelled: true` for user-initiated cancels.
++    if (err?.userCancelled === true) {
++      addGameBreadcrumb({
++        category: "revenuecat",
++        message:  "Purchase cancelled",
++        data:     { productId: pkg.product.identifier },
++      });
++      return { kind: "cancelled" };
++    }
++    Sentry.captureException(err, {
++      tags: { component: "revenueCat", phase: "purchasePackage" },
++      extra: { productId: pkg.product.identifier },
++    });
++    return {
++      kind:    "error",
++      message: err?.message ?? "Purchase failed. Please try again.",
++    };
++  }
++}
++
++/**
++ * Restore previous purchases. Useful for parents who reinstall or sign in
++ * on a new device. Returns the resulting customer info; null on failure.
++ */
++export async function restorePurchases(): Promise<{
++  customerInfo: CustomerInfo;
++  details:      SubscriptionDetails;
++} | null> {
++  if (!_configured) return null;
++  const mod = await loadPurchases();
++  if (!mod) return null;
++  try {
++    addGameBreadcrumb({ category: "revenuecat", message: "Restore initiated" });
++    const customerInfo = await mod.default.restorePurchases();
++    const details = deriveSubscriptionDetails(customerInfo);
++    addGameBreadcrumb({
++      category: "revenuecat",
++      message:  "Restore completed",
++      data:     { tier: details.tier, isActive: details.isActive },
++    });
++    return { customerInfo, details };
++  } catch (err) {
++    Sentry.captureException(err, {
++      tags: { component: "revenueCat", phase: "restorePurchases" },
++    });
++    return null;
++  }
++}
++
++/**
++ * Read the current CustomerInfo from RC's cache. Triggers a fresh fetch
++ * from RC's backend on first call after configure(). Subsequent calls
++ * return the cached value updated by the listener.
++ */
++export async function getCustomerInfo(): Promise<{
++  customerInfo: CustomerInfo;
++  details:      SubscriptionDetails;
++} | null> {
++  if (!_configured) return null;
++  const mod = await loadPurchases();
++  if (!mod) return null;
++  try {
++    const customerInfo = await mod.default.getCustomerInfo();
++    return { customerInfo, details: deriveSubscriptionDetails(customerInfo) };
++  } catch (err) {
++    Sentry.captureException(err, {
++      tags: { component: "revenueCat", phase: "getCustomerInfo" },
++    });
++    return null;
++  }
++}
++
++// ─── Listener fanout ──────────────────────────────────────────────────────
++
++function attachNativeListener(mod: typeof import("react-native-purchases")): void {
++  if (_nativeListenerAttached) return;
++  try {
++    mod.default.addCustomerInfoUpdateListener((info: CustomerInfo) => {
++      for (const fn of _infoListeners) {
++        try { fn(info); } catch (e) {
++          // Don't let one bad listener kill the rest.
++          console.warn("[revenueCat] listener threw:", e);
++        }
++      }
++    });
++    _nativeListenerAttached = true;
++  } catch (err) {
++    Sentry.captureException(err, {
++      tags: { component: "revenueCat", phase: "addCustomerInfoUpdateListener" },
++    });
++  }
++}
++
++/**
++ * Subscribe to customer-info updates from RC. Returns an unsubscribe fn.
++ *
++ * Use this in gameStore (or a hook) to refresh `parentSubscriptionTier`
++ * whenever RC notifies of a purchase / renewal / expiration / refund.
++ */
++export function addCustomerInfoListener(cb: InfoListener): () => void {
++  _infoListeners.add(cb);
++  return () => { _infoListeners.delete(cb); };
++}
++
++/** True iff this RC instance has been successfully configured. */
++export function isConfigured(): boolean {
++  return _configured;
++}
+diff --git a/lib/sentry.ts b/lib/sentry.ts
+index 3531ed8..b62bc07 100644
+--- a/lib/sentry.ts
++++ b/lib/sentry.ts
+@@ -295,7 +295,8 @@ export type GameBreadcrumbCategory =
+   | "cache"         // Redis hit / miss
+   | "xp"            // XP awarded
+   | "report"        // v4.7 — verdict report submitted
+-  | "pdf_export";   // Word Tome PDF generation
++  | "pdf_export"    // Word Tome PDF generation
++  | "revenuecat";   // Phase 4.4 — RC SDK lifecycle, purchases, customer-info updates
+ 
+ export function addGameBreadcrumb(opts: {
+   category: GameBreadcrumbCategory;
+diff --git a/package-lock.json b/package-lock.json
+index 1a4e681..eaed30f 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -33,6 +33,7 @@
+         "react-dom": "19.1.0",
+         "react-native": "0.81.5",
+         "react-native-gesture-handler": "~2.28.0",
++        "react-native-purchases": "10.0.1",
+         "react-native-reanimated": "~4.1.1",
+         "react-native-safe-area-context": "~5.6.0",
+         "react-native-screens": "~4.16.0",
+@@ -2800,6 +2801,27 @@
+         "nanoid": "^3.3.11"
+       }
+     },
++    "node_modules/@revenuecat/purchases-js": {
++      "version": "1.34.0",
++      "resolved": "https://registry.npmjs.org/@revenuecat/purchases-js/-/purchases-js-1.34.0.tgz",
++      "integrity": "sha512-p3hpHHvyllAckqnjpjaCoj+lVK0gNJwqR1F8EwZPw7eMKFummE0UItbGzBCfncJIPxGA1NJHrgZb1dLflEmjhg==",
++      "license": "MIT"
++    },
++    "node_modules/@revenuecat/purchases-js-hybrid-mappings": {
++      "version": "18.1.0",
++      "resolved": "https://registry.npmjs.org/@revenuecat/purchases-js-hybrid-mappings/-/purchases-js-hybrid-mappings-18.1.0.tgz",
++      "integrity": "sha512-P2KtqjPUcdEhTx51nzXAWNFoNTRzQm9lR/g2S90jQ/uzwrB4H7OJNRJ9B1NFNa511Uc84LfwmmIh51oeQO9+qQ==",
++      "license": "MIT",
++      "dependencies": {
++        "@revenuecat/purchases-js": "1.34.0"
++      }
++    },
++    "node_modules/@revenuecat/purchases-typescript-internal": {
++      "version": "18.1.0",
++      "resolved": "https://registry.npmjs.org/@revenuecat/purchases-typescript-internal/-/purchases-typescript-internal-18.1.0.tgz",
++      "integrity": "sha512-aoXmrvDSCVStXAbv+yfUkb1BEIga2hXYiUSLHOoGMX6luXXlSLNMeG7nhvMa7gXTgjnEZXDYOG59en4NNBtJ6A==",
++      "license": "MIT"
++    },
+     "node_modules/@sentry-internal/browser-utils": {
+       "version": "10.12.0",
+       "resolved": "https://registry.npmjs.org/@sentry-internal/browser-utils/-/browser-utils-10.12.0.tgz",
+@@ -6745,9 +6767,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -6768,9 +6787,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -6791,9 +6807,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -6814,9 +6827,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -8421,6 +8431,31 @@
+         "react-native": "*"
+       }
+     },
++    "node_modules/react-native-purchases": {
++      "version": "10.0.1",
++      "resolved": "https://registry.npmjs.org/react-native-purchases/-/react-native-purchases-10.0.1.tgz",
++      "integrity": "sha512-FyJgOLuGo2TqR/sswzgkUebiYu30FPAsB9N2goyv4q2pr5ixPL0v6QrETrYDpnPI8kz/wg+aMv8/HsAU9b6ajw==",
++      "license": "MIT",
++      "workspaces": [
++        "examples/purchaseTesterTypescript",
++        "react-native-purchases-ui",
++        "e2e-tests/MaestroTestApp"
++      ],
++      "dependencies": {
++        "@revenuecat/purchases-js-hybrid-mappings": "18.1.0",
++        "@revenuecat/purchases-typescript-internal": "18.1.0"
++      },
++      "peerDependencies": {
++        "react": ">= 16.6.3",
++        "react-native": ">= 0.73.0",
++        "react-native-web": "*"
++      },
++      "peerDependenciesMeta": {
++        "react-native-web": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/react-native-reanimated": {
+       "version": "4.1.7",
+       "resolved": "https://registry.npmjs.org/react-native-reanimated/-/react-native-reanimated-4.1.7.tgz",
+diff --git a/package.json b/package.json
+index 5b87313..8c39e6f 100644
+--- a/package.json
++++ b/package.json
+@@ -35,6 +35,7 @@
+     "react-dom": "19.1.0",
+     "react-native": "0.81.5",
+     "react-native-gesture-handler": "~2.28.0",
++    "react-native-purchases": "10.0.1",
+     "react-native-reanimated": "~4.1.1",
+     "react-native-safe-area-context": "~5.6.0",
+     "react-native-screens": "~4.16.0",
+diff --git a/screens/ParentDashboard.tsx b/screens/ParentDashboard.tsx
+index 90d59cf..9efed51 100644
+--- a/screens/ParentDashboard.tsx
++++ b/screens/ParentDashboard.tsx
+@@ -35,6 +35,8 @@ import {
+   RefreshControl,
+   Switch,
+   Modal,
++  Linking,
++  Platform,
+ } from "react-native";
+ import { useSafeAreaInsets }  from "react-native-safe-area-context";
+ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+@@ -63,6 +65,11 @@ import {
+ import type { RootStackParamList } from "../types/navigation";
+ type Props = NativeStackScreenProps<RootStackParamList, "ParentDashboard">;
+ 
++// Phase 4.4 — RC subscription state read from the store + free baseline used
++// by the dev-only Simulate toggle. Same lazy-safe import as gameStore.ts.
++import { useGameStore } from "../store/gameStore";
++import { FREE_SUBSCRIPTION, type SubscriptionDetails } from "../lib/revenueCat";
++
+ // ─── Types ────────────────────────────────────────────────────────────────────
+ 
+ interface ChildProfile {
+@@ -248,6 +255,206 @@ function QuestCard({ completion }: { completion: QuestCompletion }) {
+   );
+ }
+ 
++// ─── SubscriptionSection (Phase 4.4) ──────────────────────────────────────────
++//
++// Reads RC-derived `parentSubscriptionDetails` from the store and renders one
++// of three states:
++//   • free  → "Upgrade to Premium" CTA → navigates to PaywallScreen
++//   • paid  → plan name + "Manage subscription" deep link to store
++//   • paid + dev → adds a "Simulate Free" debug toggle (and converse for free).
++//
++// __DEV__-gated Simulate toggle. Lets you flip the local store between free
++// and paid without going through TestFlight — gates quest-lock and lock UI on
++// the QuestMap so we can verify both rendering states on Android local builds.
++// NEVER ships to TestFlight or Play (Babel strips __DEV__ branches in Release).
++
++function SubscriptionSection({
++  navigation,
++}: {
++  navigation: Props["navigation"];
++}) {
++  const details            = useGameStore((s) => s.parentSubscriptionDetails);
++  const setSubscriptionRc  = useGameStore((s) => s.setSubscriptionFromRC);
++
++  const isPaid             = details.isActive;
++  const planLabel          = planLabelFromDetails(details);
++  const renewalLabel       = renewalLabelFromDetails(details);
++
++  const handleUpgrade = useCallback(() => {
++    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
++    navigation.navigate("Paywall", { reason: "parent-dashboard" });
++  }, [navigation]);
++
++  const handleManage = useCallback(() => {
++    // Store-managed subscription. RC also exposes `details.managementUrl` but
++    // it's null for sandbox/dev — fall back to the canonical store URL.
++    const url = details.managementUrl
++      ?? (Platform.OS === "ios"
++        ? "https://apps.apple.com/account/subscriptions"
++        : "https://play.google.com/store/account/subscriptions");
++    Linking.openURL(url).catch(() => null);
++  }, [details.managementUrl]);
++
++  // __DEV__-only simulation. Flips between FREE_SUBSCRIPTION and a fake
++  // active-tier1 record so QuestMap lock states can be tested on local
++  // Android builds without burning EAS slots.
++  const handleSimulateToggle = useCallback(() => {
++    if (isPaid) {
++      setSubscriptionRc(FREE_SUBSCRIPTION);
++    } else {
++      setSubscriptionRc({
++        ...FREE_SUBSCRIPTION,
++        isActive:       true,
++        productId:      "lexilens_premium_monthly",
++        willRenew:      true,
++        tier:           "tier1",
++        expirationDate: Date.now() + 30 * 24 * 60 * 60 * 1000,
++        inGracePeriod:  false,
++      });
++    }
++  }, [isPaid, setSubscriptionRc]);
++
++  return (
++    <View style={styles.section}>
++      <Text style={styles.sectionTitle}>Subscription</Text>
++
++      <View style={subStyles.planRow}>
++        <View style={{ flex: 1 }}>
++          <Text style={subStyles.planLabel}>{planLabel}</Text>
++          {!!renewalLabel && (
++            <Text style={subStyles.planSub}>{renewalLabel}</Text>
++          )}
++        </View>
++        {isPaid && (
++          <View style={subStyles.activeBadge}>
++            <Text style={subStyles.activeBadgeText}>Active</Text>
++          </View>
++        )}
++      </View>
++
++      {isPaid ? (
++        <TouchableOpacity style={subStyles.secondaryBtn} onPress={handleManage}>
++          <Text style={subStyles.secondaryBtnText}>Manage subscription</Text>
++          <Text style={subStyles.chevron}>›</Text>
++        </TouchableOpacity>
++      ) : (
++        <TouchableOpacity style={subStyles.primaryBtn} onPress={handleUpgrade} activeOpacity={0.85}>
++          <Text style={subStyles.primaryBtnText}>✦ Upgrade to Premium</Text>
++        </TouchableOpacity>
++      )}
++
++      {__DEV__ && (
++        <TouchableOpacity style={subStyles.devBtn} onPress={handleSimulateToggle}>
++          <Text style={subStyles.devBtnText}>
++            🛠 DEV: Simulate {isPaid ? "Free" : "Premium (tier1)"}
++          </Text>
++        </TouchableOpacity>
++      )}
++    </View>
++  );
++}
++
++function planLabelFromDetails(details: SubscriptionDetails): string {
++  if (!details.isActive) return "Free plan";
++  switch (details.tier) {
++    case "family": return "Premium · Family";
++    case "tier2":  return "Premium · Pro";
++    case "tier1":  return "Premium";
++    default:       return "Premium";
++  }
++}
++
++function renewalLabelFromDetails(details: SubscriptionDetails): string | null {
++  if (!details.isActive) return "Unlock the full quest library + unlimited scans.";
++  if (details.inGracePeriod) return "Free trial — enjoy!";
++  if (!details.expirationDate) return null;
++  const when = new Date(details.expirationDate);
++  const fmt  = when.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
++  return details.willRenew ? `Renews ${fmt}` : `Ends ${fmt}`;
++}
++
++const subStyles = StyleSheet.create({
++  planRow: {
++    flexDirection:  "row",
++    alignItems:     "center",
++    paddingVertical: 8,
++  },
++  planLabel: {
++    fontSize:   16,
++    fontWeight: "700",
++    color:      P.inkBrown,
++  },
++  planSub: {
++    fontSize:  12,
++    color:     P.inkMid,
++    marginTop: 2,
++  },
++  activeBadge: {
++    backgroundColor:  P.greenBg,
++    borderWidth:      1,
++    borderColor:      P.greenBorder,
++    borderRadius:     12,
++    paddingHorizontal: 10,
++    paddingVertical:  4,
++  },
++  activeBadgeText: {
++    fontSize:   11,
++    fontWeight: "700",
++    color:      P.greenBadge,
++    letterSpacing: 0.3,
++  },
++  primaryBtn: {
++    backgroundColor:  P.amberAccent,
++    borderRadius:     14,
++    paddingVertical:  14,
++    paddingHorizontal: 16,
++    alignItems:       "center",
++    marginTop:        12,
++  },
++  primaryBtnText: {
++    color:        "#fff",
++    fontSize:     15,
++    fontWeight:   "700",
++    letterSpacing: 0.4,
++  },
++  secondaryBtn: {
++    flexDirection:    "row",
++    alignItems:       "center",
++    justifyContent:   "space-between",
++    backgroundColor:  P.parchment,
++    borderRadius:     12,
++    paddingVertical:  12,
++    paddingHorizontal: 14,
++    marginTop:        12,
++    borderWidth:      1,
++    borderColor:      P.warmBorder,
++  },
++  secondaryBtnText: {
++    fontSize:   14,
++    fontWeight: "600",
++    color:      P.inkBrown,
++  },
++  chevron: {
++    fontSize: 20,
++    color:    P.inkLight,
++  },
++  devBtn: {
++    marginTop:        10,
++    paddingVertical:  8,
++    paddingHorizontal: 12,
++    borderRadius:     8,
++    borderWidth:      1,
++    borderColor:      P.purpleBorder,
++    backgroundColor:  P.purpleLight,
++    alignItems:       "center",
++  },
++  devBtnText: {
++    fontSize:   12,
++    color:      P.purpleAccent,
++    fontWeight: "600",
++  },
++});
++
+ // ─── LumiSettingsCard ─────────────────────────────────────────────────────────
+ // Mounted between AchievementBadgeGrid and Word Tome. Sound row only renders
+ // if expo-audio is actually installed (isLumiAudioAvailable returns true).
+@@ -815,6 +1022,9 @@ export function ParentDashboard({ navigation }: Props) {
+             </View>
+           )}
+ 
++          {/* ── Subscription (Phase 4.4) ─────────────────── */}
++          <SubscriptionSection navigation={navigation} />
++
+           {/* ── Account & Privacy ────────────────────────── */}
+           <View style={[styles.section, { marginBottom: 8 }]}>
+             <Text style={styles.sectionTitle}>Account & Privacy</Text>
+diff --git a/screens/PaywallScreen.tsx b/screens/PaywallScreen.tsx
+new file mode 100644
+index 0000000..9a862ce
+--- /dev/null
++++ b/screens/PaywallScreen.tsx
+@@ -0,0 +1,592 @@
++/**
++ * screens/PaywallScreen.tsx
++ * Lexi-Lens — Phase 4.4 paywall.
++ *
++ * Custom paywall (not RevenueCat-hosted) because:
++ *   • react-native-purchases-ui has incompatibility issues with Expo SDK 54
++ *     (RC issue #1450 — PurchasesHybridCommonUI pod resolution fails).
++ *   • A kids' brand needs design control — Lexi-Lens purple/amber, magical
++ *     framing, no generic SaaS upsell language.
++ *   • Custom paywall composes packages from RC's `getOfferings()` and calls
++ *     `purchasePackage()` on tap — same purchase flow, our look.
++ *
++ * Mounted as a modal route ("Paywall") via the root stack. Triggers:
++ *   • QuestMapScreen — tapping a locked premium quest
++ *   • ParentDashboard — tapping the "Upgrade" CTA in the subscription card
++ *   • RateLimitWall — tapping "Upgrade for unlimited scans"
++ *
++ * Required App Store / Play Store elements (Apple guideline 3.1.2):
++ *   • "Restore Purchases" button — always visible
++ *   • Privacy Policy + Terms of Service links — visible before purchase
++ *   • Auto-renewal disclosure copy for monthly/annual plans
++ *   • Price + period clearly shown per package
++ *
++ * In __DEV__ (where RC is intentionally not initialized — see
++ * lib/revenueCat.ts), this screen renders a "Dev preview" mode with a mock
++ * package and disabled CTA, so layout work doesn't require a TestFlight loop.
++ */
++
++import React, { useEffect, useState, useCallback } from "react";
++import {
++  View,
++  Text,
++  ScrollView,
++  TouchableOpacity,
++  StyleSheet,
++  ActivityIndicator,
++  Linking,
++  Alert,
++  Platform,
++} from "react-native";
++import { useSafeAreaInsets } from "react-native-safe-area-context";
++import type { NativeStackScreenProps } from "@react-navigation/native-stack";
++import * as Haptics from "expo-haptics";
++
++import {
++  fetchCurrentOffering,
++  purchasePackage,
++  restorePurchases,
++  isConfigured,
++  type PurchasesPackage,
++  type PurchasesOffering,
++} from "../lib/revenueCat";
++import { useGameStore } from "../store/gameStore";
++import type { RootStackParamList } from "../types/navigation";
++
++type Props = NativeStackScreenProps<RootStackParamList, "Paywall">;
++
++// ─── Palette ──────────────────────────────────────────────────────────────
++
++const P = {
++  bg:            "#0f0620",
++  cardBg:        "rgba(124,58,237,0.10)",
++  cardBorder:    "rgba(124,58,237,0.35)",
++  cardSelectBg:  "rgba(245,200,66,0.10)",
++  cardSelectBd:  "rgba(245,200,66,0.65)",
++  primary:       "#7c3aed",
++  primaryDim:    "#5b21b6",
++  accent:        "#f5c842",
++  accentDim:     "#7a6a3a",
++  textPrimary:   "#f5f3ff",
++  textSecondary: "#c4b5fd",
++  textMuted:     "#a78bfa",
++  textDim:       "#6b7280",
++  success:       "#22c55e",
++  error:         "#ef4444",
++  divider:       "rgba(255,255,255,0.08)",
++};
++
++// ─── Bullet line ──────────────────────────────────────────────────────────
++
++function Bullet({ children }: { children: React.ReactNode }) {
++  return (
++    <View style={styles.bullet}>
++      <Text style={styles.bulletDot}>✦</Text>
++      <Text style={styles.bulletText}>{children}</Text>
++    </View>
++  );
++}
++
++// ─── Package card ─────────────────────────────────────────────────────────
++
++interface PackageCardProps {
++  pkg:        PurchasesPackage;
++  selected:   boolean;
++  onSelect:   () => void;
++  highlight?: string;
++}
++
++function PackageCard({ pkg, selected, onSelect, highlight }: PackageCardProps) {
++  // RC's package types: ANNUAL, MONTHLY, etc. Use these for the title rather
++  // than the raw product identifier (more localized, more user-readable).
++  const title = packageTitle(pkg);
++  const price = pkg.product.priceString;
++  const perUnit = perUnitString(pkg);
++
++  return (
++    <TouchableOpacity
++      style={[styles.pkgCard, selected && styles.pkgCardSelected]}
++      onPress={onSelect}
++      activeOpacity={0.85}
++    >
++      {highlight && (
++        <View style={styles.pkgBadge}>
++          <Text style={styles.pkgBadgeText}>{highlight}</Text>
++        </View>
++      )}
++      <View style={styles.pkgRow}>
++        <View style={{ flex: 1 }}>
++          <Text style={[styles.pkgTitle, selected && { color: P.accent }]}>{title}</Text>
++          {perUnit && <Text style={styles.pkgSubtitle}>{perUnit}</Text>}
++        </View>
++        <Text style={[styles.pkgPrice, selected && { color: P.accent }]}>{price}</Text>
++      </View>
++    </TouchableOpacity>
++  );
++}
++
++function packageTitle(pkg: PurchasesPackage): string {
++  switch (pkg.packageType) {
++    case "ANNUAL":     return "Yearly";
++    case "MONTHLY":    return "Monthly";
++    case "WEEKLY":     return "Weekly";
++    case "TWO_MONTH":  return "Every 2 months";
++    case "THREE_MONTH":return "Every 3 months";
++    case "SIX_MONTH":  return "Every 6 months";
++    case "LIFETIME":   return "Lifetime";
++    default:           return pkg.product.title || "Premium";
++  }
++}
++
++function perUnitString(pkg: PurchasesPackage): string | null {
++  // Render "≈ ₹29/mo" under the annual price when we can compute it.
++  if (pkg.packageType !== "ANNUAL") return null;
++  const price = pkg.product.price;
++  if (!price || price <= 0) return null;
++  const perMonth = price / 12;
++  const currency = pkg.product.currencyCode || "";
++  const formatted = perMonth.toFixed(2);
++  return `≈ ${currency} ${formatted}/month`;
++}
++
++// ─── Highlight selector ───────────────────────────────────────────────────
++//
++// "Best value" badge goes on the annual package when both monthly + annual
++// are present. Computed at render time, not configured in RC, so we don't
++// need to edit dashboard metadata to change the marketing language.
++
++function packageHighlights(pkgs: PurchasesPackage[]): Map<string, string> {
++  const map = new Map<string, string>();
++  const annual = pkgs.find((p) => p.packageType === "ANNUAL");
++  const monthly = pkgs.find((p) => p.packageType === "MONTHLY");
++  if (annual && monthly) {
++    const monthlyAnnualised = monthly.product.price * 12;
++    const annualPrice       = annual.product.price;
++    if (monthlyAnnualised > 0) {
++      const saved = Math.round((1 - annualPrice / monthlyAnnualised) * 100);
++      if (saved >= 5) map.set(annual.identifier, `Save ${saved}%`);
++      else            map.set(annual.identifier, "Best value");
++    } else {
++      map.set(annual.identifier, "Best value");
++    }
++  } else if (annual && !monthly) {
++    map.set(annual.identifier, "Best value");
++  }
++  return map;
++}
++
++// ─── Screen ───────────────────────────────────────────────────────────────
++
++export default function PaywallScreen({ navigation, route }: Props) {
++  const insets = useSafeAreaInsets();
++  const reason = route.params?.reason ?? "premium";
++
++  const [loading,  setLoading]  = useState(true);
++  const [offering, setOffering] = useState<PurchasesOffering | null>(null);
++  const [selected, setSelected] = useState<string | null>(null);
++  const [purchasing, setPurchasing] = useState(false);
++  const [restoring,  setRestoring]  = useState(false);
++
++  const setSubscriptionFromRC = useGameStore((s) => s.setSubscriptionFromRC);
++
++  // Initial fetch
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      const off = await fetchCurrentOffering();
++      if (cancelled) return;
++      setOffering(off);
++      // Pre-select annual if available; else first package.
++      if (off?.availablePackages?.length) {
++        const annual = off.availablePackages.find((p) => p.packageType === "ANNUAL");
++        setSelected(annual?.identifier ?? off.availablePackages[0].identifier);
++      }
++      setLoading(false);
++    })();
++    return () => { cancelled = true; };
++  }, []);
++
++  // ── Actions ────────────────────────────────────────────────────────────
++
++  const handleClose = useCallback(() => {
++    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
++    navigation.goBack();
++  }, [navigation]);
++
++  const handleSelect = useCallback((id: string) => {
++    Haptics.selectionAsync();
++    setSelected(id);
++  }, []);
++
++  const handlePurchase = useCallback(async () => {
++    if (!offering || !selected || purchasing) return;
++    const pkg = offering.availablePackages.find((p) => p.identifier === selected);
++    if (!pkg) return;
++
++    if (!isConfigured()) {
++      Alert.alert(
++        "Not available",
++        "Purchases aren't available in this build. Please run a release build on TestFlight or Play Internal Testing.",
++      );
++      return;
++    }
++
++    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
++    setPurchasing(true);
++    const outcome = await purchasePackage(pkg);
++    setPurchasing(false);
++
++    if (outcome.kind === "success") {
++      // Update store immediately — webhook will follow.
++      setSubscriptionFromRC(outcome.details);
++      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
++      Alert.alert("✨ Welcome to Premium!", "Your account is now upgraded. Enjoy all premium quests!", [
++        { text: "Continue", onPress: () => navigation.goBack() },
++      ]);
++    } else if (outcome.kind === "cancelled") {
++      // No alert — cancel is silent UX.
++    } else {
++      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
++      Alert.alert("Purchase failed", outcome.message);
++    }
++  }, [offering, selected, purchasing, navigation, setSubscriptionFromRC]);
++
++  const handleRestore = useCallback(async () => {
++    if (restoring) return;
++    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
++    setRestoring(true);
++    const result = await restorePurchases();
++    setRestoring(false);
++
++    if (result?.details.isActive) {
++      setSubscriptionFromRC(result.details);
++      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
++      Alert.alert("Purchases restored", "Your Premium subscription has been restored.", [
++        { text: "Continue", onPress: () => navigation.goBack() },
++      ]);
++    } else {
++      Alert.alert(
++        "Nothing to restore",
++        "We couldn't find an active purchase on this account. If you believe this is an error, contact support.",
++      );
++    }
++  }, [restoring, navigation, setSubscriptionFromRC]);
++
++  const handlePrivacy = useCallback(() => {
++    Linking.openURL("https://lexilens.app/privacy-policy").catch(() => null);
++  }, []);
++
++  const handleTerms = useCallback(() => {
++    Linking.openURL("https://lexilens.app/terms").catch(() => null);
++  }, []);
++
++  const handleManage = useCallback(() => {
++    // Deep link to App Store / Play Store subscription management.
++    const url = Platform.OS === "ios"
++      ? "https://apps.apple.com/account/subscriptions"
++      : "https://play.google.com/store/account/subscriptions";
++    Linking.openURL(url).catch(() => null);
++  }, []);
++
++  // ── Render states ──────────────────────────────────────────────────────
++
++  if (loading) {
++    return (
++      <View style={[styles.screen, styles.center]}>
++        <ActivityIndicator size="large" color={P.accent} />
++      </View>
++    );
++  }
++
++  // RC not configured (most likely __DEV__ or missing keys) — render preview-only.
++  if (!offering && !isConfigured()) {
++    return (
++      <View style={[styles.screen]}>
++        <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
++          <TouchableOpacity onPress={handleClose} style={styles.closeBtn}>
++            <Text style={styles.closeBtnText}>✕</Text>
++          </TouchableOpacity>
++        </View>
++        <ScrollView contentContainerStyle={{ padding: 24, paddingBottom: insets.bottom + 40 }}>
++          <Text style={styles.title}>✦ Premium Preview</Text>
++          <Text style={styles.subtitle}>
++            Paywall is not active in this build. Run a release build on TestFlight or Play Internal Testing
++            to test purchases.
++          </Text>
++          <View style={styles.bullets}>
++            <Bullet>Unlock 50+ premium quests across all tiers</Bullet>
++            <Bullet>Custom AI quests for your child's interests</Bullet>
++            <Bullet>Unlimited daily scans (Free is capped at 5)</Bullet>
++            <Bullet>Hard-mode challenges + bonus XP</Bullet>
++          </View>
++        </ScrollView>
++      </View>
++    );
++  }
++
++  // RC configured but no offering — surface this to the user with actionable copy.
++  if (!offering) {
++    return (
++      <View style={[styles.screen]}>
++        <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
++          <TouchableOpacity onPress={handleClose} style={styles.closeBtn}>
++            <Text style={styles.closeBtnText}>✕</Text>
++          </TouchableOpacity>
++        </View>
++        <View style={[styles.center, { padding: 24 }]}>
++          <Text style={styles.title}>Premium</Text>
++          <Text style={styles.subtitle}>
++            We couldn't load purchase options. Please check your connection and try again.
++          </Text>
++          <TouchableOpacity style={styles.restoreBtn} onPress={handleRestore} disabled={restoring}>
++            {restoring
++              ? <ActivityIndicator color={P.textPrimary} />
++              : <Text style={styles.restoreBtnText}>Restore Purchases</Text>}
++          </TouchableOpacity>
++        </View>
++      </View>
++    );
++  }
++
++  const packages = offering.availablePackages;
++  const highlights = packageHighlights(packages);
++
++  return (
++    <View style={styles.screen}>
++      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
++        <TouchableOpacity onPress={handleClose} style={styles.closeBtn}>
++          <Text style={styles.closeBtnText}>✕</Text>
++        </TouchableOpacity>
++      </View>
++
++      <ScrollView
++        contentContainerStyle={{ padding: 24, paddingBottom: insets.bottom + 40 }}
++        showsVerticalScrollIndicator={false}
++      >
++        <Text style={styles.title}>✦ Unlock Premium</Text>
++        <Text style={styles.subtitle}>
++          {reasonCopy(reason)}
++        </Text>
++
++        <View style={styles.bullets}>
++          <Bullet>50+ premium quests across all tiers</Bullet>
++          <Bullet>Unlimited daily scans (Free is capped daily)</Bullet>
++          <Bullet>Custom AI quests for your child's interests</Bullet>
++          <Bullet>Hard-mode challenges with bonus XP</Bullet>
++          <Bullet>Sibling profiles + cross-device sync</Bullet>
++        </View>
++
++        <View style={styles.divider} />
++
++        <Text style={styles.pkgGroupLabel}>Choose your plan</Text>
++
++        {packages.map((p) => (
++          <PackageCard
++            key={p.identifier}
++            pkg={p}
++            selected={selected === p.identifier}
++            onSelect={() => handleSelect(p.identifier)}
++            highlight={highlights.get(p.identifier)}
++          />
++        ))}
++
++        <TouchableOpacity
++          style={[styles.cta, (purchasing || !selected) && styles.ctaDisabled]}
++          onPress={handlePurchase}
++          disabled={purchasing || !selected}
++          activeOpacity={0.85}
++        >
++          {purchasing
++            ? <ActivityIndicator color={P.bg} />
++            : <Text style={styles.ctaText}>
++                {hasIntroOffer(packages, selected) ? "Start Free Trial" : "Subscribe"}
++              </Text>
++          }
++        </TouchableOpacity>
++
++        <Text style={styles.legalBlock}>
++          Auto-renewable subscription. Cancel anytime in your {Platform.OS === "ios" ? "Apple ID" : "Google Play"} account
++          settings. Payment is charged to your account at purchase confirmation. Subscription auto-renews unless
++          cancelled at least 24 hours before the end of the current period.
++        </Text>
++
++        <View style={styles.linkRow}>
++          <TouchableOpacity onPress={handleRestore} disabled={restoring}>
++            {restoring
++              ? <ActivityIndicator color={P.textMuted} size="small" />
++              : <Text style={styles.link}>Restore Purchases</Text>}
++          </TouchableOpacity>
++          <Text style={styles.linkSep}>·</Text>
++          <TouchableOpacity onPress={handleManage}>
++            <Text style={styles.link}>Manage</Text>
++          </TouchableOpacity>
++        </View>
++
++        <View style={styles.linkRow}>
++          <TouchableOpacity onPress={handlePrivacy}>
++            <Text style={styles.link}>Privacy Policy</Text>
++          </TouchableOpacity>
++          <Text style={styles.linkSep}>·</Text>
++          <TouchableOpacity onPress={handleTerms}>
++            <Text style={styles.link}>Terms of Service</Text>
++          </TouchableOpacity>
++        </View>
++      </ScrollView>
++    </View>
++  );
++}
++
++function hasIntroOffer(pkgs: PurchasesPackage[], selectedId: string | null): boolean {
++  if (!selectedId) return false;
++  const pkg = pkgs.find((p) => p.identifier === selectedId);
++  // RC product has `introPrice` populated when an introductory offer is configured.
++  return !!pkg?.product?.introPrice;
++}
++
++function reasonCopy(reason: string): string {
++  switch (reason) {
++    case "rate-limit":
++      return "You've hit today's free scan limit. Premium gives you unlimited daily scans and the full quest library.";
++    case "quest-locked":
++      return "This is a Premium quest. Unlock the full quest library, custom AI quests, and unlimited scans.";
++    case "parent-dashboard":
++      return "Take your child's adventure further with the full Premium experience.";
++    default:
++      return "Unlock the full Lexi-Lens adventure for your child.";
++  }
++}
++
++// ─── Styles ───────────────────────────────────────────────────────────────
++
++const styles = StyleSheet.create({
++  screen: {
++    flex: 1,
++    backgroundColor: P.bg,
++  },
++  center: { alignItems: "center", justifyContent: "center", flex: 1 },
++
++  header: {
++    flexDirection:   "row",
++    justifyContent:  "flex-end",
++    paddingHorizontal: 16,
++    paddingBottom:   4,
++  },
++  closeBtn: {
++    width:          36,
++    height:         36,
++    borderRadius:   18,
++    backgroundColor: "rgba(255,255,255,0.08)",
++    alignItems:     "center",
++    justifyContent: "center",
++  },
++  closeBtnText: { fontSize: 18, color: P.textPrimary, fontWeight: "600" },
++
++  title: {
++    fontSize:   28,
++    fontWeight: "800",
++    color:      P.textPrimary,
++    marginBottom: 8,
++    letterSpacing: 0.3,
++  },
++  subtitle: {
++    fontSize:   15,
++    color:      P.textSecondary,
++    lineHeight: 22,
++    marginBottom: 24,
++  },
++
++  bullets: { gap: 10, marginBottom: 8 },
++  bullet:  { flexDirection: "row", alignItems: "flex-start", gap: 10 },
++  bulletDot:  { fontSize: 14, color: P.accent, marginTop: 1 },
++  bulletText: { fontSize: 14, color: P.textPrimary, flex: 1, lineHeight: 20 },
++
++  divider: {
++    height: 1,
++    backgroundColor: P.divider,
++    marginVertical: 20,
++  },
++
++  pkgGroupLabel: {
++    fontSize:     11,
++    color:        P.textMuted,
++    textTransform: "uppercase",
++    letterSpacing: 1.2,
++    marginBottom: 10,
++    fontWeight:   "700",
++  },
++
++  pkgCard: {
++    backgroundColor: P.cardBg,
++    borderRadius: 14,
++    borderWidth:  1,
++    borderColor:  P.cardBorder,
++    padding:      14,
++    marginBottom: 10,
++    position:     "relative",
++  },
++  pkgCardSelected: {
++    backgroundColor: P.cardSelectBg,
++    borderColor:     P.cardSelectBd,
++    borderWidth:     1.5,
++  },
++  pkgRow:    { flexDirection: "row", alignItems: "center" },
++  pkgTitle:  { fontSize: 16, color: P.textPrimary, fontWeight: "700" },
++  pkgSubtitle: { fontSize: 12, color: P.textMuted, marginTop: 2 },
++  pkgPrice:  { fontSize: 18, color: P.textPrimary, fontWeight: "800" },
++
++  pkgBadge: {
++    position:        "absolute",
++    top:             -10,
++    right:           12,
++    backgroundColor: P.accent,
++    paddingHorizontal: 10,
++    paddingVertical: 3,
++    borderRadius:    10,
++  },
++  pkgBadgeText: {
++    fontSize:   10,
++    fontWeight: "800",
++    color:      P.bg,
++    letterSpacing: 0.5,
++  },
++
++  cta: {
++    marginTop:    18,
++    height:       54,
++    borderRadius: 14,
++    backgroundColor: P.accent,
++    alignItems:   "center",
++    justifyContent: "center",
++  },
++  ctaDisabled: { backgroundColor: P.accentDim },
++  ctaText:     { fontSize: 17, fontWeight: "800", color: P.bg, letterSpacing: 0.4 },
++
++  restoreBtn: {
++    marginTop:    14,
++    height:       46,
++    borderRadius: 12,
++    borderWidth:  1,
++    borderColor:  P.primary,
++    paddingHorizontal: 20,
++    alignItems:   "center",
++    justifyContent: "center",
++  },
++  restoreBtnText: { fontSize: 14, fontWeight: "700", color: P.textSecondary },
++
++  legalBlock: {
++    fontSize:    11,
++    color:       P.textDim,
++    lineHeight:  16,
++    marginTop:   14,
++  },
++
++  linkRow: {
++    flexDirection:   "row",
++    justifyContent:  "center",
++    alignItems:      "center",
++    gap:             8,
++    marginTop:       14,
++  },
++  link:    { fontSize: 13, color: P.textMuted, textDecorationLine: "underline" },
++  linkSep: { fontSize: 13, color: P.textDim },
++});
+diff --git a/screens/QuestMapScreen.tsx b/screens/QuestMapScreen.tsx
+index d9a6f9c..3878eec 100644
+--- a/screens/QuestMapScreen.tsx
++++ b/screens/QuestMapScreen.tsx
+@@ -35,7 +35,6 @@ import {
+   StyleSheet,
+   Platform,
+   ActivityIndicator,
+-  Alert,
+ } from "react-native";
+ import { useSafeAreaInsets } from "react-native-safe-area-context";
+ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+@@ -211,11 +210,18 @@ function QuestCard({
+   quest,
+   onBegin,
+   onHardMode,
++  onLockedTap,
+   isLocked,
+ }: {
+-  quest:      Quest;
+-  onBegin:    () => void;
+-  onHardMode: () => void;
++  quest:       Quest;
++  onBegin:     () => void;
++  onHardMode:  () => void;
++  /**
++   * Phase 4.4 — invoked when a free user taps a premium-locked card. Lives
++   * on the parent so it has navigation access for the Paywall modal route.
++   * The pre-RC Alert.alert flow has been retired; this opens PaywallScreen.
++   */
++  onLockedTap: () => void;
+   /**
+    * v6.0 — true when quest is paid-tier and the parent is on free.
+    * Renders a greyed card with a 🔒 Premium CTA instead of Begin.
+@@ -244,21 +250,13 @@ function QuestCard({
+   const maxXpRetry  = Math.round((quest.xp_reward_retry     ?? 25) * propCount * multiBonus);
+ 
+   // ── v6.0 — Premium-locked tap handler ─────────────────────
+-  // Pre-RevenueCat (Phase 4.4): single Alert explaining the lock.
+-  // Post-RevenueCat: replace this body with the paywall trigger.
++  // Phase 4.4: tap routes to PaywallScreen modal via the parent's
++  // handleLockedTap (passed in as `onLockedTap`). Haptic warning kept here
++  // so the feedback fires before the navigation transition.
+   const handleLockedTap = useCallback(() => {
+     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+-    Alert.alert(
+-      "🔒 Premium Quest",
+-      `"${quest.name}" is part of the Premium adventure pack.\n\nUpgrade your account to unlock all premium dungeons, harder challenges, and more XP.`,
+-      [
+-        { text: "Maybe later", style: "cancel" },
+-        // TODO Phase 4.4 — replace with RevenueCat paywall presenter.
+-        { text: "Tell me more", style: "default", onPress: () => { /* paywall hook */ } },
+-      ],
+-      { cancelable: true },
+-    );
+-  }, [quest.name]);
++    onLockedTap();
++  }, [onLockedTap]);
+ 
+   return (
+     <View
+@@ -478,6 +476,12 @@ export function QuestMapScreen({ navigation }: Props) {
+     navigation.navigate("Scan", { questId: dailyQuestObj.id, hardMode: false });
+   }, [dailyQuestObj, navigation]);
+ 
++  // Phase 4.4 — locked premium quest tap → PaywallScreen modal. Lifted here
++  // (vs inside QuestCard) so navigation is in scope. Haptic fires in the card.
++  const handleLockedTap = useCallback(() => {
++    navigation.navigate("Paywall", { reason: "quest-locked" });
++  }, [navigation]);
++
+   // Build SectionList sections from tier groups
+   const sections = useMemo(() => {
+     return tierGroups.map((group: TierGroup) => {
+@@ -531,10 +535,11 @@ export function QuestMapScreen({ navigation }: Props) {
+           isLocked={isLocked}
+           onBegin={() => handleBegin(item.quest, false)}
+           onHardMode={() => handleBegin(item.quest, true)}
++          onLockedTap={handleLockedTap}
+         />
+       );
+     },
+-    [handleBegin, parentTier]
++    [handleBegin, handleLockedTap, parentTier]
+   );
+ 
+   const keyExtractor = useCallback(
+diff --git a/store/gameStore.ts b/store/gameStore.ts
+index 17e0587..59bc825 100644
+--- a/store/gameStore.ts
++++ b/store/gameStore.ts
+@@ -60,6 +60,15 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
+ import { supabase } from "../lib/supabase";
+ import { addGameBreadcrumb } from "../lib/sentry";
+ 
++// Phase 4.4 — RevenueCat subscription type. Value (FREE_SUBSCRIPTION) and type
++// (SubscriptionDetails) only; the native SDK is NOT loaded by this import
++// (lib/revenueCat lazy-loads `react-native-purchases` to dodge iOS bridgeless
++// module-init crashes — see that file's header for context).
++import {
++  FREE_SUBSCRIPTION,
++  type SubscriptionDetails,
++} from "../lib/revenueCat";
++
+ // N4 — Achievement service imports
+ import {
+   loadEarnedAchievements,
+@@ -388,6 +397,32 @@ interface GameState {
+    * Idempotent; safe to call from any mount.
+    */
+   loadParentProfile:     () => Promise<void>;
++
++  // ── Phase 4.4 — RevenueCat granular subscription details ───────────────
++  /**
++   * Granular RC-derived subscription state. Persisted via partialize so the
++   * UI doesn't flash "free" on cold start before getCustomerInfo() resolves.
++   *
++   * The legacy `parentSubscriptionTier` field (above) stays as the binary
++   * free/paid lock-driver used by selectIsQuestLocked. setSubscriptionFromRC
++   * keeps both fields in sync — never set one without the other.
++   *
++   * Source of truth: SERVER (parents.subscription_tier, written by webhook).
++   * This client field is the FRESHNESS layer — RC fires customer-info events
++   * faster than the webhook round-trip, so the UI flips premium the moment
++   * a purchase completes, then re-converges with the DB on next reload.
++   */
++  parentSubscriptionDetails: SubscriptionDetails;
++  /**
++   * Write RC-derived details into the store. Triggered by:
++   *   • PaywallScreen on successful purchase / restore
++   *   • App.tsx RC customer-info listener (renewals, refunds, expirations)
++   *   • ParentDashboard dev-only "Simulate Paid" toggle (__DEV__)
++   *
++   * Also updates the binary parentSubscriptionTier — so existing quest-lock
++   * selectors (selectIsQuestLocked) react without needing to know about RC.
++   */
++  setSubscriptionFromRC: (details: SubscriptionDetails) => void;
+ }
+ 
+ // ─── Helpers ──────────────────────────────────────────────────────────────────
+@@ -466,6 +501,29 @@ export const useGameStore = create<GameState>()(
+       // v6.0 — null until loadParentProfile() resolves; render as free meanwhile
+       parentSubscriptionTier: null,
+ 
++      // Phase 4.4 — granular RC details. FREE_SUBSCRIPTION until either the
++      // webhook lands or RC's customer-info listener fires post-purchase.
++      parentSubscriptionDetails: FREE_SUBSCRIPTION,
++
++      setSubscriptionFromRC: (details) => {
++        // Keep the binary tier in sync so legacy selectors (selectIsQuestLocked)
++        // react without needing RC awareness. Active entitlement → 'paid'.
++        const binaryTier: "free" | "paid" = details.isActive ? "paid" : "free";
++        set({
++          parentSubscriptionDetails: details,
++          parentSubscriptionTier:    binaryTier,
++        });
++        addGameBreadcrumb({
++          category: "revenuecat",
++          message:  "Store updated from RC",
++          data: {
++            isActive:  details.isActive,
++            tier:      details.tier,
++            productId: details.productId,
++          },
++        });
++      },
++
+       resetSessionCounters: () =>
+         set({ sessionCounters: { questsStarted: 0, questsFinished: 0, xpEarned: 0 } }),
+ 
+@@ -1285,6 +1343,10 @@ export const useGameStore = create<GameState>()(
+         // v6.0 — persist parent tier so cold-start QuestMap doesn't flash
+         // unlocked content for a beat before loadParentProfile() resolves.
+         parentSubscriptionTier: state.parentSubscriptionTier,
++        // Phase 4.4 — persist RC details so the ParentDashboard "Premium"
++        // badge and PaywallScreen entry-state are correct on cold start
++        // before RC's customer-info round-trip completes.
++        parentSubscriptionDetails: state.parentSubscriptionDetails,
+       }),
+     }
+   )
+diff --git a/supabase/functions/revenuecat-webhook/index.ts b/supabase/functions/revenuecat-webhook/index.ts
+new file mode 100644
+index 0000000..1a44195
+--- /dev/null
++++ b/supabase/functions/revenuecat-webhook/index.ts
+@@ -0,0 +1,369 @@
++/**
++ * supabase/functions/revenuecat-webhook/index.ts
++ * Lexi-Lens — RevenueCat webhook handler (Phase 4.4).
++ *
++ * POST /functions/v1/revenuecat-webhook
++ *
++ * What this function does
++ * ───────────────────────
++ * Receives RevenueCat server-to-server notifications and updates
++ * `parents.subscription_tier` accordingly. This is the AUTHORITATIVE backend
++ * sync — server-side enforcement (Edge Functions, RLS policies) only trusts
++ * this column, not the client's read of RC.
++ *
++ * Security model
++ * ──────────────
++ * 1. Authorization header MUST match REVENUECAT_WEBHOOK_SECRET (a shared
++ *    secret you configure both in the RC Dashboard and as a Supabase Edge
++ *    Function secret). Bearer token format: `Authorization: Bearer <secret>`.
++ *    Without this, anyone can POST and grant themselves paid tier.
++ *
++ * 2. The function uses SERVICE_ROLE_KEY to bypass RLS — it must update rows
++ *    in `public.parents` regardless of who is signed in (the webhook isn't
++ *    signed in as anyone).
++ *
++ * 3. We deploy with `--no-verify-jwt` because RC's request isn't a
++ *    Supabase-signed JWT. We rely on the shared-secret bearer instead.
++ *
++ * Idempotency
++ * ───────────
++ * RC may retry on transient errors. The `revenuecat_webhook_log` table
++ * (migration 20260514) records every processed event_id. We check before
++ * applying state changes and short-circuit on duplicates.
++ *
++ * Event handling
++ * ──────────────
++ * Mapped events (entitlement gained → set tier):
++ *   • INITIAL_PURCHASE
++ *   • RENEWAL
++ *   • PRODUCT_CHANGE
++ *   • UNCANCELLATION
++ *   • TEMPORARY_ENTITLEMENT_GRANT   (RC promotional grant)
++ *   • SUBSCRIPTION_EXTENDED         (apple grace period extension)
++ *
++ * Entitlement lost → set tier='free':
++ *   • EXPIRATION
++ *   • BILLING_ISSUE                 (auto-renewal failed after grace)
++ *   • REFUND
++ *   • SUBSCRIPTION_PAUSED           (Android only)
++ *
++ * Special handling:
++ *   • CANCELLATION — user cancelled but entitlement remains until expiration.
++ *     We DO NOT change tier here; we wait for EXPIRATION.
++ *   • TRANSFER — RC moves the entitlement to a different app_user_id.
++ *     We update the OLD app_user_id to free and (if known) set the NEW one
++ *     to the active tier.
++ *
++ * Ignored events:
++ *   • TEST                          (RC dashboard "Send test event" button)
++ *   • NON_RENEWING_PURCHASE         (consumables — no entitlement state)
++ *
++ * Forward compatibility: unknown event types are logged + returned 200 so
++ * RC doesn't retry. New event types are added to the mapped sets above as
++ * RC introduces them.
++ *
++ * Tier mapping (entitlement product → schema tier)
++ * ────────────────────────────────────────────────
++ * Same as client (lib/revenueCat.ts:tierFromProductId). If you change
++ * product IDs in App Store Connect / Play Console, update BOTH places.
++ *
++ * Deploy
++ * ──────
++ *   supabase functions deploy revenuecat-webhook --no-verify-jwt
++ *
++ * Secrets required:
++ *   supabase secrets set REVENUECAT_WEBHOOK_SECRET=<shared-secret>
++ *
++ * RC Dashboard:
++ *   Project Settings → Integrations → Webhooks → Add webhook
++ *     URL:     https://<project-ref>.supabase.co/functions/v1/revenuecat-webhook
++ *     Headers: Authorization: Bearer <same-shared-secret>
++ */
++
++import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
++
++const corsHeaders = {
++  "Access-Control-Allow-Origin":  "*",
++  "Access-Control-Allow-Headers": "authorization, content-type",
++};
++
++// Must match `ENTITLEMENT_PREMIUM` in lib/revenueCat.ts.
++const ENTITLEMENT_ID = "premium";
++
++// Event-type sets — keep in sync with the doc block above.
++const EVENTS_GRANT_TIER = new Set([
++  "INITIAL_PURCHASE",
++  "RENEWAL",
++  "PRODUCT_CHANGE",
++  "UNCANCELLATION",
++  "TEMPORARY_ENTITLEMENT_GRANT",
++  "SUBSCRIPTION_EXTENDED",
++]);
++
++const EVENTS_REVOKE_TIER = new Set([
++  "EXPIRATION",
++  "BILLING_ISSUE",
++  "REFUND",
++  "SUBSCRIPTION_PAUSED",
++]);
++
++const EVENTS_IGNORE = new Set([
++  "TEST",
++  "NON_RENEWING_PURCHASE",
++  "CANCELLATION", // wait for EXPIRATION
++]);
++
++// ─── Tier mapping ─────────────────────────────────────────────────────────
++
++function tierFromProductId(productId: string | null | undefined): "free" | "tier1" | "tier2" | "family" {
++  if (!productId) return "free";
++  const id = productId.toLowerCase();
++  if (id.includes("family")) return "family";
++  if (id.includes("pro"))    return "tier2";
++  return "tier1";
++}
++
++// ─── Handler ──────────────────────────────────────────────────────────────
++
++Deno.serve(async (req: Request) => {
++  if (req.method === "OPTIONS") {
++    return new Response("ok", { headers: corsHeaders });
++  }
++  if (req.method !== "POST") {
++    return jsonResponse({ error: "Method not allowed" }, 405);
++  }
++
++  // ── 1. Authorization: shared bearer secret ─────────────────────────────
++  const expectedSecret = Deno.env.get("REVENUECAT_WEBHOOK_SECRET");
++  if (!expectedSecret) {
++    console.error("[revenuecat-webhook] REVENUECAT_WEBHOOK_SECRET not set");
++    return jsonResponse({ error: "Webhook secret not configured server-side" }, 500);
++  }
++
++  const authHeader = req.headers.get("authorization") ?? "";
++  const provided   = authHeader.replace(/^Bearer\s+/i, "").trim();
++  if (!provided || !timingSafeEqual(provided, expectedSecret)) {
++    return jsonResponse({ error: "Unauthorized" }, 401);
++  }
++
++  // ── 2. Parse + validate body ───────────────────────────────────────────
++  let payload: any;
++  try {
++    payload = await req.json();
++  } catch {
++    return jsonResponse({ error: "Invalid JSON" }, 400);
++  }
++
++  const event = payload?.event;
++  if (!event || typeof event.type !== "string" || typeof event.id !== "string") {
++    return jsonResponse({ error: "Missing event.id or event.type" }, 400);
++  }
++
++  const eventId      = event.id;
++  const eventType    = event.type;
++  const appUserId    = event.app_user_id as string | undefined;
++  const productId    = event.product_id  as string | undefined;
++  const expiresMs    = event.expiration_at_ms as number | undefined;
++
++  console.log(`[revenuecat-webhook] ${eventType} id=${eventId} user=${appUserId ?? "(none)"} product=${productId ?? "(none)"}`);
++
++  // ── 3. Connect to DB with service role ─────────────────────────────────
++  const supabaseUrl     = Deno.env.get("SUPABASE_URL");
++  const serviceRoleKey  = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
++  if (!supabaseUrl || !serviceRoleKey) {
++    console.error("[revenuecat-webhook] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
++    return jsonResponse({ error: "Server misconfigured" }, 500);
++  }
++  const supabase = createClient(supabaseUrl, serviceRoleKey, {
++    auth: { autoRefreshToken: false, persistSession: false },
++  });
++
++  // ── 4. Idempotency check ───────────────────────────────────────────────
++  // Insert a row pre-emptively; on conflict we know this event was already
++  // processed and can short-circuit.
++  const { data: logRow, error: logErr } = await supabase
++    .from("revenuecat_webhook_log")
++    .upsert(
++      {
++        event_id:    eventId,
++        event_type:  eventType,
++        app_user_id: appUserId ?? null,
++        product_id:  productId ?? null,
++        raw_payload: payload,
++      },
++      { onConflict: "event_id", ignoreDuplicates: true },
++    )
++    .select("event_id, processed_at")
++    .maybeSingle();
++
++  if (logErr) {
++    console.error("[revenuecat-webhook] Failed to insert log row:", logErr);
++    // Don't return 500 — RC will retry, possibly duplicating processing.
++    // We continue with best-effort. If the DB is genuinely down, the next
++    // statement will fail too and we'll return 500 there.
++  }
++
++  // upsert with ignoreDuplicates returns null on conflict. If null → duplicate.
++  if (!logRow && !logErr) {
++    console.log(`[revenuecat-webhook] Skipping duplicate event ${eventId}`);
++    return jsonResponse({ ok: true, duplicate: true });
++  }
++
++  // ── 5. Apply state change based on event type ──────────────────────────
++  if (EVENTS_IGNORE.has(eventType)) {
++    await markProcessed(supabase, eventId, "ignored");
++    return jsonResponse({ ok: true, ignored: true });
++  }
++
++  if (!appUserId) {
++    console.warn(`[revenuecat-webhook] No app_user_id on event ${eventId}; cannot map to parent`);
++    await markProcessed(supabase, eventId, "no_user");
++    return jsonResponse({ ok: true, no_user: true });
++  }
++
++  // RC's app_user_id is the Supabase parent UUID (set by Purchases.logIn in
++  // lib/revenueCat.ts:identifyParent). Validate that it parses as a UUID.
++  if (!isValidUUID(appUserId)) {
++    console.warn(`[revenuecat-webhook] app_user_id ${appUserId} is not a UUID — likely anonymous RC ID. Skipping.`);
++    await markProcessed(supabase, eventId, "anonymous_user");
++    return jsonResponse({ ok: true, anonymous: true });
++  }
++
++  // Special case: TRANSFER moves entitlement between users.
++  if (eventType === "TRANSFER") {
++    const transferredFrom = event.transferred_from as string[] | undefined;
++    const transferredTo   = event.transferred_to   as string[] | undefined;
++    return handleTransfer(supabase, eventId, transferredFrom, transferredTo, productId);
++  }
++
++  let newTier: "free" | "tier1" | "tier2" | "family";
++  if (EVENTS_GRANT_TIER.has(eventType)) {
++    newTier = tierFromProductId(productId);
++  } else if (EVENTS_REVOKE_TIER.has(eventType)) {
++    newTier = "free";
++  } else {
++    // Unknown event type — log and ignore so RC doesn't retry.
++    console.warn(`[revenuecat-webhook] Unknown event type: ${eventType}. Treating as no-op.`);
++    await markProcessed(supabase, eventId, "unknown_type");
++    return jsonResponse({ ok: true, unknown: true });
++  }
++
++  // Sanity: don't downgrade a parent in the brief window where two events
++  // race (e.g. RENEWAL arrives before BILLING_ISSUE clears). Defensive read.
++  const { data: parentRow } = await supabase
++    .from("parents")
++    .select("subscription_tier")
++    .eq("id", appUserId)
++    .maybeSingle();
++
++  if (!parentRow) {
++    console.warn(`[revenuecat-webhook] No parent row for ${appUserId} — RC user not in parents table. Skipping.`);
++    await markProcessed(supabase, eventId, "no_parent_row");
++    return jsonResponse({ ok: true, no_parent: true });
++  }
++
++  // For GRANT events with an expiration in the past, treat as revoke.
++  if (EVENTS_GRANT_TIER.has(eventType) && expiresMs && expiresMs < Date.now()) {
++    newTier = "free";
++  }
++
++  // Apply the update.
++  const { error: updErr } = await supabase
++    .from("parents")
++    .update({ subscription_tier: newTier })
++    .eq("id", appUserId);
++
++  if (updErr) {
++    console.error(`[revenuecat-webhook] Failed to update parent ${appUserId}:`, updErr);
++    // Return 500 so RC retries. The idempotency log row will protect against
++    // double-application on retry.
++    return jsonResponse({ error: "Update failed", details: updErr.message }, 500);
++  }
++
++  await markProcessed(supabase, eventId, "applied", newTier);
++
++  console.log(`[revenuecat-webhook] Applied tier=${newTier} for parent=${appUserId} (was ${parentRow.subscription_tier})`);
++  return jsonResponse({ ok: true, tier: newTier });
++});
++
++// ─── Helpers ──────────────────────────────────────────────────────────────
++
++async function markProcessed(
++  supabase: ReturnType<typeof createClient>,
++  eventId:  string,
++  status:   string,
++  appliedTier?: string,
++): Promise<void> {
++  await supabase
++    .from("revenuecat_webhook_log")
++    .update({
++      processed_at:    new Date().toISOString(),
++      processing_note: appliedTier ? `${status}:${appliedTier}` : status,
++    })
++    .eq("event_id", eventId);
++}
++
++async function handleTransfer(
++  supabase: ReturnType<typeof createClient>,
++  eventId:  string,
++  fromIds:  string[] | undefined,
++  toIds:    string[] | undefined,
++  productId: string | undefined,
++): Promise<Response> {
++  const tier = tierFromProductId(productId);
++
++  // Revoke from old users
++  if (fromIds && fromIds.length > 0) {
++    const validFrom = fromIds.filter(isValidUUID);
++    if (validFrom.length > 0) {
++      await supabase
++        .from("parents")
++        .update({ subscription_tier: "free" })
++        .in("id", validFrom);
++    }
++  }
++
++  // Grant to new users
++  if (toIds && toIds.length > 0) {
++    const validTo = toIds.filter(isValidUUID);
++    if (validTo.length > 0) {
++      await supabase
++        .from("parents")
++        .update({ subscription_tier: tier })
++        .in("id", validTo);
++    }
++  }
++
++  await markProcessed(supabase, eventId, "transfer", tier);
++  return jsonResponse({ ok: true, transfer: true, tier });
++}
++
++/**
++ * Constant-time string comparison. Standard `===` leaks length / prefix
++ * information via timing side channels — relevant when an attacker is
++ * brute-forcing the webhook secret.
++ */
++function timingSafeEqual(a: string, b: string): boolean {
++  if (a.length !== b.length) {
++    // Still run a fixed-time loop so length-mismatch doesn't itself leak.
++    let _ = 0;
++    for (let i = 0; i < Math.max(a.length, b.length); i++) _ |= 1;
++    return false;
++  }
++  let diff = 0;
++  for (let i = 0; i < a.length; i++) {
++    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
++  }
++  return diff === 0;
++}
++
++function isValidUUID(s: string): boolean {
++  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
++}
++
++function jsonResponse(body: unknown, status = 200): Response {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { ...corsHeaders, "Content-Type": "application/json" },
++  });
++}
+diff --git a/supabase/migrations/20260514_revenuecat_webhook_log.sql b/supabase/migrations/20260514_revenuecat_webhook_log.sql
+new file mode 100644
+index 0000000..f7da42e
+--- /dev/null
++++ b/supabase/migrations/20260514_revenuecat_webhook_log.sql
+@@ -0,0 +1,128 @@
++-- ============================================================================
++-- 20260514_revenuecat_webhook_log.sql
++-- Lexi-Lens — Phase 4.4 RevenueCat webhook idempotency log.
++--
++-- ─── What this migration does ──────────────────────────────────────────────
++--
++-- Creates public.revenuecat_webhook_log — a small append-only log used by the
++-- revenuecat-webhook Edge Function to deduplicate retried events.
++--
++-- RC retries webhooks on non-2xx responses for up to ~24h. Without an
++-- idempotency check, a retried INITIAL_PURCHASE would re-apply tier changes;
++-- a retried EXPIRATION followed by a RENEWAL with reordering could flap a
++-- parent free→paid→free incorrectly. The log catches all of this.
++--
++-- ─── Schema ────────────────────────────────────────────────────────────────
++--
++--   event_id         — RC's UUID for this event. PRIMARY KEY. Webhook upserts
++--                      with ON CONFLICT DO NOTHING; if the row already exists,
++--                      the event is a duplicate and is short-circuited.
++--   event_type       — INITIAL_PURCHASE, RENEWAL, EXPIRATION, etc. Indexed for
++--                      operational queries like "how many BILLING_ISSUE events
++--                      this week".
++--   app_user_id      — the RC app_user_id (= Supabase parent UUID in our setup,
++--                      but stored as text since RC may also send anonymous IDs
++--                      like `$RCAnonymousID:...`).
++--   product_id       — store product identifier (lexilens_premium_monthly, etc).
++--   received_at      — when the webhook arrived (set by DEFAULT now()).
++--   processed_at     — when the webhook handler finished processing this event.
++--                      NULL means the handler crashed mid-processing — useful
++--                      for forensics if we ever see ghost rows.
++--   processing_note  — short status like "applied:tier1", "ignored",
++--                      "duplicate", "anonymous_user". Aids debugging without
++--                      having to re-parse raw_payload.
++--   raw_payload      — entire webhook body. Stored for debugging and audit.
++--                      Don't index. Don't query at high volume — for forensics
++--                      only.
++--
++-- ─── Retention ─────────────────────────────────────────────────────────────
++--
++-- For now: keep everything. Volume is bounded by purchase activity (orders
++-- of magnitude lower than scan_attempts). At 10k MAU with 5% paid and
++-- monthly events ≈ 500/month, the table grows ~6k rows/year. Not worth
++-- auto-purging until 100k rows / 1 year of data.
++--
++-- ─── RLS ───────────────────────────────────────────────────────────────────
++--
++-- Webhook uses the service role key (bypasses RLS). No client should ever
++-- read this table. We enable RLS with NO policies → effectively locked to
++-- service role only.
++--
++-- ─── Apply ─────────────────────────────────────────────────────────────────
++--
++--   supabase db push                 (or run SQL via Dashboard)
++--
++-- The webhook Edge Function will fail with "table not found" if deployed
++-- before this migration applies. Apply migration BEFORE deploying the
++-- function.
++-- ============================================================================
++
++BEGIN;
++
++-- ─── 1. Table ───────────────────────────────────────────────────────────────
++
++CREATE TABLE IF NOT EXISTS public.revenuecat_webhook_log (
++  event_id         text        PRIMARY KEY,
++  event_type       text        NOT NULL,
++  app_user_id      text,
++  product_id       text,
++  received_at      timestamptz NOT NULL DEFAULT now(),
++  processed_at     timestamptz,
++  processing_note  text,
++  raw_payload      jsonb       NOT NULL
++);
++
++COMMENT ON TABLE public.revenuecat_webhook_log IS
++  'RevenueCat webhook idempotency log (Phase 4.4). Append-only. event_id is '
++  'the dedupe key — the webhook function upserts with ON CONFLICT DO NOTHING '
++  'to skip duplicate retries.';
++
++COMMENT ON COLUMN public.revenuecat_webhook_log.processing_note IS
++  'Short status for forensics. Values: applied:<tier>, ignored, duplicate, '
++  'anonymous_user, no_parent_row, no_user, unknown_type, transfer:<tier>.';
++
++-- ─── 2. Indexes ────────────────────────────────────────────────────────────
++
++CREATE INDEX IF NOT EXISTS revenuecat_webhook_log_event_type_idx
++  ON public.revenuecat_webhook_log (event_type, received_at DESC);
++
++CREATE INDEX IF NOT EXISTS revenuecat_webhook_log_app_user_idx
++  ON public.revenuecat_webhook_log (app_user_id, received_at DESC)
++  WHERE app_user_id IS NOT NULL;
++
++-- ─── 3. RLS — service role only ────────────────────────────────────────────
++
++ALTER TABLE public.revenuecat_webhook_log ENABLE ROW LEVEL SECURITY;
++
++-- No policies defined = no role except service role can read or write.
++-- Re-confirm by selecting as authenticated user → 0 rows.
++
++-- ─── 4. Verification queries (run manually after apply) ────────────────────
++--
++--   -- 1. Table is in place:
++--   SELECT table_name FROM information_schema.tables
++--   WHERE table_schema = 'public' AND table_name = 'revenuecat_webhook_log';
++--
++--   -- 2. Indexes:
++--   SELECT indexname, indexdef
++--   FROM pg_indexes
++--   WHERE schemaname = 'public' AND tablename = 'revenuecat_webhook_log';
++--
++--   -- 3. RLS enabled + zero policies:
++--   SELECT relrowsecurity, relforcerowsecurity
++--   FROM pg_class WHERE relname = 'revenuecat_webhook_log';
++--   -- expect: true, false
++--   SELECT count(*) FROM pg_policy
++--   WHERE polrelid = 'public.revenuecat_webhook_log'::regclass;
++--   -- expect: 0
++--
++--   -- 4. Insert a test row as service role and confirm anonymous can't see it:
++--   --    (run this via the dashboard SQL editor as service role)
++--   INSERT INTO public.revenuecat_webhook_log
++--     (event_id, event_type, app_user_id, product_id, raw_payload)
++--   VALUES ('test-' || gen_random_uuid(), 'TEST', NULL, NULL, '{}'::jsonb);
++--   -- then as authenticated:
++--   SELECT count(*) FROM public.revenuecat_webhook_log;
++--   -- expect: 0 (RLS blocks)
++
++COMMIT;
+diff --git a/types/navigation.ts b/types/navigation.ts
+index b6a874d..6b46f4d 100644
+--- a/types/navigation.ts
++++ b/types/navigation.ts
+@@ -24,4 +24,5 @@ export type RootStackParamList = {
+   SpellBook:       undefined;
+   QuestGenerator:  undefined;
+   Onboarding:      undefined;
++  Paywall:         { reason?: string } | undefined;
+ };

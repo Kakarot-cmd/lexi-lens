@@ -24,4 +24,5 @@ export type RootStackParamList = {
   SpellBook:       undefined;
   QuestGenerator:  undefined;
   Onboarding:      undefined;
+  Paywall:         { reason?: string } | undefined;
 };

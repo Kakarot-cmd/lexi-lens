@@ -35,6 +35,8 @@ import {
   RefreshControl,
   Switch,
   Modal,
+  Linking,
+  Platform,
 } from "react-native";
 import { useSafeAreaInsets }  from "react-native-safe-area-context";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -62,6 +64,11 @@ import {
 
 import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "ParentDashboard">;
+
+// Phase 4.4 — RC subscription state read from the store + free baseline used
+// by the dev-only Simulate toggle. Same lazy-safe import as gameStore.ts.
+import { useGameStore } from "../store/gameStore";
+import { FREE_SUBSCRIPTION, type SubscriptionDetails } from "../lib/revenueCat";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -247,6 +254,206 @@ function QuestCard({ completion }: { completion: QuestCompletion }) {
     </View>
   );
 }
+
+// ─── SubscriptionSection (Phase 4.4) ──────────────────────────────────────────
+//
+// Reads RC-derived `parentSubscriptionDetails` from the store and renders one
+// of three states:
+//   • free  → "Upgrade to Premium" CTA → navigates to PaywallScreen
+//   • paid  → plan name + "Manage subscription" deep link to store
+//   • paid + dev → adds a "Simulate Free" debug toggle (and converse for free).
+//
+// __DEV__-gated Simulate toggle. Lets you flip the local store between free
+// and paid without going through TestFlight — gates quest-lock and lock UI on
+// the QuestMap so we can verify both rendering states on Android local builds.
+// NEVER ships to TestFlight or Play (Babel strips __DEV__ branches in Release).
+
+function SubscriptionSection({
+  navigation,
+}: {
+  navigation: Props["navigation"];
+}) {
+  const details            = useGameStore((s) => s.parentSubscriptionDetails);
+  const setSubscriptionRc  = useGameStore((s) => s.setSubscriptionFromRC);
+
+  const isPaid             = details.isActive;
+  const planLabel          = planLabelFromDetails(details);
+  const renewalLabel       = renewalLabelFromDetails(details);
+
+  const handleUpgrade = useCallback(() => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    navigation.navigate("Paywall", { reason: "parent-dashboard" });
+  }, [navigation]);
+
+  const handleManage = useCallback(() => {
+    // Store-managed subscription. RC also exposes `details.managementUrl` but
+    // it's null for sandbox/dev — fall back to the canonical store URL.
+    const url = details.managementUrl
+      ?? (Platform.OS === "ios"
+        ? "https://apps.apple.com/account/subscriptions"
+        : "https://play.google.com/store/account/subscriptions");
+    Linking.openURL(url).catch(() => null);
+  }, [details.managementUrl]);
+
+  // __DEV__-only simulation. Flips between FREE_SUBSCRIPTION and a fake
+  // active-tier1 record so QuestMap lock states can be tested on local
+  // Android builds without burning EAS slots.
+  const handleSimulateToggle = useCallback(() => {
+    if (isPaid) {
+      setSubscriptionRc(FREE_SUBSCRIPTION);
+    } else {
+      setSubscriptionRc({
+        ...FREE_SUBSCRIPTION,
+        isActive:       true,
+        productId:      "lexilens_premium_monthly",
+        willRenew:      true,
+        tier:           "tier1",
+        expirationDate: Date.now() + 30 * 24 * 60 * 60 * 1000,
+        inGracePeriod:  false,
+      });
+    }
+  }, [isPaid, setSubscriptionRc]);
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Subscription</Text>
+
+      <View style={subStyles.planRow}>
+        <View style={{ flex: 1 }}>
+          <Text style={subStyles.planLabel}>{planLabel}</Text>
+          {!!renewalLabel && (
+            <Text style={subStyles.planSub}>{renewalLabel}</Text>
+          )}
+        </View>
+        {isPaid && (
+          <View style={subStyles.activeBadge}>
+            <Text style={subStyles.activeBadgeText}>Active</Text>
+          </View>
+        )}
+      </View>
+
+      {isPaid ? (
+        <TouchableOpacity style={subStyles.secondaryBtn} onPress={handleManage}>
+          <Text style={subStyles.secondaryBtnText}>Manage subscription</Text>
+          <Text style={subStyles.chevron}>›</Text>
+        </TouchableOpacity>
+      ) : (
+        <TouchableOpacity style={subStyles.primaryBtn} onPress={handleUpgrade} activeOpacity={0.85}>
+          <Text style={subStyles.primaryBtnText}>✦ Upgrade to Premium</Text>
+        </TouchableOpacity>
+      )}
+
+      {__DEV__ && (
+        <TouchableOpacity style={subStyles.devBtn} onPress={handleSimulateToggle}>
+          <Text style={subStyles.devBtnText}>
+            🛠 DEV: Simulate {isPaid ? "Free" : "Premium (tier1)"}
+          </Text>
+        </TouchableOpacity>
+      )}
+    </View>
+  );
+}
+
+function planLabelFromDetails(details: SubscriptionDetails): string {
+  if (!details.isActive) return "Free plan";
+  switch (details.tier) {
+    case "family": return "Premium · Family";
+    case "tier2":  return "Premium · Pro";
+    case "tier1":  return "Premium";
+    default:       return "Premium";
+  }
+}
+
+function renewalLabelFromDetails(details: SubscriptionDetails): string | null {
+  if (!details.isActive) return "Unlock the full quest library + unlimited scans.";
+  if (details.inGracePeriod) return "Free trial — enjoy!";
+  if (!details.expirationDate) return null;
+  const when = new Date(details.expirationDate);
+  const fmt  = when.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+  return details.willRenew ? `Renews ${fmt}` : `Ends ${fmt}`;
+}
+
+const subStyles = StyleSheet.create({
+  planRow: {
+    flexDirection:  "row",
+    alignItems:     "center",
+    paddingVertical: 8,
+  },
+  planLabel: {
+    fontSize:   16,
+    fontWeight: "700",
+    color:      P.inkBrown,
+  },
+  planSub: {
+    fontSize:  12,
+    color:     P.inkMid,
+    marginTop: 2,
+  },
+  activeBadge: {
+    backgroundColor:  P.greenBg,
+    borderWidth:      1,
+    borderColor:      P.greenBorder,
+    borderRadius:     12,
+    paddingHorizontal: 10,
+    paddingVertical:  4,
+  },
+  activeBadgeText: {
+    fontSize:   11,
+    fontWeight: "700",
+    color:      P.greenBadge,
+    letterSpacing: 0.3,
+  },
+  primaryBtn: {
+    backgroundColor:  P.amberAccent,
+    borderRadius:     14,
+    paddingVertical:  14,
+    paddingHorizontal: 16,
+    alignItems:       "center",
+    marginTop:        12,
+  },
+  primaryBtnText: {
+    color:        "#fff",
+    fontSize:     15,
+    fontWeight:   "700",
+    letterSpacing: 0.4,
+  },
+  secondaryBtn: {
+    flexDirection:    "row",
+    alignItems:       "center",
+    justifyContent:   "space-between",
+    backgroundColor:  P.parchment,
+    borderRadius:     12,
+    paddingVertical:  12,
+    paddingHorizontal: 14,
+    marginTop:        12,
+    borderWidth:      1,
+    borderColor:      P.warmBorder,
+  },
+  secondaryBtnText: {
+    fontSize:   14,
+    fontWeight: "600",
+    color:      P.inkBrown,
+  },
+  chevron: {
+    fontSize: 20,
+    color:    P.inkLight,
+  },
+  devBtn: {
+    marginTop:        10,
+    paddingVertical:  8,
+    paddingHorizontal: 12,
+    borderRadius:     8,
+    borderWidth:      1,
+    borderColor:      P.purpleBorder,
+    backgroundColor:  P.purpleLight,
+    alignItems:       "center",
+  },
+  devBtnText: {
+    fontSize:   12,
+    color:      P.purpleAccent,
+    fontWeight: "600",
+  },
+});
 
 // ─── LumiSettingsCard ─────────────────────────────────────────────────────────
 // Mounted between AchievementBadgeGrid and Word Tome. Sound row only renders
@@ -814,6 +1021,9 @@ export function ParentDashboard({ navigation }: Props) {
               </TouchableOpacity>
             </View>
           )}
+
+          {/* ── Subscription (Phase 4.4) ─────────────────── */}
+          <SubscriptionSection navigation={navigation} />
 
           {/* ── Account & Privacy ────────────────────────── */}
           <View style={[styles.section, { marginBottom: 8 }]}>
