@@ -56,3 +56,5 @@ supabase/.temp/
 credentials/ 
 credentials/ 
 credentials.json 
+android/sentry.properties 
+android/gradle.properties 

@@ -170,7 +170,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.24',
+    version: '1.0.28',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -219,6 +219,7 @@ export default {
 
     plugins: [
       'react-native-vision-camera',
+	  './plugins/withReleaseSigningConfig.js',
       [
         'expo-build-properties',
         {
