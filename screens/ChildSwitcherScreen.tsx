@@ -3,8 +3,17 @@
  * Lexi-Lens — choose which child is playing (or add a new one).
  *
  * v2.1 change: age_band replaced with exact age (5–12).
- *   • AgePicker shows individual ages 5–12 as chips
- *   • age_band derived server-side via DB trigger
+ *   • age_band derived server-side via DB trigger (sync_age_band)
+ *
+ * UI change (this revision): the age picker is now a single dropdown
+ * (cross-platform Modal list — identical on iOS and Android, no native
+ * Picker dependency) instead of a row of 8 tiles. There is intentionally
+ * NO separate "proficiency" input: the app has no proficiency column —
+ * reading level is DERIVED from age by the server-side sync_age_band
+ * trigger. Surfacing it as a read-only line that tracks the chosen age
+ * keeps the UI honest and avoids dead, contradictory data. (Adding an
+ * independent proficiency picker would fight the v6.1 "capture actual
+ * age precisely" design and the trigger.)
  *
  * N1 change: handleSelect checks hasSeenOnboarding and routes to onboarding
  * on first launch instead of jumping straight to QuestMap.
@@ -25,6 +34,7 @@ import {
   ActivityIndicator,
   Alert,
   Platform,
+  Modal,
 } from "react-native";
 import { useSafeAreaInsets }  from "react-native-safe-area-context";
 import * as Haptics           from "expo-haptics";
@@ -41,9 +51,8 @@ type Props = NativeStackScreenProps<RootStackParamList, "ChildSwitcher">;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-// Actual ages (5-12), grouped visually by reading band for the picker UX.
-// The model and DB store the actual integer age. The age_band column in DB
-// is derived server-side via the sync_age_band trigger.
+// Actual ages (5-12). The model and DB store the actual integer age. The
+// age_band column in DB is derived server-side via the sync_age_band trigger.
 //
 // Why integers and not bands: Mistral's kid_msg.young/older split fires at
 // age<8 → young, age≥8 → older. A 7-year-old picked as part of the "7-8"
@@ -60,6 +69,18 @@ const AGE_OPTIONS = [
   { age: 11, bandLabel: "Proficient"   },
   { age: 12, bandLabel: "Proficient"   },
 ] as const;
+
+// Reading level shown to the parent is DERIVED from age using the same
+// thresholds the server uses (sync_age_band: ≤6 → 5-6, ≤8 → 7-8, ≤10 → 9-10,
+// else 11-12). This is display-only and read-only — it is not stored or sent;
+// the server re-derives age_band from `age` on insert. Kept in lockstep with
+// the DB trigger so the label never lies about what the child will get.
+function readingLevelForAge(age: number): { band: string; label: string } {
+  if (age <= 6)  return { band: "5-6",   label: "Early reader" };
+  if (age <= 8)  return { band: "7-8",   label: "Developing"   };
+  if (age <= 10) return { band: "9-10",  label: "Advancing"    };
+  return { band: "11-12", label: "Proficient" };
+}
 
 const AVATAR_OPTIONS = [
   { key: "wizard",  emoji: "🧙", label: "Wizard" },
@@ -157,14 +178,15 @@ interface AddChildFormProps {
 }
 
 function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
-  const [name,      setName]      = useState("");
+  const [name,        setName]        = useState("");
   // No default — parent must actively pick an age. This prevents the
   // pre-v6.1 bug where every child silently got age=8 because that was
   // the form's hardcoded initial value.
-  const [age,       setAge]       = useState<number | null>(null);
-  const [avatarKey, setAvatarKey] = useState<string>("wizard");
-  const [saving,    setSaving]    = useState(false);
-  const [error,     setError]     = useState<string | null>(null);
+  const [age,         setAge]         = useState<number | null>(null);
+  const [avatarKey,   setAvatarKey]   = useState<string>("wizard");
+  const [ageMenuOpen, setAgeMenuOpen] = useState(false);
+  const [saving,      setSaving]      = useState(false);
+  const [error,       setError]       = useState<string | null>(null);
 
   const handleSave = async () => {
     const trimmed = name.trim();
@@ -197,6 +219,8 @@ function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
     }
   };
 
+  const derived = age !== null ? readingLevelForAge(age) : null;
+
   return (
     <View style={styles.addForm}>
       <Text style={styles.addFormTitle}>Add a child</Text>
@@ -213,23 +237,33 @@ function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
         autoFocus
       />
 
-      {/* Actual age picker — 8 options, no default */}
+      {/* Age — single dropdown (cross-platform Modal list) */}
       <Text style={styles.addFormLabel}>Age</Text>
-      <View style={styles.chipRow}>
-        {AGE_OPTIONS.map((opt) => (
-          <TouchableOpacity
-            key={opt.age}
-            style={[styles.chip, age === opt.age && styles.chipActive]}
-            onPress={() => { setAge(opt.age); Haptics.selectionAsync(); }}
-          >
-            <Text style={[styles.chipLabel, age === opt.age && styles.chipLabelActive]}>{opt.age}</Text>
-            <Text style={[styles.chipDesc,  age === opt.age && styles.chipDescActive]}>{opt.bandLabel}</Text>
-          </TouchableOpacity>
-        ))}
+      <TouchableOpacity
+        style={[styles.dropdown, age !== null && styles.dropdownFilled]}
+        onPress={() => { setAgeMenuOpen(true); Haptics.selectionAsync(); }}
+        accessibilityRole="button"
+        accessibilityLabel={age === null ? "Select age" : `Age ${age}, change`}
+      >
+        <Text style={[styles.dropdownText, age === null && styles.dropdownPlaceholder]}>
+          {age === null ? "Select age (5–12)" : `${age} years old`}
+        </Text>
+        <Text style={styles.dropdownCaret}>▾</Text>
+      </TouchableOpacity>
+
+      {/* Reading level — derived, read-only. Tracks the chosen age. */}
+      <View style={styles.derivedRow}>
+        <Text style={styles.derivedLabel}>Reading level</Text>
+        <Text style={styles.derivedValue}>
+          {derived ? `${derived.label} · band ${derived.band}` : "—"}
+        </Text>
       </View>
+      <Text style={styles.derivedHint}>
+        Set automatically from age — tunes word difficulty and Lumi's voice.
+      </Text>
 
       {/* Avatar */}
-      <Text style={styles.addFormLabel}>Avatar</Text>
+      <Text style={[styles.addFormLabel, { marginTop: 18 }]}>Avatar</Text>
       <View style={styles.avatarRow}>
         {AVATAR_OPTIONS.map((a) => (
           <TouchableOpacity
@@ -259,6 +293,54 @@ function AddChildForm({ onSaved, onCancel }: AddChildFormProps) {
           }
         </TouchableOpacity>
       </View>
+
+      {/* Age dropdown sheet — identical behaviour iOS & Android */}
+      <Modal
+        visible={ageMenuOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setAgeMenuOpen(false)}
+      >
+        <TouchableOpacity
+          style={styles.modalScrim}
+          activeOpacity={1}
+          onPress={() => setAgeMenuOpen(false)}
+        >
+          <View style={styles.modalSheet}>
+            <Text style={styles.modalTitle}>Select age</Text>
+            <ScrollView
+              style={styles.modalList}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+            >
+              {AGE_OPTIONS.map((opt) => {
+                const selected = age === opt.age;
+                return (
+                  <TouchableOpacity
+                    key={opt.age}
+                    style={[styles.modalRow, selected && styles.modalRowActive]}
+                    onPress={() => {
+                      setAge(opt.age);
+                      setAgeMenuOpen(false);
+                      Haptics.selectionAsync();
+                    }}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Age ${opt.age}, ${opt.bandLabel}`}
+                  >
+                    <Text style={[styles.modalRowAge, selected && styles.modalRowAgeActive]}>
+                      {opt.age} years
+                    </Text>
+                    <Text style={[styles.modalRowBand, selected && styles.modalRowBandActive]}>
+                      {opt.bandLabel}
+                    </Text>
+                    {selected && <Text style={styles.modalRowCheck}>✓</Text>}
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </View>
   );
 }
@@ -594,6 +676,80 @@ const styles = StyleSheet.create({
   },
   addFormLabel: { fontSize: 13, fontWeight: "600", color: P.inkMid, marginBottom: 8 },
 
+  // Dropdown trigger (age)
+  dropdown: {
+    flexDirection:     "row",
+    alignItems:        "center",
+    justifyContent:    "space-between",
+    backgroundColor:   P.white,
+    borderRadius:      10,
+    borderWidth:       1,
+    borderColor:       P.warmBorder,
+    paddingHorizontal: 14,
+    paddingVertical:   13,
+  },
+  dropdownFilled:      { borderColor: P.amber, backgroundColor: P.amberLight },
+  dropdownText:        { fontSize: 15, fontWeight: "600", color: P.inkBrown },
+  dropdownPlaceholder: { color: P.inkFaint, fontWeight: "500" },
+  dropdownCaret:       { fontSize: 14, color: P.inkLight, marginLeft: 8 },
+
+  // Derived reading level (read-only)
+  derivedRow: {
+    flexDirection:   "row",
+    alignItems:      "center",
+    justifyContent:  "space-between",
+    marginTop:       12,
+    paddingHorizontal: 4,
+  },
+  derivedLabel: { fontSize: 13, fontWeight: "600", color: P.inkMid },
+  derivedValue: { fontSize: 13, fontWeight: "700", color: P.amber },
+  derivedHint:  { fontSize: 11, color: P.inkFaint, marginTop: 4, paddingHorizontal: 4, lineHeight: 15 },
+
+  // Age dropdown modal
+  modalScrim: {
+    flex:            1,
+    backgroundColor: "rgba(61,42,15,0.45)",
+    justifyContent:  "center",
+    alignItems:      "center",
+    paddingHorizontal: 28,
+  },
+  modalSheet: {
+    width:           "100%",
+    maxWidth:        360,
+    maxHeight:       "70%",
+    backgroundColor: P.cream,
+    borderRadius:    18,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+    paddingVertical: 16,
+    paddingHorizontal: 16,
+    ...Platform.select({
+      ios:     { shadowColor: P.inkBrown, shadowOpacity: 0.18, shadowRadius: 16, shadowOffset: { width: 0, height: 6 } },
+      android: { elevation: 8 },
+    }),
+  },
+  modalTitle: { fontSize: 16, fontWeight: "800", color: P.inkBrown, marginBottom: 10, paddingHorizontal: 4 },
+  modalList:  { flexGrow: 0 },
+  modalRow: {
+    flexDirection:     "row",
+    alignItems:        "center",
+    paddingVertical:   13,
+    paddingHorizontal: 14,
+    borderRadius:      10,
+    marginBottom:      6,
+    borderWidth:       1,
+    borderColor:       P.warmBorder,
+    backgroundColor:   P.white,
+  },
+  modalRowActive:      { borderColor: P.amber, backgroundColor: P.amberLight },
+  modalRowAge:         { fontSize: 15, fontWeight: "700", color: P.inkBrown },
+  modalRowAgeActive:   { color: P.amber },
+  modalRowBand:        { fontSize: 13, color: P.inkLight, marginLeft: 10, flex: 1 },
+  modalRowBandActive:  { color: P.inkMid },
+  modalRowCheck:       { fontSize: 16, fontWeight: "800", color: P.amber, marginLeft: 8 },
+
+  // Legacy chip styles retained (no longer used by the age picker; kept to
+  // avoid touching unrelated style references).
   chipRow:    { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 },
   chip: {
     backgroundColor:   P.white,
@@ -625,7 +781,7 @@ const styles = StyleSheet.create({
   avatarLabel:      { fontSize: 11, color: P.inkLight, fontWeight: "600" },
   avatarLabelActive:{ color: P.amber },
 
-  addFormButtons: { flexDirection: "row", gap: 10 },
+  addFormButtons: { flexDirection: "row", gap: 10, marginTop: 4 },
   cancelBtn: {
     flex:            1,
     paddingVertical: 13,

@@ -31,6 +31,21 @@
  * (migration 20260514) records every processed event_id. We check before
  * applying state changes and short-circuit on duplicates.
  *
+ * Ordering guard (20260518)
+ * ─────────────────────────
+ * RC does NOT guarantee webhook delivery order and this function runs as
+ * concurrent Edge invocations. Without a guard, a late-delivered RENEWAL
+ * can overwrite a freshly-applied EXPIRATION (re-granting paid access to a
+ * lapsed user) purely on write-race luck. Each tier write records RC's
+ * source-side `event.event_timestamp_ms` into
+ * `parents.last_rc_event_ts_ms`, and an incoming event is applied ONLY IF
+ * its event_timestamp_ms >= the stored watermark. We key on RC's event
+ * time (not our ingest `received_at`, which is subject to our own clock
+ * skew under concurrency; not `expiration_at_ms`, whose meaning differs
+ * across grant/revoke/cancel). NULL watermark = first event, always
+ * applied. Requires migration 20260518_parents_rc_event_watermark.sql
+ * (deploy that BEFORE this function — it is inert without this code).
+ *
  * Event handling
  * ──────────────
  * Mapped events (entitlement gained → set tier):
@@ -164,6 +179,13 @@ Deno.serve(async (req: Request) => {
   const appUserId    = event.app_user_id as string | undefined;
   const productId    = event.product_id  as string | undefined;
   const expiresMs    = event.expiration_at_ms as number | undefined;
+  // RC's authoritative source-side time for when this event occurred.
+  // Present on every event type; monotonic per subscription from RC. Used
+  // as the ordering guard key (see header / 20260518).
+  const eventTsMsRaw = event.event_timestamp_ms;
+  const eventTsMs    = typeof eventTsMsRaw === "number" && Number.isFinite(eventTsMsRaw)
+    ? eventTsMsRaw
+    : null;
 
   console.log(`[revenuecat-webhook] ${eventType} id=${eventId} user=${appUserId ?? "(none)"} product=${productId ?? "(none)"}`);
 
@@ -233,7 +255,7 @@ Deno.serve(async (req: Request) => {
   if (eventType === "TRANSFER") {
     const transferredFrom = event.transferred_from as string[] | undefined;
     const transferredTo   = event.transferred_to   as string[] | undefined;
-    return handleTransfer(supabase, eventId, transferredFrom, transferredTo, productId);
+    return handleTransfer(supabase, eventId, transferredFrom, transferredTo, productId, eventTsMs);
   }
 
   let newTier: "free" | "tier1" | "tier2" | "family";
@@ -250,9 +272,10 @@ Deno.serve(async (req: Request) => {
 
   // Sanity: don't downgrade a parent in the brief window where two events
   // race (e.g. RENEWAL arrives before BILLING_ISSUE clears). Defensive read.
+  // Also read the ordering watermark (20260518).
   const { data: parentRow } = await supabase
     .from("parents")
-    .select("subscription_tier")
+    .select("subscription_tier, last_rc_event_ts_ms")
     .eq("id", appUserId)
     .maybeSingle();
 
@@ -267,10 +290,36 @@ Deno.serve(async (req: Request) => {
     newTier = "free";
   }
 
-  // Apply the update.
+  // ── Ordering guard (20260518) ──────────────────────────────────────────
+  // Skip if this event is OLDER than the last event already applied to
+  // this parent. Out-of-order / racing webhook deliveries must not let a
+  // stale event clobber a newer one. NULL watermark = nothing applied yet
+  // → always apply. Missing event_timestamp_ms (shouldn't happen on real
+  // RC events) → fail OPEN (apply) rather than risk dropping a valid event.
+  const priorTsMs = parentRow.last_rc_event_ts_ms as number | null;
+  if (eventTsMs !== null && priorTsMs !== null && eventTsMs < priorTsMs) {
+    console.log(
+      `[revenuecat-webhook] Stale event ${eventId} (${eventType}) for ${appUserId}: ` +
+      `event_ts=${eventTsMs} < applied_ts=${priorTsMs}. Skipping tier write.`,
+    );
+    await markProcessed(supabase, eventId, "stale_skipped", newTier);
+    return jsonResponse({ ok: true, stale: true, tier: parentRow.subscription_tier });
+  }
+
+  // Apply the update. Advance the watermark in the SAME statement so the
+  // tier and its ordering key move atomically (one row, one lock). Only
+  // advance the watermark when we actually have a newer timestamp; never
+  // move it backwards.
+  const updatePayload: { subscription_tier: string; last_rc_event_ts_ms?: number } = {
+    subscription_tier: newTier,
+  };
+  if (eventTsMs !== null && (priorTsMs === null || eventTsMs >= priorTsMs)) {
+    updatePayload.last_rc_event_ts_ms = eventTsMs;
+  }
+
   const { error: updErr } = await supabase
     .from("parents")
-    .update({ subscription_tier: newTier })
+    .update(updatePayload)
     .eq("id", appUserId);
 
   if (updErr) {
@@ -309,28 +358,49 @@ async function handleTransfer(
   fromIds:  string[] | undefined,
   toIds:    string[] | undefined,
   productId: string | undefined,
+  eventTsMs: number | null,
 ): Promise<Response> {
   const tier = tierFromProductId(productId);
 
+  // Per-row ordering guard: only mutate a parent if this TRANSFER is not
+  // older than the event already applied to that parent. Done per-id
+  // (can't bulk .in() update with a per-row timestamp comparison via the
+  // JS client, so we resolve the eligible id sets first).
+  async function eligibleIds(ids: string[]): Promise<string[]> {
+    const valid = ids.filter(isValidUUID);
+    if (valid.length === 0) return [];
+    if (eventTsMs === null) return valid; // no event time → fail open
+    const { data } = await supabase
+      .from("parents")
+      .select("id, last_rc_event_ts_ms")
+      .in("id", valid);
+    if (!data) return [];
+    return (data as { id: string; last_rc_event_ts_ms: number | null }[])
+      .filter((r) => r.last_rc_event_ts_ms === null || eventTsMs >= r.last_rc_event_ts_ms)
+      .map((r) => r.id);
+  }
+
+  const tsPatch = eventTsMs !== null ? { last_rc_event_ts_ms: eventTsMs } : {};
+
   // Revoke from old users
   if (fromIds && fromIds.length > 0) {
-    const validFrom = fromIds.filter(isValidUUID);
-    if (validFrom.length > 0) {
+    const ids = await eligibleIds(fromIds);
+    if (ids.length > 0) {
       await supabase
         .from("parents")
-        .update({ subscription_tier: "free" })
-        .in("id", validFrom);
+        .update({ subscription_tier: "free", ...tsPatch })
+        .in("id", ids);
     }
   }
 
   // Grant to new users
   if (toIds && toIds.length > 0) {
-    const validTo = toIds.filter(isValidUUID);
-    if (validTo.length > 0) {
+    const ids = await eligibleIds(toIds);
+    if (ids.length > 0) {
       await supabase
         .from("parents")
-        .update({ subscription_tier: tier })
-        .in("id", validTo);
+        .update({ subscription_tier: tier, ...tsPatch })
+        .in("id", ids);
     }
   }
 

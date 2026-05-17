@@ -33,6 +33,23 @@
  *
  * Default: 'true'. Flag row inserted by 20260513_daily_quest_auto_gen.sql.
  *
+ * ─── Daily quest tier (20260518 follow-up) ───────────────────────────────────
+ *
+ * feature_flags.daily_quest_min_tier:
+ *   'free' (default) → the daily quest is created/selected as a free quest,
+ *                       so free-tier accounts can play it. Original behaviour.
+ *   'paid'           → the daily quest is created/selected as a paid quest.
+ *                       Free accounts no longer see it (RLS-gated out of
+ *                       their quest library; the daily banner degrades to
+ *                       hidden — selectDailyQuest returns null, no crash).
+ *                       Makes the daily quest a 7-day-trial / paid perk.
+ *
+ * Unknown/garbage flag value falls back to 'free' (fail-open, never writes a
+ * tier that violates quests_min_subscription_tier_check). Flag row inserted
+ * by 20260518_daily_quest_min_tier_flag.sql. The fallback selector is also
+ * constrained to the apprentice tier so flipping to 'paid' cannot surface a
+ * hard quest as the gentle daily.
+ *
  * ─── Uniqueness check (C3, partial overlap allowed) ──────────────────────────
  *
  *   • enemy_name uniqueness — case-insensitive ILIKE against existing rows.
@@ -65,6 +82,14 @@ const DAILY_MIN_AGE_BAND  = "5-6"; // Visibility — accessible to all ages
 const MODEL               = "claude-haiku-4-5-20251001";
 const MAX_TOKENS          = 1400;
 const KILL_SWITCH_FLAG    = "daily_quest_auto_gen_enabled";
+// Tier the daily quest is created/selected at. Flag (default 'free') so the
+// free-vs-paid daily-quest decision is a one-line SQL flip, not a redeploy —
+// same rationale as daily_scan_limit_*. Flip to 'paid' to make the daily
+// quest a trial/paid perk. Allowed values mirror quests.min_subscription_tier.
+const DAILY_TIER_FLAG     = "daily_quest_min_tier";
+const DAILY_TIER_DEFAULT  = "free";
+const DAILY_TIER_ALLOWED  = ["free", "paid"] as const;
+type DailyMinTier = (typeof DAILY_TIER_ALLOWED)[number];
 
 const CORS = {
   "Access-Control-Allow-Origin":  "*",
@@ -170,6 +195,26 @@ async function readAutoGenEnabled(supabase: SupabaseClient): Promise<boolean> {
   }
 }
 
+async function readDailyQuestMinTier(supabase: SupabaseClient): Promise<DailyMinTier> {
+  try {
+    const { data } = await supabase
+      .from("feature_flags")
+      .select("value")
+      .eq("key", DAILY_TIER_FLAG)
+      .maybeSingle();
+    const v = (data as { value?: unknown } | null)?.value;
+    if (typeof v !== "string") return DAILY_TIER_DEFAULT;
+    const norm = v.trim().toLowerCase();
+    // Fail-safe: an unknown / fat-fingered value falls back to the default
+    // rather than writing a tier that violates quests_min_subscription_tier_check.
+    return (DAILY_TIER_ALLOWED as readonly string[]).includes(norm)
+      ? (norm as DailyMinTier)
+      : DAILY_TIER_DEFAULT;
+  } catch {
+    return DAILY_TIER_DEFAULT;
+  }
+}
+
 // ─── Haiku call ──────────────────────────────────────────────────────────────
 
 async function generateQuestViaHaiku(apiKey: string): Promise<GeneratedQuest> {
@@ -270,12 +315,21 @@ async function propertySetCollides(
 
 // ─── Fallback: existing free quest, deterministic by UTC day ─────────────────
 
-async function pickFallbackQuest(supabase: SupabaseClient): Promise<string | null> {
+async function pickFallbackQuest(
+  supabase: SupabaseClient,
+  minTier:  DailyMinTier,
+): Promise<string | null> {
   const { data } = await supabase
     .from("quests")
     .select("id")
     .eq("is_active", true)
-    .eq("min_subscription_tier", "free")
+    .eq("min_subscription_tier", minTier)
+    // Constrain to the apprentice tier regardless of minTier. Without this,
+    // flipping the flag to 'paid' would let the fallback surface ANY paid
+    // quest (up to archmage) as the gentle "daily" — a sharp difficulty
+    // cliff. The 3 curated starters are apprentice, so the free pool is
+    // unaffected; the paid pool is correctly limited to easy quests.
+    .eq("tier", DAILY_TIER)
     .order("created_at", { ascending: true });
 
   if (!data || data.length === 0) return null;
@@ -289,6 +343,7 @@ async function pickFallbackQuest(supabase: SupabaseClient): Promise<string | nul
 async function insertQuest(
   supabase: SupabaseClient,
   q:        GeneratedQuest,
+  minTier:  DailyMinTier,
 ): Promise<string | null> {
   const { data, error } = await supabase
     .from("quests")
@@ -298,7 +353,7 @@ async function insertQuest(
       enemy_emoji:           q.enemy_emoji,
       room_label:            q.room_label,
       min_age_band:          DAILY_MIN_AGE_BAND,
-      min_subscription_tier: "free",
+      min_subscription_tier: minTier,
       required_properties:   q.required_properties,
       hard_mode_properties:  q.hard_mode_properties,
       spell_name:            q.spell_name,
@@ -382,11 +437,13 @@ Deno.serve(async (req: Request) => {
 
   // ── 2. Read kill-switch flag ─────────────────────────────────────────────
   const autoGenEnabled = await readAutoGenEnabled(supabase);
+  // Tier the daily quest is created/selected at (flag-driven, default 'free').
+  const dailyMinTier   = await readDailyQuestMinTier(supabase);
 
   // ── 3a. Kill-switch OFF → straight to round-robin fallback ───────────────
   if (!autoGenEnabled) {
     console.log(`[ensure-daily-quest] day=${today} kill-switch=off, using fallback`);
-    const fallbackId = await pickFallbackQuest(supabase);
+    const fallbackId = await pickFallbackQuest(supabase, dailyMinTier);
     if (!fallbackId) {
       return json({ error: "no_free_quests_available" }, 500);
     }
@@ -440,7 +497,7 @@ Deno.serve(async (req: Request) => {
       `[ensure-daily-quest] all ${MAX_RETRIES + 1} attempts failed (${lastFailReason}); ` +
       `falling back to existing free quest`,
     );
-    const fallbackId = await pickFallbackQuest(supabase);
+    const fallbackId = await pickFallbackQuest(supabase, dailyMinTier);
     if (!fallbackId) {
       return json({ error: "could_not_provision_daily_quest" }, 500);
     }
@@ -457,7 +514,7 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── 5. Insert quest + link as today's daily ──────────────────────────────
-  const newQuestId = await insertQuest(supabase, questData);
+  const newQuestId = await insertQuest(supabase, questData, dailyMinTier);
   if (!newQuestId) {
     return json({ error: "quest_insert_failed" }, 500);
   }
