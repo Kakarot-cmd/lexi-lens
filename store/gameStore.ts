@@ -1383,14 +1383,20 @@ export const selectQuestsGroupedByTier = (state: GameState): TierGroup[] => {
   const completed     = new Set(state.completedQuestIds);
   const unlockedTiers = selectUnlockedTiers(state);
 
-  return TIER_ORDER.map((tier) => ({
-    tier,
-    quests:   state.questLibrary.filter((q) => q.tier === tier),
-    unlocked: unlockedTiers.includes(tier),
-    cleared:  state.questLibrary
-      .filter((q) => q.tier === tier)
-      .every((q) => completed.has(q.id)),
-  }));
+  return TIER_ORDER.map((tier) => {
+    const tierQuests = state.questLibrary.filter((q) => q.tier === tier);
+    return {
+      tier,
+      quests:   tierQuests,
+      unlocked: unlockedTiers.includes(tier),
+      // An EMPTY tier is NOT "cleared". [].every() === true (vacuous truth)
+      // rendered unseeded Scholar/Sage/Archmage tiers as "Cleared / 0
+      // quests await", which reads as data loss to a paying parent.
+      // Mirrors selectTierCleared's length guard. (audit 2026-05-17)
+      cleared:  tierQuests.length > 0 &&
+                tierQuests.every((q) => completed.has(q.id)),
+    };
+  });
 };
 
 export const selectTierCleared = (tier: QuestTier) => (state: GameState): boolean => {

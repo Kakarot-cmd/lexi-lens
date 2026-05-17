@@ -240,7 +240,7 @@ export default function PaywallScreen({ navigation, route }: Props) {
       // Update store immediately — webhook will follow.
       setSubscriptionFromRC(outcome.details);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      Alert.alert("✨ Welcome to Premium!", "Your account is now upgraded. Enjoy all premium quests!", [
+      Alert.alert("✨ Welcome to Premium!", "Your account is now Premium.", [
         { text: "Continue", onPress: () => navigation.goBack() },
       ]);
     } else if (outcome.kind === "cancelled") {
@@ -314,10 +314,12 @@ export default function PaywallScreen({ navigation, route }: Props) {
             to test purchases.
           </Text>
           <View style={styles.bullets}>
-            <Bullet>Unlock 50+ premium quests across all tiers</Bullet>
-            <Bullet>Custom AI quests for your child's interests</Bullet>
-            <Bullet>Unlimited daily scans (Free is capped at 5)</Bullet>
-            <Bullet>Hard-mode challenges + bonus XP</Bullet>
+            {/* HONEST COPY (audit 2026-05-17): only claim what is actually
+                enforced in code today. tier1 cap = 20/day, free = 5/day
+                (tier_config). Do NOT re-add quest-count / AI-quest /
+                hard-mode / sibling bullets until each is genuinely
+                premium-gated. */}
+            <Bullet>20 scans per day — 4x the free daily limit of 5</Bullet>
           </View>
         </ScrollView>
       </View>
@@ -369,11 +371,12 @@ export default function PaywallScreen({ navigation, route }: Props) {
         </Text>
 
         <View style={styles.bullets}>
-          <Bullet>50+ premium quests across all tiers</Bullet>
-          <Bullet>Unlimited daily scans (Free is capped daily)</Bullet>
-          <Bullet>Custom AI quests for your child's interests</Bullet>
-          <Bullet>Hard-mode challenges with bonus XP</Bullet>
-          <Bullet>Sibling profiles + cross-device sync</Bullet>
+          {/* HONEST COPY (audit 2026-05-17): the four removed bullets
+              describe features that are NOT premium-gated in this build
+              (AI quests, hard mode, sibling profiles are free for everyone;
+              zero paid-tier quests are seeded). Restore each only after it
+              is actually gated. */}
+          <Bullet>20 scans per day — 4x the free daily limit of 5</Bullet>
         </View>
 
         <View style={styles.divider} />
