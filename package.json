@@ -7,7 +7,8 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "jest --config test/jest.config.json --rootDir test"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",

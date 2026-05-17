@@ -1,0 +1,408 @@
+From 5b956bcb2697645206d29634dd78a244b61e0eae Mon Sep 17 00:00:00 2001
+From: audit <a@b.c>
+Date: Sun, 17 May 2026 02:07:50 +0000
+Subject: [PATCH] test: CC1 safety + RC tier-map + v6 cache-key suites; wire
+ npm test
+
+- test/cc1Logic.{ts,test.ts}: verbatim sanitizeOutput mirror; pins
+  HUMAN_BODY_BLOCKLIST + GENERIC_LABELS child-safety override
+- test/revenuecatWebhook.{ts,test.ts}: tierFromProductId pinned against
+  the real asymmetric Product IDs (premium_annual_v2, annual:annual, monthly-v2)
+- test/cacheKeyV6.{ts,test.ts}: current buildPerPropCacheKey/normalizeForKey
+  contract (legacy evaluateHandler v4.7 buildCacheKey left intact = orphaned not broken)
+- root package.json: 'npm test' now runs the suite (was absent)
+- +25 tests, all green; documents unreachable over-cap hash path
+
+Baseline: 3ed6a1b
+---
+ package.json                   |  3 +-
+ test/cacheKeyV6.test.ts        | 71 ++++++++++++++++++++++++++++++++++
+ test/cacheKeyV6.ts             | 50 ++++++++++++++++++++++++
+ test/cc1Logic.test.ts          | 71 ++++++++++++++++++++++++++++++++++
+ test/cc1Logic.ts               | 56 +++++++++++++++++++++++++++
+ test/revenuecatWebhook.test.ts | 54 ++++++++++++++++++++++++++
+ test/revenuecatWebhook.ts      | 21 ++++++++++
+ 7 files changed, 325 insertions(+), 1 deletion(-)
+ create mode 100644 test/cacheKeyV6.test.ts
+ create mode 100644 test/cacheKeyV6.ts
+ create mode 100644 test/cc1Logic.test.ts
+ create mode 100644 test/cc1Logic.ts
+ create mode 100644 test/revenuecatWebhook.test.ts
+ create mode 100644 test/revenuecatWebhook.ts
+
+diff --git a/package.json b/package.json
+index 8c39e6f..e49b42b 100644
+--- a/package.json
++++ b/package.json
+@@ -7,7 +7,8 @@
+     "android": "expo run:android",
+     "ios": "expo run:ios",
+     "web": "expo start --web",
+-    "typecheck": "tsc --noEmit"
++    "typecheck": "tsc --noEmit",
++    "test": "jest --config test/jest.config.json --rootDir test"
+   },
+   "dependencies": {
+     "@react-native-async-storage/async-storage": "2.2.0",
+diff --git a/test/cacheKeyV6.test.ts b/test/cacheKeyV6.test.ts
+new file mode 100644
+index 0000000..f9a0666
+--- /dev/null
++++ b/test/cacheKeyV6.test.ts
+@@ -0,0 +1,71 @@
++/**
++ * cacheKeyV6.test.ts — v6 per-property cache key (CURRENT production contract)
++ *
++ * Replaces the coverage the orphaned evaluateHandler v4.7 buildCacheKey
++ * suite no longer provides for production. Pins normalisation,
++ * determinism, plural collapse, the hash fallback, and env prefixing —
++ * all critical to cache correctness and cross-env isolation.
++ */
++
++import { buildPerPropCacheKey, normalizeForKey } from "./cacheKeyV6";
++
++describe("evaluate.normalizeForKey", () => {
++  it("lowercases, trims, collapses whitespace", () => {
++    expect(normalizeForKey("  Red   APPLE ")).toBe("red-apple");
++  });
++
++  it("collapses regular plurals to singular (cats → cat)", () => {
++    expect(normalizeForKey("cats")).toBe(normalizeForKey("cat"));
++  });
++
++  it("does NOT mangle -ss / -es words (glass stays glass)", () => {
++    expect(normalizeForKey("glass")).toBe("glass");
++  });
++
++  it("strips punctuation to single dashes, trims edge dashes", () => {
++    expect(normalizeForKey("!!apple, pie!!")).toBe("apple-pie");
++  });
++});
++
++describe("evaluate.buildPerPropCacheKey", () => {
++  it("is deterministic for identical inputs", () => {
++    expect(buildPerPropCacheKey("Spoon", "metal"))
++      .toBe(buildPerPropCacheKey("spoon", "metal"));
++  });
++
++  it("singular/plural label resolve to the SAME key (cache-hit win)", () => {
++    expect(buildPerPropCacheKey("spoons", "shiny"))
++      .toBe(buildPerPropCacheKey("spoon", "shiny"));
++  });
++
++  it("carries the env prefix for cross-environment isolation", () => {
++    expect(buildPerPropCacheKey("apple", "red"))
++      .toMatch(/^test:lexi:v6:verdict:/);
++  });
++
++  it("falls back to a hashed key when a segment normalises empty", () => {
++    const k = buildPerPropCacheKey("???", "word");
++    expect(k).toMatch(/^test:lexi:v6:verdict:_h:/);
++    expect(k).not.toContain("=");
++  });
++
++  it("per-segment cap (80) keeps long inputs under the 200 full-key cap", () => {
++    // Documents real behaviour: normalizeForKey slices each segment to
++    // KEY_SEGMENT_MAX=80 BEFORE the full-key length check, so the 200-char
++    // FULL_KEY_MAX hash fallback is effectively unreachable via long input
++    // alone. The hash fallback is reached via the empty-segment path
++    // (tested above), not via length. This test pins that intentional
++    // ordering so a future refactor that moves the length check before
++    // the slice is caught.
++    const huge = "a".repeat(300);
++    const k = buildPerPropCacheKey(huge, huge);
++    expect(k).not.toContain("_h:");          // NOT the hash path
++    expect(k.split(":").pop()!.length).toBe(80); // word segment capped at 80
++    expect(k.length).toBeLessThanOrEqual(200);   // still under full cap
++  });
++
++  it("distinct objects do not collide", () => {
++    expect(buildPerPropCacheKey("apple", "red"))
++      .not.toBe(buildPerPropCacheKey("banana", "red"));
++  });
++});
+diff --git a/test/cacheKeyV6.ts b/test/cacheKeyV6.ts
+new file mode 100644
+index 0000000..7e1f357
+--- /dev/null
++++ b/test/cacheKeyV6.ts
+@@ -0,0 +1,50 @@
++/**
++ * cacheKeyV6.ts — pure-logic extract of:
++ *   • supabase/functions/evaluate/index.ts → buildPerPropCacheKey,
++ *     normalizeForKey (v6 cache architecture)
++ *
++ * Verbatim mirror as of repo 3ed6a1b. NOTE: the legacy
++ * test/evaluateHandler.ts still exports a v4.7 3-arg `buildCacheKey`
++ * which production NO LONGER USES (renamed + re-architected to the
++ * per-property canonical key below in the v6 cache rework). That legacy
++ * suite is orphaned, not broken — left intact deliberately. THIS file
++ * tests the contract production actually ships. Platform-agnostic.
++ */
++
++const ENV_NAME = "test"; // mirrors evaluate's ENV_NAME resolution under test
++const KEY_SEGMENT_MAX = 80;
++const FULL_KEY_MAX = 200;
++
++// Verbatim mirror of evaluate/index.ts :: normalizeForKey
++export function normalizeForKey(s: string): string {
++  return s
++    .toLowerCase()
++    .trim()
++    .replace(/\s+/g, " ")
++    .replace(/([a-z]{2,})([^se])s\b/g, "$1$2")
++    .replace(/[^a-z0-9_-]+/g, "-")
++    .replace(/^-+|-+$/g, "")
++    .slice(0, KEY_SEGMENT_MAX);
++}
++
++// btoa shim for Node test env (Edge runtime has btoa natively)
++const b64 = (s: string): string =>
++  typeof btoa === "function"
++    ? btoa(s)
++    : Buffer.from(s, "binary").toString("base64");
++
++// Verbatim mirror of evaluate/index.ts :: buildPerPropCacheKey
++export function buildPerPropCacheKey(label: string, word: string): string {
++  const nl = normalizeForKey(label);
++  const nw = normalizeForKey(word);
++
++  if (nl.length === 0 || nw.length === 0) {
++    return `${ENV_NAME}:lexi:v6:verdict:_h:${b64(`${label}::${word}`).replace(/=/g, "")}`;
++  }
++
++  const key = `${ENV_NAME}:lexi:v6:verdict:${nl}:${nw}`;
++  if (key.length > FULL_KEY_MAX) {
++    return `${ENV_NAME}:lexi:v6:verdict:_h:${b64(`${label}::${word}`).replace(/=/g, "")}`;
++  }
++  return key;
++}
+diff --git a/test/cc1Logic.test.ts b/test/cc1Logic.test.ts
+new file mode 100644
+index 0000000..e4ffbbf
+--- /dev/null
++++ b/test/cc1Logic.test.ts
+@@ -0,0 +1,71 @@
++/**
++ * cc1Logic.test.ts — CC1 child-safety + canonical sanitisation
++ *
++ * Why this matters: sanitizeOutput is the LAST line of defense before a
++ * canonical is cached and shown to a child. The model prompt forbids
++ * human-body and generic outputs, but models drift — this guard must
++ * hold regardless. These tests pin that contract.
++ */
++
++import {
++  sanitizeOutput,
++  GENERIC_LABELS,
++  HUMAN_BODY_BLOCKLIST,
++} from "./cc1Logic";
++
++describe("cc1.sanitizeOutput — child-safety override", () => {
++  it("forces every human-body term to \"object\" and drops aliases", () => {
++    for (const term of HUMAN_BODY_BLOCKLIST) {
++      const out = sanitizeOutput({ canonical: term, aliases: ["x", "y"] });
++      expect(out.canonical).toBe("object");
++      expect(out.aliases).toEqual([]);
++    }
++  });
++
++  it("catches human-body term even behind a leading article", () => {
++    const out = sanitizeOutput({ canonical: "the face", aliases: ["smile"] });
++    expect(out.canonical).toBe("object");
++    expect(out.aliases).toEqual([]);
++  });
++
++  it("strips a human-body alias from an otherwise-safe canonical", () => {
++    const out = sanitizeOutput({ canonical: "mirror", aliases: ["face", "glass"] });
++    expect(out.canonical).toBe("mirror");
++    expect(out.aliases).not.toContain("face");
++    expect(out.aliases).toContain("glass");
++  });
++});
++
++describe("cc1.sanitizeOutput — generic collapse", () => {
++  it("maps every generic label to \"object\"", () => {
++    for (const g of GENERIC_LABELS) {
++      const out = sanitizeOutput({ canonical: g, aliases: ["banana"] });
++      expect(out.canonical).toBe("object");
++      expect(out.aliases).toEqual([]);
++    }
++  });
++
++  it("treats empty/whitespace canonical as generic", () => {
++    expect(sanitizeOutput({ canonical: "   ", aliases: [] }).canonical).toBe("object");
++  });
++});
++
++describe("cc1.sanitizeOutput — happy path & hygiene", () => {
++  it("preserves a legitimate canonical and cleans aliases", () => {
++    const out = sanitizeOutput({
++      canonical: "a red apple",
++      aliases: ["the fruit", "apple", "object", ""],
++    });
++    expect(out.canonical).toBe("red apple");
++    expect(out.aliases).toContain("fruit");
++    expect(out.aliases).not.toContain("object");
++    expect(out.aliases).not.toContain("");
++    expect(out.aliases).not.toContain("red apple"); // alias == canonical removed
++  });
++
++  it("is idempotent — sanitising twice changes nothing", () => {
++    const once = sanitizeOutput({ canonical: "the wooden spoon", aliases: ["spoon"] });
++    const twice = sanitizeOutput(once);
++    expect(twice).toEqual(once);
++  });
++});
+diff --git a/test/cc1Logic.ts b/test/cc1Logic.ts
+new file mode 100644
+index 0000000..cf28d7f
+--- /dev/null
++++ b/test/cc1Logic.ts
+@@ -0,0 +1,56 @@
++/**
++ * cc1Logic.ts — pure-logic extract of:
++ *   • supabase/functions/cc1/index.ts → sanitizeOutput (+ its constants)
++ *
++ * Mirrors the live function VERBATIM as of repo 3ed6a1b. This is the
++ * child-safety core of CC1: the defense-in-depth layer that forces any
++ * human-body or generic canonical to "object" even if the model ignores
++ * the prompt. Untested before this file — unacceptable for a kids' app.
++ *
++ * Platform-agnostic: this is server-side Edge logic, identical for
++ * Android and iOS clients.
++ */
++
++export const GENERIC_LABELS = new Set(["", "object", "unknown", "thing", "item"]);
++
++export const HUMAN_BODY_BLOCKLIST = new Set([
++  "person", "people", "human", "child", "kid", "baby", "infant", "toddler",
++  "adult", "man", "woman", "boy", "girl",
++  "face", "head", "neck", "shoulder", "shoulders",
++  "hair", "skin", "flesh", "hand", "hands", "finger", "fingers",
++  "arm", "arms", "leg", "legs", "foot", "feet", "knee",
++  "eye", "eyes", "nose", "mouth", "lip", "lips", "ear", "ears",
++  "chest", "stomach", "back",
++]);
++
++export interface ModelOutput {
++  canonical: string;
++  aliases: string[];
++}
++
++// Verbatim mirror of supabase/functions/cc1/index.ts :: sanitizeOutput
++export function sanitizeOutput(parsed: ModelOutput): ModelOutput {
++  const stripArticles = (s: string): string =>
++    s.replace(/^(a|an|the)\s+/i, "").trim();
++
++  let canonical = stripArticles(parsed.canonical);
++
++  if (canonical.length === 0 || GENERIC_LABELS.has(canonical)) {
++    canonical = "object";
++  }
++
++  if (HUMAN_BODY_BLOCKLIST.has(canonical)) {
++    canonical = "object";
++  }
++
++  const aliases = canonical === "object"
++    ? []
++    : parsed.aliases
++        .map(stripArticles)
++        .filter((a) => a.length > 0)
++        .filter((a) => !GENERIC_LABELS.has(a))
++        .filter((a) => !HUMAN_BODY_BLOCKLIST.has(a))
++        .filter((a) => a !== canonical);
++
++  return { canonical, aliases };
++}
+diff --git a/test/revenuecatWebhook.test.ts b/test/revenuecatWebhook.test.ts
+new file mode 100644
+index 0000000..48795b8
+--- /dev/null
++++ b/test/revenuecatWebhook.test.ts
+@@ -0,0 +1,54 @@
++/**
++ * revenuecatWebhook.test.ts — RC entitlement → schema tier mapping
++ *
++ * Pins tierFromProductId against the REAL Product IDs this project
++ * actually registered (incl. the asymmetric annual IDs that caused
++ * real pain during RC setup). A regression here is invisible until a
++ * customer complains they paid and didn't unlock.
++ */
++
++import { tierFromProductId } from "./revenuecatWebhook";
++
++describe("rc.tierFromProductId — real registered Product IDs", () => {
++  it("maps both monthly variants (Apple + Google) to tier1", () => {
++    expect(tierFromProductId("lexilens_premium_monthly")).toBe("tier1");
++    expect(tierFromProductId("lexilens_premium_monthly:monthly-v2")).toBe("tier1");
++  });
++
++  it("maps the asymmetric annual IDs (Apple v2 + Google base-plan) to tier1", () => {
++    expect(tierFromProductId("lexilens_premium_annual_v2")).toBe("tier1");
++    expect(tierFromProductId("lexilens_premium_annual:annual")).toBe("tier1");
++  });
++
++  it("routes family-tier products to family regardless of period", () => {
++    expect(tierFromProductId("lexilens_family_monthly")).toBe("family");
++    expect(tierFromProductId("lexilens_family_annual:annual")).toBe("family");
++  });
++
++  it("routes a hypothetical pro tier to tier2", () => {
++    expect(tierFromProductId("lexilens_pro_monthly")).toBe("tier2");
++  });
++});
++
++describe("rc.tierFromProductId — precedence & edge cases", () => {
++  it("is case-insensitive", () => {
++    expect(tierFromProductId("LEXILENS_FAMILY_MONTHLY")).toBe("family");
++    expect(tierFromProductId("LexiLens_Premium_Annual_V2")).toBe("tier1");
++  });
++
++  it("family wins over pro when both substrings somehow appear", () => {
++    // documents current precedence: family check runs before pro
++    expect(tierFromProductId("family_pro_bundle")).toBe("family");
++  });
++
++  it("null / undefined / empty → free (no entitlement)", () => {
++    expect(tierFromProductId(null)).toBe("free");
++    expect(tierFromProductId(undefined)).toBe("free");
++    expect(tierFromProductId("")).toBe("free");
++  });
++
++  it("unknown non-empty product defaults to tier1, never free", () => {
++    // intentional design: any active entitlement grants at least tier1
++    expect(tierFromProductId("some_unmapped_sku")).toBe("tier1");
++  });
++});
+diff --git a/test/revenuecatWebhook.ts b/test/revenuecatWebhook.ts
+new file mode 100644
+index 0000000..e57f02b
+--- /dev/null
++++ b/test/revenuecatWebhook.ts
+@@ -0,0 +1,21 @@
++/**
++ * revenuecatWebhook.ts — pure-logic extract of:
++ *   • supabase/functions/revenuecat-webhook/index.ts → tierFromProductId
++ *
++ * Verbatim mirror as of repo 3ed6a1b. This single function decides
++ * whether a paying customer gets unlocked. Given the asymmetric Product
++ * IDs in this project (lexilens_premium_annual_v2 on Apple,
++ * lexilens_premium_annual:annual on Google, monthly-v2, etc.), a silent
++ * mis-map here = lost revenue that never throws an error. Highest-value
++ * untested surface in the codebase. Platform-agnostic (server-side).
++ */
++
++export function tierFromProductId(
++  productId: string | null | undefined,
++): "free" | "tier1" | "tier2" | "family" {
++  if (!productId) return "free";
++  const id = productId.toLowerCase();
++  if (id.includes("family")) return "family";
++  if (id.includes("pro"))    return "tier2";
++  return "tier1";
++}
+-- 
+2.43.0
+
