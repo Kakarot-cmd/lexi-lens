@@ -16,6 +16,7 @@ REM   scripts\build-android.cmd                — build current versionCode
 REM   scripts\build-android.cmd bump           — bump versionCode +1, then build
 REM   scripts\build-android.cmd clean          — clean :app then build (slower)
 REM   scripts\build-android.cmd bump production — bump + build with prod env
+REM   scripts\build-android.cmd skiptest        - bypass the Jest gate (known-good rebuild)
 REM
 REM Prerequisites (one-time setup — see docs/BUILD_ANDROID_LOCAL.md):
 REM   - .env.local at repo root with EXPO_PUBLIC_* vars filled in
@@ -40,12 +41,14 @@ REM ── Parse args ───────────────────�
 REM Args can come in any order. Look for known tokens.
 set "DO_BUMP=0"
 set "DO_CLEAN=0"
+set "SKIP_TEST=0"
 set "REQUESTED_VARIANT="
 
 :parse_args
 if "%~1"=="" goto args_done
 if /I "%~1"=="bump"        set "DO_BUMP=1"
 if /I "%~1"=="clean"       set "DO_CLEAN=1"
+if /I "%~1"=="skiptest"    set "SKIP_TEST=1"
 if /I "%~1"=="staging"     set "REQUESTED_VARIANT=staging"
 if /I "%~1"=="production"  set "REQUESTED_VARIANT=production"
 if /I "%~1"=="development" set "REQUESTED_VARIANT=development"
@@ -93,6 +96,34 @@ if defined MISSING_VARS (
 )
 echo [env] .env.local validation passed.
 
+
+REM -- Regression gate: run the Jest suite before spending build time --------
+REM The test/ harness is self-contained (own package.json + jest.config.json).
+REM A failing suite aborts BEFORE Gradle runs (fail fast). Bypass for a
+REM known-good rebuild with the 'skiptest' arg.
+if "!SKIP_TEST!"=="1" (
+    echo [test] SKIPPED via 'skiptest' arg.
+) else (
+    echo [test] Running Jest regression suite ^(test/^)...
+    pushd test
+    if not exist "node_modules" (
+        echo [test] Installing test deps ^(first run only^)...
+        call npm install --silent
+    )
+    call npx jest --config jest.config.json
+    set "TEST_EXIT=!ERRORLEVEL!"
+    popd
+    if not "!TEST_EXIT!"=="0" (
+        echo.
+        echo [TEST FAILED] Jest exited with code !TEST_EXIT! - aborting before Gradle.
+        echo Fix the failing test, or pass 'skiptest' to bypass intentionally.
+        popd
+        endlocal
+        exit /b 1
+    )
+    echo [test] All suites green.
+    echo.
+)
 REM ── Optional: bump versionCode (delegated to subroutine) ───────────────────
 if "!DO_BUMP!"=="1" (
     call :bump_version_code
