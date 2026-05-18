@@ -52,14 +52,20 @@
  *   portfolio summary is a simple 2-sentence generation, not a complex eval.
  */
 
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
+import { getModelAdapter } from "../_shared/models/index.ts";
+import {
+  resolveFeatureAccess,
+  statusFor,
+  messageFor,
+} from "../_shared/featureAccess.ts";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-
-const ANTHROPIC_API_URL  = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION  = "2023-06-01";
-const MODEL              = "claude-haiku-4-5-20251001";
+//
+// Model + endpoint are no longer hardcoded here — the provider is resolved
+// at call time by _shared/models (feature_flags.export_word_tome_model_
+// provider). See generatePortfolioSummary().
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
@@ -178,6 +184,24 @@ Deno.serve(async (req: Request) => {
 
   const child = childData as ChildProfile;
 
+  // ── 4b. Access gate: premium-only / free-grant / monthly cap ───────────────
+  //
+  //   Placed AFTER the ownership gate so a parent probing another family's
+  //   childId gets a 403 and never touches their own counter. All policy is
+  //   server-side in feature_flags (see _shared/featureAccess.ts). Premium
+  //   gate fails CLOSED; cost controls fail OPEN.
+  const access = await resolveFeatureAccess(admin, parentId, "export_word_tome");
+  if (!access.allowed) {
+    console.log(
+      `[export-word-tome] blocked outcome=${access.outcome} ` +
+      `parent=${parentId} used=${access.monthUsed}/${access.cap}`,
+    );
+    return json(
+      messageFor("export_word_tome", access.outcome),
+      statusFor(access.outcome),
+    );
+  }
+
   // ── 5. Fetch Word Tome ─────────────────────────────────────────────────────
   //      Ordered by first_used_at asc so the PDF tells the child's story
   //      chronologically — first word first, most recent last.
@@ -217,7 +241,7 @@ Deno.serve(async (req: Request) => {
   const quests: QuestCompletion[] = (questsData ?? []) as unknown as QuestCompletion[];
 
   // ── 7. Generate AI portfolio summary ──────────────────────────────────────
-  const summary = await generatePortfolioSummary(child, words, quests);
+  const summary = await generatePortfolioSummary(admin, child, words, quests);
 
   // ── 8. Return assembled portfolio data ────────────────────────────────────
   return json({
@@ -246,16 +270,11 @@ Deno.serve(async (req: Request) => {
  * This ensures the export always succeeds even during Anthropic API disruptions.
  */
 async function generatePortfolioSummary(
+  admin:  SupabaseClient,
   child:  ChildProfile,
   words:  WordTomeEntry[],
   quests: QuestCompletion[]
 ): Promise<string> {
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) {
-    console.warn("[export-word-tome] ANTHROPIC_API_KEY not set — using fallback summary.");
-    return buildFallbackSummary(child, words, quests);
-  }
-
   try {
     // Build mastery stats for the prompt
     const expertCount     = words.filter(w => (w.mastery_score ?? 0) >= 0.80).length;
@@ -304,34 +323,27 @@ Rules:
 - Be specific to THIS child's data, not generic.
 - Max 60 words total.`;
 
-    const response = await fetch(ANTHROPIC_API_URL, {
-      method:  "POST",
-      headers: {
-        "Content-Type":      "application/json",
-        "x-api-key":         apiKey,
-        "anthropic-version": ANTHROPIC_VERSION,
-      },
-      body: JSON.stringify({
-        model:      MODEL,
-        max_tokens: 150,
-        system:     CHILD_SAFETY_PREFIX,
-        messages:   [{ role: "user", content: prompt }],
-      }),
-    });
-
-    if (!response.ok) {
-      console.warn("[export-word-tome] Claude API returned", response.status);
-      return buildFallbackSummary(child, words, quests);
-    }
-
-    const data = await response.json();
-    const text = data?.content?.[0]?.text ?? "";
+    const response = await getModelAdapter("export-word-tome", admin)
+      .then((adapter) => adapter.call({
+        systemPrompt: CHILD_SAFETY_PREFIX,
+        userText:     prompt,
+        maxTokens:    150,
+      }));
 
     // Trim and clean — remove any stray quotes or leading/trailing whitespace
-    return text.trim().replace(/^["']|["']$/g, "");
+    const text = (response.rawText ?? "").trim().replace(/^["']|["']$/g, "");
+    if (!text) {
+      console.warn("[export-word-tome] model returned empty summary — fallback");
+      return buildFallbackSummary(child, words, quests);
+    }
+    console.log(
+      `[export-word-tome] summary model=${response.modelId} ` +
+      `latency=${response.latencyMs}ms`,
+    );
+    return text;
 
   } catch (err) {
-    console.warn("[export-word-tome] Claude summary failed:", err);
+    console.warn("[export-word-tome] model summary failed:", err);
     return buildFallbackSummary(child, words, quests);
   }
 }

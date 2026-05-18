@@ -37,6 +37,12 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
+import { getModelAdapter } from "../_shared/models/index.ts";
+import {
+  resolveFeatureAccess,
+  statusFor,
+  messageFor,
+} from "../_shared/featureAccess.ts";
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 
@@ -324,10 +330,53 @@ Deno.serve(async (req: Request) => {
     return json({ error: `Unknown ageBand: ${ageBand}. Use 5-6, 7-8, 9-10, or 11-12.` }, 400);
   }
 
-  // ── Call Claude ────────────────────────────────────────────────────────────
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) return json({ error: "ANTHROPIC_API_KEY not configured." }, 500);
+  // ── Authenticate caller + resolve access (premium gate / grant / cap) ──────
+  //
+  // generate-quest historically ran anonymous (deployed --no-verify-jwt and
+  // never read the auth header). The Supabase client SDK's functions.invoke()
+  // ALREADY attaches the caller's session JWT — this function just ignored
+  // it. So we derive the parent identity here with ZERO client-side change,
+  // mirroring export-word-tome's pattern.
+  //
+  // Access policy lives entirely server-side in feature_flags (premium_only,
+  // free_lifetime_grant, monthly_cap) — see _shared/featureAccess.ts. The
+  // premium gate fails CLOSED for an unidentifiable caller when premium_only
+  // is on; cost controls fail OPEN.
+  const admin = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    { auth: { autoRefreshToken: false, persistSession: false } },
+  );
 
+  let parentId: string | null = null;
+  const authHeader = req.headers.get("Authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    try {
+      const userClient = createClient(
+        Deno.env.get("SUPABASE_URL")!,
+        Deno.env.get("SUPABASE_ANON_KEY")!,
+        {
+          global: { headers: { Authorization: authHeader } },
+          auth:   { autoRefreshToken: false, persistSession: false },
+        },
+      );
+      const { data: { user }, error: authErr } = await userClient.auth.getUser();
+      if (!authErr && user) parentId = user.id;
+    } catch (e) {
+      console.warn(`[generate-quest] getUser threw: ${(e as Error)?.message ?? e}`);
+    }
+  }
+
+  const access = await resolveFeatureAccess(admin, parentId, "generate_quest");
+  if (!access.allowed) {
+    console.log(
+      `[generate-quest] blocked outcome=${access.outcome} ` +
+      `parent=${parentId ?? "anon"} used=${access.monthUsed}/${access.cap}`,
+    );
+    return json(messageFor("generate_quest", access.outcome), statusFor(access.outcome));
+  }
+
+  // ── Call the model (provider chosen by feature_flags via _shared/models) ───
   const systemPrompt = buildSystemPrompt(ageBand, tier, knownWords, masteryProfile, propCount);
   const userMessage  = buildUserMessage(theme, ageBand, tier);
 
@@ -336,38 +385,23 @@ Deno.serve(async (req: Request) => {
 
   let raw: string;
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method:  "POST",
-      headers: {
-        "Content-Type":      "application/json",
-        "x-api-key":         apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model:      "claude-haiku-4-5-20251001",
-        max_tokens: maxTokens,
-        system:     systemPrompt,
-        messages:   [{ role: "user", content: userMessage }],
-      }),
+    // Provider resolved from feature_flags.generate_quest_model_provider
+    // (anthropic|gemini|mistral) by the shared factory, with the same env +
+    // fallback chain evaluate uses. Default stays Haiku until deliberately
+    // flipped. Adapter normalises the request/response across providers.
+    const adapter = await getModelAdapter("generate-quest", admin);
+    const result  = await adapter.call({
+      systemPrompt,
+      userText:  userMessage,
+      maxTokens,
+      jsonMode:  true,   // quest is strict JSON; let the provider enforce it
     });
-
-    if (!response.ok) {
-      const errText = await response.text().catch(() => "(unreadable)");
-      console.error("[generate-quest] Anthropic error:", response.status, errText);
-      return json({ error: `AI service error (${response.status}). Please try again.` }, 502);
-    }
-
-    const apiResponse = await response.json() as {
-      content: Array<{ type: string; text?: string }>;
-    };
-
-    raw = apiResponse.content
-      .filter(b => b.type === "text")
-      .map(b => b.text ?? "")
-      .join("");
-
+    raw = result.rawText;
+    console.log(
+      `[generate-quest] model=${result.modelId} latency=${result.latencyMs}ms`,
+    );
   } catch (err: any) {
-    console.error("[generate-quest] fetch error:", err.message);
+    console.error("[generate-quest] model call error:", err?.message ?? err);
     return json({ error: "Could not reach AI service. Please try again." }, 502);
   }
 
