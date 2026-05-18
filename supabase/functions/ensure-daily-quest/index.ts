@@ -71,6 +71,7 @@
 
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
+import { getModelAdapter } from "../_shared/models/index.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -79,7 +80,6 @@ const DAILY_AGE_BAND      = "7-8"; // Middle-ground vocabulary
 const DAILY_TIER          = "apprentice";
 const DAILY_PROP_COUNT    = 3;
 const DAILY_MIN_AGE_BAND  = "5-6"; // Visibility — accessible to all ages
-const MODEL               = "claude-haiku-4-5-20251001";
 const MAX_TOKENS          = 1400;
 const KILL_SWITCH_FLAG    = "daily_quest_auto_gen_enabled";
 // Tier the daily quest is created/selected at. Flag (default 'free') so the
@@ -215,35 +215,24 @@ async function readDailyQuestMinTier(supabase: SupabaseClient): Promise<DailyMin
   }
 }
 
-// ─── Haiku call ──────────────────────────────────────────────────────────────
+// ─── Model call (provider via factory; default anthropic = unchanged) ────────
 
-async function generateQuestViaHaiku(apiKey: string): Promise<GeneratedQuest> {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type":      "application/json",
-      "x-api-key":         apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model:      MODEL,
-      max_tokens: MAX_TOKENS,
-      system:     SYSTEM_PROMPT,
-      messages:   [{ role: "user", content: USER_MESSAGE }],
-    }),
+async function generateQuestViaModel(supabase: SupabaseClient): Promise<GeneratedQuest> {
+  // Wired to the shared factory for consistency with the other model-calling
+  // functions. Default stays 'anthropic' (Haiku) via the seed migration —
+  // this is a ~1-call/day-globally function, so cost is irrelevant; the only
+  // goal here is that no function is left on a raw hardcoded fetch (avoids
+  // the next "wait, is this one dynamic?" surprise). Flip the flag if ever
+  // desired, but there is no cost reason to.
+  const adapter = await getModelAdapter("generate-quest", supabase);
+  const result  = await adapter.call({
+    systemPrompt: SYSTEM_PROMPT,
+    userText:     USER_MESSAGE,
+    maxTokens:    MAX_TOKENS,
+    jsonMode:     true,
   });
 
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "(unreadable)");
-    throw new Error(`Anthropic ${response.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const apiResponse = await response.json() as { content: Array<{ type: string; text?: string }> };
-  const raw = apiResponse.content
-    .filter(b => b.type === "text")
-    .map(b => b.text ?? "")
-    .join("");
-
+  const raw   = result.rawText ?? "";
   const clean = raw.replace(/```json|```/g, "").trim();
   const quest = JSON.parse(clean) as GeneratedQuest;
 
@@ -410,7 +399,6 @@ Deno.serve(async (req: Request) => {
 
   const SUPABASE_URL      = Deno.env.get("SUPABASE_URL")              ?? "";
   const SERVICE_ROLE_KEY  = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
-  const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")         ?? "";
 
   if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
     return json({ error: "missing_supabase_secrets" }, 500);
@@ -459,9 +447,8 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── 3b. Kill-switch ON → generate with uniqueness check + retries ────────
-  if (!ANTHROPIC_API_KEY) {
-    return json({ error: "ANTHROPIC_API_KEY not configured" }, 500);
-  }
+  // Provider creds are owned by the model factory now; no hard ANTHROPIC
+  // key requirement here (the factory falls back across providers).
 
   let questData: GeneratedQuest | null = null;
   let attempt = 0;
@@ -470,7 +457,7 @@ Deno.serve(async (req: Request) => {
   while (attempt <= MAX_RETRIES) {
     attempt++;
     try {
-      const candidate = await generateQuestViaHaiku(ANTHROPIC_API_KEY);
+      const candidate = await generateQuestViaModel(supabase);
 
       if (await nameCollides(supabase, candidate.enemy_name)) {
         lastFailReason = `name_collision: "${candidate.enemy_name}"`;

@@ -25,10 +25,12 @@
  *   • Direct fetch() to Anthropic API — NEVER the SDK (esm.sh times out at bundle).
  *   • Deno.env.get for ANTHROPIC_API_KEY (not process.env — that's Node).
  *   • std@0.168.0/http/server — same version as other deployed EFs.
- *   • Same CORS_HEADERS shape, same anthropic-version header.
- *   • Model: claude-haiku-4-5-20251001 — bucketing into 6 domains is exactly
- *     the kind of simple eval Haiku 4.5 was designed for. ~65% cheaper than
- *     Sonnet for this task.
+ *   • Same CORS_HEADERS shape.
+ *   • Model: resolved at call time by _shared/models from
+ *     feature_flags.classify_words_model_provider (seeded to 'gemini' —
+ *     6-domain bucketing is trivial; Gemini Flash-Lite ~30x cheaper than
+ *     Haiku, zero quality loss, and this function is uncapped +
+ *     free-user-reachable so model choice is the cost lever).
  *
  * Deploy:
  *   supabase functions deploy classify-words --no-verify-jwt
@@ -47,7 +49,8 @@
  */
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2.103.0";
+import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2.103.0";
+import { getModelAdapter } from "../_shared/models/index.ts";
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 
 // ─── Constants ────────────────────────────────────────────────────────────
@@ -58,9 +61,8 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, apikey",
 };
 
-const MODEL              = "claude-haiku-4-5-20251001";
-const ANTHROPIC_API_URL  = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION  = "2023-06-01";
+// Model + endpoint are no longer hardcoded — provider is resolved per-call
+// by _shared/models (feature_flags.classify_words_model_provider).
 
 const VALID_DOMAINS = [
   "texture", "colour", "structure", "sound", "shape", "material", "other",
@@ -113,10 +115,9 @@ serve(async (req: Request) => {
   }
 
   // ── Wire up clients ─────────────────────────────────────────────────────
-  const anthropicKey  = Deno.env.get("ANTHROPIC_API_KEY");
   const supabaseUrl   = Deno.env.get("SUPABASE_URL");
   const serviceKey    = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!anthropicKey || !supabaseUrl || !serviceKey) {
+  if (!supabaseUrl || !serviceKey) {
     console.error("[classify-words] missing required env vars");
     return jsonResponse({ error: "Server configuration error" }, 500);
   }
@@ -154,7 +155,7 @@ serve(async (req: Request) => {
   for (let i = 0; i < toClassify.length; i += BATCH_SIZE) {
     const batch = toClassify.slice(i, i + BATCH_SIZE);
     try {
-      const result = await classifyBatch(batch, anthropicKey);
+      const result = await classifyBatch(batch, supabase);
       allClassifications.push(...result);
     } catch (e) {
       console.error("[classify-words] batch failed:", (e as Error).message);
@@ -211,7 +212,7 @@ function sanitizeInput(rawWords: unknown[]): InputWord[] {
 
 async function classifyBatch(
   batch: InputWord[],
-  apiKey: string
+  supabase: SupabaseClient
 ): Promise<Classification[]> {
   const wordList = batch
     .map((w, i) => `${i + 1}. "${w.word}"${w.definition ? ` — ${w.definition}` : ""}`)
@@ -242,36 +243,21 @@ Output STRICT JSON only, no commentary, no markdown fences:
 
 Include every input word exactly once. Preserve the lowercase form.`;
 
-  const response = await fetch(ANTHROPIC_API_URL, {
-    method:  "POST",
-    headers: {
-      "Content-Type":      "application/json",
-      "x-api-key":         apiKey,
-      "anthropic-version": ANTHROPIC_VERSION,
-    },
-    body: JSON.stringify({
-      model:      MODEL,
-      max_tokens: MAX_TOKENS_PER_BATCH,
-      system:     systemPrompt,
-      messages: [
-        { role: "user", content: `Classify these words:\n\n${wordList}` },
-      ],
-    }),
+  // Provider resolved from feature_flags.classify_words_model_provider
+  // (anthropic|gemini|mistral) via the shared factory. Default → gemini for
+  // this scope (set by the accompanying migration): 6-bucket classification
+  // is a trivial text task; Gemini Flash-Lite is ~30x cheaper than Haiku
+  // with no quality loss, and this function is uncapped + free-user-reachable
+  // so model choice is the only cost lever that matters here.
+  const adapter = await getModelAdapter("classify-words", supabase);
+  const result  = await adapter.call({
+    systemPrompt: systemPrompt,
+    userText:     `Classify these words:\n\n${wordList}`,
+    maxTokens:    MAX_TOKENS_PER_BATCH,
+    jsonMode:     true,
   });
 
-  if (!response.ok) {
-    const errText = await response.text().catch(() => "(unreadable)");
-    throw new Error(`Anthropic ${response.status}: ${errText.slice(0, 200)}`);
-  }
-
-  const apiResponse = await response.json() as {
-    content: Array<{ type: string; text?: string }>;
-  };
-
-  const rawText = apiResponse.content
-    .filter((b) => b.type === "text")
-    .map((b)   => b.text ?? "")
-    .join("");
+  const rawText = result.rawText ?? "";
 
   return parseClassifications(rawText, batch);
 }

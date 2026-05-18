@@ -27,7 +27,9 @@
  */
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
+import { getModelAdapter } from "../_shared/models/index.ts";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin":  "*",
@@ -36,9 +38,8 @@ const CORS_HEADERS = {
 };
 
 
-const MODEL              = "claude-haiku-4-5-20251001";
-const ANTHROPIC_API_URL  = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION  = "2023-06-01";
+// Model + endpoint are no longer hardcoded — provider is resolved per-call
+// by _shared/models (feature_flags.retire_word_model_provider).
 
 serve(async (req: Request) => {
   // Handle CORS preflight
@@ -56,8 +57,14 @@ serve(async (req: Request) => {
       );
     }
 
-    const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-    if (!apiKey) throw new Error("ANTHROPIC_API_KEY not configured");
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceKey  = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceKey) {
+      throw new Error("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured");
+    }
+    const supabase = createClient(supabaseUrl, serviceKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
 
     // ── Call Claude for synonym suggestion ────────────────────────────────────
     //
@@ -77,17 +84,15 @@ serve(async (req: Request) => {
 	
 	
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type":      "application/json",
-        "x-api-key":         apiKey,
-        "anthropic-version": ANTHROPIC_VERSION,
-      },
-      body: JSON.stringify({
-		model: MODEL,
-        max_tokens: 200,
-        system: `${CHILD_SAFETY_PREFIX}
+    // Provider resolved from feature_flags.retire_word_model_provider via the
+    // shared factory. Default → gemini (set by migration): "suggest one
+    // harder synonym + child-friendly definition" is a trivial text task;
+    // Gemini Flash-Lite is ~30x cheaper than Haiku with no quality loss.
+    // retire-word is app-logic (fires once when a word crosses mastery 0.80)
+    // and intentionally NOT capped — model choice is the right cost lever.
+    const adapter = await getModelAdapter("retire-word", supabase);
+    const modelResult = await adapter.call({
+      systemPrompt: `${CHILD_SAFETY_PREFIX}
 
 You are a vocabulary curriculum designer for a children's educational game.
 Your task: find a harder synonym for a word a child has just mastered.
@@ -107,26 +112,13 @@ Good progression examples:
   heavy       → ponderous (def: "so heavy it moves slowly and with great weight")
   smooth      → frictionless (def: "so smooth that nothing can grip or catch on it")
   fragile     → brittle  (def: "hard but snaps instantly under force instead of bending")`,
-        messages: [
-          {
-            role:    "user",
-            content: `The child has mastered the word "${word}" (definition: "${definition}").
+      userText: `The child has mastered the word "${word}" (definition: "${definition}").
 What is the perfect next-level synonym they should learn? Return JSON only.`,
-          },
-        ],
-      }),
+      maxTokens: 200,
+      jsonMode:  true,
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Claude API error ${response.status}: ${errText}`);
-    }
-
-    const claudeData = await response.json();
-    const rawText = claudeData.content
-      .filter((b: any) => b.type === "text")
-      .map((b: any) => b.text)
-      .join("");
+    const rawText = modelResult.rawText ?? "";
 
     // Strip accidental markdown fences
     const clean = rawText.replace(/```json|```/g, "").trim();
