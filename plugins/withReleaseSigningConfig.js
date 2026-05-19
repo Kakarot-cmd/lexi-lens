@@ -41,11 +41,16 @@
  * keystore credentials). On a fresh clone, add the four LEXILENS_UPLOAD_*
  * properties manually — see docs/BUILD_ANDROID_LOCAL.md.
  *
- * If gradle.properties is missing the properties, the plugin's injected
- * `project.hasProperty(...)` guard falls back gracefully — release builds
- * silently sign with debug instead of failing the build. This is intentional:
- * developers on a fresh checkout can still produce *debug* APKs without
- * needing the production keystore. Only release AABs need the upload key.
+ * If gradle.properties is missing the properties, the plugin degrades
+ * correctly: the injected `release` SigningConfig mirrors the debug keystore
+ * (so it is a valid, fully-populated config — not an empty one that makes
+ * AGP throw), AND buildTypes.release stays pointed at signingConfigs.debug
+ * via a Gradle-time `project.hasProperty(...)` ternary. Net: a fresh clone
+ * or a --clean-wiped machine produces a working debug-signed APK with zero
+ * secrets. Only release AABs destined for Play need the real upload key.
+ * (Earlier versions of this plugin DOCUMENTED this fallback but did not
+ * implement it — an empty release config crashed every Gradle task,
+ * including assembleDebug. Fixed 2026-05-18.)
  *
  * If the build.gradle template's `signingConfigs.debug` block can't be
  * located (Expo updates its template and the regex misses), the plugin
@@ -60,14 +65,26 @@ const RELEASE_SIGNING_BLOCK = `
         release {
             // Lexi-Lens upload keystore — injected by plugins/withReleaseSigningConfig.js.
             // Values resolved from android/gradle.properties (gitignored).
-            // Falls back gracefully if properties missing — release variant signs
-            // with debug keystore in that case, which Play will reject but local
-            // dev/debug workflows continue to function.
+            //
+            // When the LEXILENS_UPLOAD_* properties are PRESENT this configures
+            // the real upload keystore. When ABSENT (fresh clone, dev machine,
+            // after a --clean wipe of gradle.properties) it deliberately mirrors
+            // the DEBUG signing config so the 'release' SigningConfig is fully
+            // populated and valid — never an empty/half-evaluated config that
+            // makes AGP throw 'unknown property LEXILENS_UPLOAD_STORE_PASSWORD'
+            // and fail *every* task, including assembleDebug. Edit 2 below only
+            // repoints buildTypes.release at this when the props exist, so a
+            // keyless machine still produces a debug-signed APK as documented.
             if (project.hasProperty('LEXILENS_UPLOAD_STORE_FILE')) {
                 storeFile     file(LEXILENS_UPLOAD_STORE_FILE)
                 storePassword LEXILENS_UPLOAD_STORE_PASSWORD
                 keyAlias      LEXILENS_UPLOAD_KEY_ALIAS
                 keyPassword   LEXILENS_UPLOAD_KEY_PASSWORD
+            } else {
+                storeFile     file(signingConfigs.debug.storeFile)
+                storePassword signingConfigs.debug.storePassword
+                keyAlias      signingConfigs.debug.keyAlias
+                keyPassword   signingConfigs.debug.keyPassword
             }
         }`;
 
@@ -114,12 +131,24 @@ const withReleaseSigningConfig = (config) => {
     }
 
     // ── Edit 2: buildTypes.release.signingConfig debug → release ────────────
+    //
+    // ONLY repoint release at signingConfigs.release when the upload keystore
+    // is actually configured. The plugin runs at prebuild time but the regex
+    // edit bakes a static decision into build.gradle, so we cannot read
+    // project.hasProperty here — instead we wrap the swapped value itself in
+    // a Gradle-time ternary. With props absent this evaluates to
+    // signingConfigs.debug (valid, debug-signed release — fine for local
+    // dev/debug; never uploaded to Play). With props present it is
+    // signingConfigs.release (the real upload key). Either way the value is a
+    // fully-populated, valid SigningConfig, so AGP never throws during :app
+    // evaluation and assembleDebug works with zero secrets.
     const wrongSigningPattern = /(buildTypes\s*\{[\s\S]*?release\s*\{[\s\S]*?)signingConfig\s+signingConfigs\.debug/;
 
     if (wrongSigningPattern.test(contents)) {
       contents = contents.replace(
         wrongSigningPattern,
-        '$1signingConfig signingConfigs.release',
+        "$1signingConfig (project.hasProperty('LEXILENS_UPLOAD_STORE_FILE') " +
+          "? signingConfigs.release : signingConfigs.debug)",
       );
       edit2Applied = true;
     }
