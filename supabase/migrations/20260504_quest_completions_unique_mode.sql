@@ -2,22 +2,28 @@
 -- 20260504_quest_completions_unique_mode.sql
 -- Lexi-Lens — quest_completions: mode column + UNIQUE (child_id, quest_id, mode)
 --
--- HISTORY: this migration was originally applied directly to live staging
--- during the v3.5 quest-progress-persistence debugging pass and never
--- committed to the repo. Flagged in 3+ subsequent audits. Committing now to
+-- HISTORY: originally applied directly to live staging during the v3.5
+-- quest-progress-persistence debugging pass; never committed to the repo
+-- until 2026-05-20. Flagged in 3+ subsequent audits. Committing now to
 -- close the gap so:
 --   • bootstrap-then-migrate fresh provisioning matches the applied state
 --   • a migration-replay-only fresh PROD has the same uniqueness guarantee
 --     as live (without it, duplicate quest_completions corrupt streaks
 --     and XP)
 --
--- IDEMPOTENT BY COLUMN-TUPLE, NOT BY NAME — live staging currently carries
+-- IDEMPOTENT BY COLUMN-TUPLE, NOT BY NAME — live staging + prod each carry
 -- TWO UNIQUE (child_id, quest_id, mode) constraints (different system-
--- generated names, identical column tuple). A name-based guard would
--- silently add a third. We check the column tuple and skip cleanly.
+-- generated names: ..._key and ..._uniq, identical column tuple). A
+-- name-based guard would silently add a third. We check the column tuple
+-- and skip cleanly.
+--
+-- 2026-05-20 fix: pg_attribute.attname is type `name`, not `text`; the
+-- equality comparison must cast or PostgreSQL throws 42883
+-- (`operator does not exist: name[] = text[]`). Cast added inline in the
+-- subquery.
 --
 -- REVERSIBILITY: fully additive. To revert, drop the named constraint
--- this migration creates (leaves the historical duplicate(s) intact).
+-- this migration creates (leaves the historical duplicates intact).
 -- ============================================================================
 
 -- ── 1. Ensure mode column exists ────────────────────────────────────────────
@@ -53,7 +59,7 @@ DECLARE
 BEGIN
     FOR existing IN
         SELECT c.conname,
-               (SELECT array_agg(a.attname ORDER BY a.attname)
+               (SELECT array_agg(a.attname::text ORDER BY a.attname::text)
                   FROM unnest(c.conkey) AS k
                   JOIN pg_attribute a
                     ON a.attrelid = c.conrelid AND a.attnum = k) AS cols
