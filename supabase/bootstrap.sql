@@ -1587,22 +1587,290 @@ ON CONFLICT (version) DO NOTHING;
 COMMIT;
 
 -- ════════════════════════════════════════════════════════════════════════════
+-- SECTION 12 — POST-MIGRATION BACKFILL (2026-05-20)
+-- ════════════════════════════════════════════════════════════════════════════
+--
+-- The sections above are the original bootstrap. The block below folds in
+-- five migrations that landed AFTER bootstrap was last regenerated, so a
+-- fresh-PROD provision from this single file is now self-contained (no
+-- migration replay needed):
+--
+--   • 20260512_routing_v6_3_followup_paid_tier  — is_paid_tier() helper
+--   • 20260515_feature_usage_monthly_caps        — paid-gate table + RPCs + 8 flags
+--   • 20260518_model_provider_flags_app_logic    — classify_words / retire_word → gemini
+--   • 20260518_daily_quest_min_tier_flag         — daily-quest tier flag
+--   • 20260518_parents_rc_event_watermark        — RC ordering-guard watermark
+--
+-- Wrapped in its own BEGIN/COMMIT so the original transaction stays intact.
+-- Every statement is idempotent (CREATE … IF NOT EXISTS, ON CONFLICT DO
+-- NOTHING, DO … EXCEPTION WHEN duplicate_object). Re-running this file
+-- against an already-provisioned database is a safe no-op.
+-- ════════════════════════════════════════════════════════════════════════════
+
+BEGIN;
+
+-- ─── 12.1. is_paid_tier(t) — central premium predicate ─────────────────────
+-- Required by parent_has_premium and by the quests RLS tier gate. The
+-- v6.3.1 definition widens the set to include legacy 'paid' alongside the
+-- 4 v6.0 tiers (paid|tier1|tier2|family).
+
+CREATE OR REPLACE FUNCTION public.is_paid_tier(t text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT t IN ('paid', 'tier1', 'tier2', 'family');
+$$;
+
+COMMENT ON FUNCTION public.is_paid_tier(text) IS
+  'v6.3.1 helper. True if the given subscription_tier represents a paying '
+  'customer with premium access RIGHT NOW. paid|tier1|tier2|family → true. '
+  'Free / NULL / unknown → false. Use everywhere instead of '
+  'subscription_tier=''paid'' literals.';
+
+-- ─── 12.2. parents.last_rc_event_ts_ms — RC webhook ordering watermark ─────
+
+ALTER TABLE public.parents
+    ADD COLUMN IF NOT EXISTS last_rc_event_ts_ms bigint;
+
+COMMENT ON COLUMN public.parents.last_rc_event_ts_ms IS
+    'RevenueCat event_timestamp_ms watermark. revenuecat-webhook writes the '
+    'tier only when incoming event_timestamp_ms >= this value, then advances '
+    'both atomically. NULL = no event seen yet (first event always lands).';
+
+-- ─── 12.3. feature_usage_monthly — per-parent monthly counter ──────────────
+
+CREATE TABLE IF NOT EXISTS public.feature_usage_monthly (
+  parent_id       uuid        NOT NULL
+                    REFERENCES auth.users(id) ON DELETE CASCADE,
+  feature_key     text        NOT NULL
+                    CHECK (feature_key IN ('generate_quest', 'export_word_tome')),
+  period_month    date        NOT NULL,
+  usage_count     integer     NOT NULL DEFAULT 0 CHECK (usage_count    >= 0),
+  lifetime_count  integer     NOT NULL DEFAULT 0 CHECK (lifetime_count >= 0),
+  updated_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (parent_id, feature_key, period_month)
+);
+
+COMMENT ON TABLE public.feature_usage_monthly IS
+  'Per-parent, per-feature usage counters for user-triggered AI Edge '
+  'Functions. usage_count = current-UTC-month tally (monthly cap). '
+  'lifetime_count = all-time tally (free-taste grant). Service role only.';
+
+CREATE INDEX IF NOT EXISTS feature_usage_monthly_period_idx
+  ON public.feature_usage_monthly (period_month);
+
+-- ─── 12.4. parent_has_premium(p_parent_id uuid) RPC ────────────────────────
+
+CREATE OR REPLACE FUNCTION public.parent_has_premium(p_parent_id uuid)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path TO 'public', 'pg_temp'
+AS $$
+  SELECT COALESCE(
+    (SELECT public.is_paid_tier(p.subscription_tier)
+       FROM public.parents p
+      WHERE p.id = p_parent_id),
+    false
+  );
+$$;
+
+COMMENT ON FUNCTION public.parent_has_premium(uuid) IS
+  'True iff parent currently has premium entitlement (wraps is_paid_tier). '
+  'Fails closed: unknown parent → false. Service role only.';
+
+-- ─── 12.5. consume_feature_quota — atomic access decision + counter ─────────
+
+CREATE OR REPLACE FUNCTION public.consume_feature_quota(
+  p_parent_id      uuid,
+  p_feature_key    text,
+  p_monthly_cap    integer,
+  p_free_grant     integer
+)
+RETURNS TABLE(decision text, month_used integer, lifetime_used integer, monthly_cap integer)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'pg_temp'
+AS $$
+DECLARE
+  v_period   date := date_trunc('month', now() AT TIME ZONE 'UTC')::date;
+  v_premium  boolean;
+  v_month    integer;
+  v_life     integer;
+BEGIN
+  v_premium := public.parent_has_premium(p_parent_id);
+
+  INSERT INTO public.feature_usage_monthly
+    (parent_id, feature_key, period_month, usage_count, lifetime_count)
+  VALUES (p_parent_id, p_feature_key, v_period, 0,
+          COALESCE((SELECT max(lifetime_count)
+                      FROM public.feature_usage_monthly
+                     WHERE parent_id   = p_parent_id
+                       AND feature_key = p_feature_key), 0))
+  ON CONFLICT (parent_id, feature_key, period_month) DO NOTHING;
+
+  SELECT usage_count, lifetime_count INTO v_month, v_life
+    FROM public.feature_usage_monthly
+   WHERE parent_id    = p_parent_id
+     AND feature_key  = p_feature_key
+     AND period_month = v_period
+   FOR UPDATE;
+
+  IF NOT v_premium AND v_life >= GREATEST(p_free_grant, 0) THEN
+    RETURN QUERY SELECT 'need_premium', v_month, v_life, p_monthly_cap;
+    RETURN;
+  END IF;
+
+  IF v_month >= p_monthly_cap THEN
+    RETURN QUERY SELECT 'monthly_cap', v_month, v_life, p_monthly_cap;
+    RETURN;
+  END IF;
+
+  UPDATE public.feature_usage_monthly
+     SET usage_count    = usage_count + 1,
+         lifetime_count = lifetime_count + 1,
+         updated_at     = now()
+   WHERE parent_id    = p_parent_id
+     AND feature_key  = p_feature_key
+     AND period_month = v_period
+  RETURNING usage_count, lifetime_count INTO v_month, v_life;
+
+  RETURN QUERY SELECT 'allow', v_month, v_life, p_monthly_cap;
+END;
+$$;
+
+COMMENT ON FUNCTION public.consume_feature_quota(uuid, text, integer, integer) IS
+  'Atomic entitlement + counter increment. decision ∈ {allow, need_premium, '
+  'monthly_cap}. Increments only on allow. Service role only.';
+
+-- ─── 12.6. prune_feature_usage_monthly — housekeeping ──────────────────────
+
+CREATE OR REPLACE FUNCTION public.prune_feature_usage_monthly(p_keep_months integer DEFAULT 6)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'pg_temp'
+AS $$
+DECLARE
+  v_cutoff  date := (date_trunc('month', now() AT TIME ZONE 'UTC')
+                      - (GREATEST(p_keep_months, 1) || ' months')::interval)::date;
+  v_deleted integer;
+BEGIN
+  DELETE FROM public.feature_usage_monthly fum
+   WHERE fum.period_month < v_cutoff
+     AND EXISTS (
+       SELECT 1 FROM public.feature_usage_monthly o
+        WHERE o.parent_id    = fum.parent_id
+          AND o.feature_key  = fum.feature_key
+          AND o.period_month >= v_cutoff);
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END;
+$$;
+
+COMMENT ON FUNCTION public.prune_feature_usage_monthly(integer) IS
+  'Manual housekeeping. Deletes feature_usage_monthly rows older than '
+  'p_keep_months but never the last surviving (parent,feature) row.';
+
+-- ─── 12.7. RLS + grants for the new objects ────────────────────────────────
+
+ALTER TABLE public.feature_usage_monthly ENABLE ROW LEVEL SECURITY;
+
+REVOKE ALL ON public.feature_usage_monthly FROM anon, authenticated;
+GRANT  ALL ON public.feature_usage_monthly TO   service_role;
+
+REVOKE ALL ON FUNCTION public.parent_has_premium(uuid)                              FROM anon, authenticated;
+GRANT  EXECUTE ON FUNCTION public.parent_has_premium(uuid)                            TO service_role;
+REVOKE ALL ON FUNCTION public.consume_feature_quota(uuid, text, integer, integer)   FROM anon, authenticated;
+GRANT  EXECUTE ON FUNCTION public.consume_feature_quota(uuid, text, integer, integer) TO service_role;
+REVOKE ALL ON FUNCTION public.prune_feature_usage_monthly(integer)                  FROM anon, authenticated;
+GRANT  EXECUTE ON FUNCTION public.prune_feature_usage_monthly(integer)                TO service_role;
+
+-- ─── 12.8. Feature-flag seeds (all 11 added since bootstrap last regenerated)
+-- ON CONFLICT DO NOTHING — re-running NEVER clobbers a value you have tuned
+-- in production (e.g. the live evaluate_model_provider = 'gemini' override).
+
+INSERT INTO public.feature_flags (key, value, description) VALUES
+  -- Paid-gate (20260515)
+  ('generate_quest_premium_only',          'true',
+   'When true, generate-quest requires premium (is_paid_tier).'),
+  ('export_word_tome_premium_only',        'true',
+   'When true, export-word-tome requires premium (is_paid_tier).'),
+  ('generate_quest_free_lifetime_grant',   '0',
+   'Lifetime free custom-quests for non-premium parents. 0 = pure paid-only. Clamp [0,50].'),
+  ('export_word_tome_free_lifetime_grant', '0',
+   'Lifetime free PDF exports for non-premium parents. Clamp [0,50].'),
+  ('generate_quest_monthly_cap',           '15',
+   'Max custom quests per parent per UTC month (flat, abuse/cost brake). Clamp [1,100000].'),
+  ('export_word_tome_monthly_cap',         '12',
+   'Max PDF exports per parent per UTC month. Clamp [1,100000].'),
+  ('generate_quest_model_provider',        'anthropic',
+   'Provider for generate-quest (anthropic|gemini|mistral). Holds at Haiku pending quest-quality A/B.'),
+  ('export_word_tome_model_provider',      'anthropic',
+   'Provider for export-word-tome (anthropic|gemini|mistral). Safe to flip to gemini after spot-check.'),
+
+  -- App-logic model providers (20260518_model_provider_flags_app_logic)
+  ('classify_words_model_provider',        'gemini',
+   'Provider for classify-words (anthropic|gemini|mistral). gemini: cached + trivial; ~30x cheaper.'),
+  ('retire_word_model_provider',           'gemini',
+   'Provider for retire-word (anthropic|gemini|mistral). gemini: fires once per mastered word; ~30x cheaper.'),
+
+  -- Daily-quest tier flag (20260518_daily_quest_min_tier_flag)
+  ('daily_quest_min_tier',                 'free',
+   'Tier the auto-provisioned daily quest is created/selected at. '
+   '''free'' (default) = daily quest is free for everyone. '
+   '''paid'' = daily quest becomes a premium perk. Read by ensure-daily-quest.')
+ON CONFLICT (key) DO NOTHING;
+
+-- ─── 12.9. Sanity log ──────────────────────────────────────────────────────
+
+DO $$
+DECLARE
+  flags_count integer;
+  table_ok    boolean;
+  rpcs_ok     boolean;
+  col_ok      boolean;
+BEGIN
+  SELECT count(*) INTO flags_count FROM public.feature_flags WHERE key IN (
+    'generate_quest_premium_only','export_word_tome_premium_only',
+    'generate_quest_free_lifetime_grant','export_word_tome_free_lifetime_grant',
+    'generate_quest_monthly_cap','export_word_tome_monthly_cap',
+    'generate_quest_model_provider','export_word_tome_model_provider',
+    'classify_words_model_provider','retire_word_model_provider',
+    'daily_quest_min_tier');
+  table_ok := to_regclass('public.feature_usage_monthly') IS NOT NULL;
+  rpcs_ok  := (SELECT count(*) FROM pg_proc
+                WHERE pronamespace = 'public'::regnamespace
+                  AND proname IN ('is_paid_tier','parent_has_premium','consume_feature_quota','prune_feature_usage_monthly')) = 4;
+  col_ok   := EXISTS(SELECT 1 FROM information_schema.columns
+                      WHERE table_schema='public' AND table_name='parents'
+                        AND column_name='last_rc_event_ts_ms');
+  RAISE NOTICE 'Section 12 backfill: flags=%/11 table=% rpcs=% watermark_col=%',
+    flags_count, table_ok, rpcs_ok, col_ok;
+END $$;
+
+COMMIT;
+
+-- ════════════════════════════════════════════════════════════════════════════
 -- POST-RUN VERIFICATION
 -- ════════════════════════════════════════════════════════════════════════════
 --
 -- Run these checks after the script completes:
 --
---   -- 1. All 19 tables present:
+--   -- 1. All 20 tables present (was 19; +feature_usage_monthly):
 --   SELECT count(*) FROM pg_tables WHERE schemaname = 'public';
---   -- expect 19
+--   -- expect 20
 --
 --   -- 2. All 7 views present:
 --   SELECT count(*) FROM pg_views WHERE schemaname = 'public';
 --   -- expect 7
 --
---   -- 3. All 14 functions present:
+--   -- 3. All 18 functions present (was 14; +is_paid_tier +parent_has_premium
+--   --    +consume_feature_quota +prune_feature_usage_monthly):
 --   SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace;
---   -- expect 14
+--   -- expect 18
 --
 --   -- 4. RPC EXECUTE grants (must be true for authenticated):
 --   SELECT proname, has_function_privilege('authenticated', oid, 'EXECUTE') AS can_call
@@ -1618,6 +1886,25 @@ COMMIT;
 --   -- 5. Privacy policy seed:
 --   SELECT version, effective_date FROM public.privacy_policy_versions;
 --   -- expect at least one row with version = '1.0'
+--
+--   -- 6. Section 12 backfill — all paid-gate plumbing present:
+--   SELECT count(*) FROM public.feature_flags
+--    WHERE key IN ('generate_quest_premium_only','export_word_tome_premium_only',
+--                  'generate_quest_free_lifetime_grant','export_word_tome_free_lifetime_grant',
+--                  'generate_quest_monthly_cap','export_word_tome_monthly_cap',
+--                  'generate_quest_model_provider','export_word_tome_model_provider',
+--                  'classify_words_model_provider','retire_word_model_provider',
+--                  'daily_quest_min_tier');
+--   -- expect 11
+--
+--   SELECT to_regclass('public.feature_usage_monthly') IS NOT NULL  AS table_ok,
+--          EXISTS(SELECT 1 FROM information_schema.columns
+--                  WHERE table_schema='public' AND table_name='parents'
+--                    AND column_name='last_rc_event_ts_ms')          AS watermark_col_ok,
+--          (SELECT count(*) FROM pg_proc WHERE pronamespace='public'::regnamespace
+--             AND proname IN ('is_paid_tier','parent_has_premium',
+--                             'consume_feature_quota','prune_feature_usage_monthly')) AS rpc_count;
+--   -- expect table_ok=t, watermark_col_ok=t, rpc_count=4
 --
 -- ════════════════════════════════════════════════════════════════════════════
 

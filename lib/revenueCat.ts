@@ -181,19 +181,39 @@ function getApiKey(): string | null {
 
 function tierFromProductId(productId: string | null): SubscriptionDetails["tier"] {
   if (!productId) return "free";
-  const id = productId.toLowerCase();
-  if (id.includes("family")) return "family";
-  if (id.includes("pro"))    return "tier2";
-  if (
-    id.includes("premium") ||
-    id.includes("monthly") ||
-    id.includes("yearly") ||
-    id.includes("annual")
-  ) {
-    return "tier1";
+
+  // Strip the Play ":base_plan_id" suffix (no-op on Apple product_ids).
+  const baseProductId = productId.split(":")[0].toLowerCase();
+
+  // EXPLICIT ALLOWLIST — must stay in sync with the same map in
+  // supabase/functions/revenuecat-webhook/index.ts. Adding a new product
+  // requires editing BOTH places (server is authoritative, client is for
+  // local UI optimism while the webhook lands).
+  //
+  // Fail-closed default: unknown product_id → "free". The webhook is the
+  // server-side authority; the client mapping only affects local UI hints
+  // until the next setSubscriptionFromRC() arrives.
+  switch (baseProductId) {
+    // Tier 1
+    case "lexilens_premium_monthly":
+    case "lexilens_premium_annual":
+    case "lexilens_premium_annual_v2":
+      return "tier1";
+
+    // Family — planned
+    case "lexilens_family_yearly":
+      return "family";
+
+    // Tier 2 — placeholder; add cases here when products are created.
+
+    default:
+      // Active entitlement but unknown product_id. Fail closed: report
+      // free locally; the server webhook is the authoritative grant. This
+      // is safer than guessing tier1 — a forgotten allowlist entry
+      // surfaces as "user paid but UI says free" (bug-reportable) rather
+      // than "user paid for tier1 and got tier2 in the UI" (silent).
+      return "free";
   }
-  // Unknown product but entitlement is active → default to tier1 (paid-equiv).
-  return "tier1";
 }
 
 // ─── Derivation from CustomerInfo ─────────────────────────────────────────

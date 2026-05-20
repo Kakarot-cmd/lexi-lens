@@ -117,7 +117,7 @@ const EVENTS_GRANT_TIER = new Set([
 
 const EVENTS_REVOKE_TIER = new Set([
   "EXPIRATION",
-  "BILLING_ISSUE",
+  // BILLING_ISSUE intentionally NOT here — see EVENTS_IGNORE for why.
   "REFUND",
   "SUBSCRIPTION_PAUSED",
 ]);
@@ -125,17 +125,62 @@ const EVENTS_REVOKE_TIER = new Set([
 const EVENTS_IGNORE = new Set([
   "TEST",
   "NON_RENEWING_PURCHASE",
-  "CANCELLATION", // wait for EXPIRATION
+  "CANCELLATION",   // wait for EXPIRATION
+  "BILLING_ISSUE",  // wait for EXPIRATION — RC fires this during the grace/
+                    // retry period, when the user still has entitlement.
+                    // Apple grace can be up to 60 days; Google up to 30.
+                    // Revoking here yanks-then-restores premium for any
+                    // card-decline-then-retry-succeeds user. EXPIRATION
+                    // remains the authoritative revoke signal.
 ]);
 
 // ─── Tier mapping ─────────────────────────────────────────────────────────
+//
+// EXPLICIT ALLOWLIST (replaces prior substring matcher 2026-05-20).
+//
+// History: prior implementation used `id.includes("family")` /
+// `id.includes("pro")` checks. Verified bug on 2026-05-20: the product_id
+// `test_product` matched `"pro"` (inside `"product"`) and routed to
+// tier2. No corruption resulted because those events were filtered out by
+// event type earlier, but the silent-collision risk was real for any
+// future SKU containing those substrings (promo SKUs, typos, RC product
+// renames). The allowlist below makes every routing decision explicit.
+//
+// Fail-closed default: unknown product_id → "free". Better to under-grant
+// (and notice when the user complains) than silently grant the wrong tier
+// (which the user thanks us for and we never catch).
+//
+// Adding a new product:
+//   1. Create it in App Store Connect / Play Console.
+//   2. Add it to PRODUCT_TIER_MAP below.
+//   3. Mirror the same change in lib/revenueCat.ts:tierFromProductId.
+//
+// Play formats product IDs as "base_product_id:base_plan_id". Apple uses
+// the bare product_id. We split on ":" and key on the base so both
+// platforms hit the same map entry.
+
+const PRODUCT_TIER_MAP: Record<string, "tier1" | "tier2" | "family"> = {
+  // Tier 1 — current premium products (Android Play + iOS App Store)
+  "lexilens_premium_monthly":    "tier1",
+  "lexilens_premium_annual":     "tier1",
+  "lexilens_premium_annual_v2":  "tier1",  // iOS rename (per memory)
+
+  // Family — planned (per roadmap)
+  "lexilens_family_yearly":      "family",
+
+  // Tier 2 — placeholder slot (no products yet); add here when created.
+  // Example shape:
+  //   "lexilens_pro_monthly": "tier2",
+  //   "lexilens_pro_annual":  "tier2",
+};
 
 function tierFromProductId(productId: string | null | undefined): "free" | "tier1" | "tier2" | "family" {
   if (!productId) return "free";
-  const id = productId.toLowerCase();
-  if (id.includes("family")) return "family";
-  if (id.includes("pro"))    return "tier2";
-  return "tier1";
+
+  // Strip the Play ":base_plan_id" suffix (no-op on Apple product_ids).
+  const baseProductId = productId.split(":")[0].toLowerCase();
+
+  return PRODUCT_TIER_MAP[baseProductId] ?? "free";
 }
 
 // ─── Handler ──────────────────────────────────────────────────────────────
