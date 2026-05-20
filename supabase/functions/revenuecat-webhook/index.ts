@@ -6,10 +6,25 @@
  *
  * What this function does
  * ───────────────────────
- * Receives RevenueCat server-to-server notifications and updates
- * `parents.subscription_tier` accordingly. This is the AUTHORITATIVE backend
- * sync — server-side enforcement (Edge Functions, RLS policies) only trusts
- * this column, not the client's read of RC.
+ * Receives RevenueCat server-to-server notifications and updates two
+ * columns on `public.parents`:
+ *   • subscription_tier        — authoritative entitlement state.
+ *   • subscription_expires_at  — server-side mirror of RC's expiration
+ *                                (or grace-period end during a billing
+ *                                issue). Read by parent_has_premium()
+ *                                and the quests RLS tier gate for inline
+ *                                self-heal: any feature gate auto-revokes
+ *                                a lapsed parent the instant their event
+ *                                fails to arrive, rather than waiting on
+ *                                a (potentially delayed) EXPIRATION
+ *                                webhook.
+ *
+ * Server-side enforcement (Edge Functions, RLS policies) only trusts
+ * these two columns, not the client's read of RC.
+ *
+ * Requires migration 20260520_subscription_expires_self_heal.sql
+ * (deploy migration FIRST, then this function). Without the column the
+ * UPDATE will 500 and RC will retry — the safe direction.
  *
  * Security model
  * ──────────────
@@ -35,20 +50,18 @@
  * ─────────────────────────
  * RC does NOT guarantee webhook delivery order and this function runs as
  * concurrent Edge invocations. Without a guard, a late-delivered RENEWAL
- * can overwrite a freshly-applied EXPIRATION (re-granting paid access to a
- * lapsed user) purely on write-race luck. Each tier write records RC's
+ * can overwrite a freshly-applied EXPIRATION (re-granting paid access to
+ * a lapsed user) purely on write-race luck. Each write records RC's
  * source-side `event.event_timestamp_ms` into
  * `parents.last_rc_event_ts_ms`, and an incoming event is applied ONLY IF
- * its event_timestamp_ms >= the stored watermark. We key on RC's event
- * time (not our ingest `received_at`, which is subject to our own clock
- * skew under concurrency; not `expiration_at_ms`, whose meaning differs
- * across grant/revoke/cancel). NULL watermark = first event, always
- * applied. Requires migration 20260518_parents_rc_event_watermark.sql
- * (deploy that BEFORE this function — it is inert without this code).
+ * its event_timestamp_ms >= the stored watermark. NULL watermark = first
+ * event, always applied. The guard also protects subscription_expires_at:
+ * a stale BILLING_ISSUE cannot push expires_at backwards over a newer
+ * RENEWAL's longer horizon.
  *
  * Event handling
  * ──────────────
- * Mapped events (entitlement gained → set tier):
+ * Mapped events (entitlement gained → set tier=paid, write expires_at):
  *   • INITIAL_PURCHASE
  *   • RENEWAL
  *   • PRODUCT_CHANGE
@@ -56,22 +69,31 @@
  *   • TEMPORARY_ENTITLEMENT_GRANT   (RC promotional grant)
  *   • SUBSCRIPTION_EXTENDED         (apple grace period extension)
  *
- * Entitlement lost → set tier='free':
+ * Entitlement lost → set tier='free', write expires_at as last-known:
  *   • EXPIRATION
- *   • BILLING_ISSUE                 (auto-renewal failed after grace)
  *   • REFUND
  *   • SUBSCRIPTION_PAUSED           (Android only)
  *
+ * Grace extension → keep tier, push expires_at forward to grace end:
+ *   • BILLING_ISSUE                 (auto-renewal failed; entitlement
+ *                                    holds until grace_period_expiration_at_ms.
+ *                                    See RC docs "Billing Issues & Grace
+ *                                    Periods".)
+ *
  * Special handling:
  *   • CANCELLATION — user cancelled but entitlement remains until expiration.
- *     We DO NOT change tier here; we wait for EXPIRATION.
+ *     We DO NOT change tier or expires_at here; we wait for EXPIRATION.
  *   • TRANSFER — RC moves the entitlement to a different app_user_id.
  *     We update the OLD app_user_id to free and (if known) set the NEW one
- *     to the active tier.
+ *     to the active tier with the transferred expiration.
  *
- * Ignored events:
+ * Ignored events (no write at all):
  *   • TEST                          (RC dashboard "Send test event" button)
  *   • NON_RENEWING_PURCHASE         (consumables — no entitlement state)
+ *   • CANCELLATION                  (wait for EXPIRATION; see above)
+ *   • BILLING_ISSUE with no grace   (Stripe path / grace-not-configured on
+ *                                    store; the imminent EXPIRATION handles
+ *                                    revocation instead)
  *
  * Forward compatibility: unknown event types are logged + returned 200 so
  * RC doesn't retry. New event types are added to the mapped sets above as
@@ -93,6 +115,20 @@
  *   Project Settings → Integrations → Webhooks → Add webhook
  *     URL:     https://<project-ref>.supabase.co/functions/v1/revenuecat-webhook
  *     Headers: Authorization: Bearer <same-shared-secret>
+ *
+ * Store-side prerequisite (cross-platform)
+ * ────────────────────────────────────────
+ * For grace handling to do anything at all, grace periods MUST be enabled
+ * in BOTH stores:
+ *   • App Store Connect → Subscriptions → (each group) → Billing Grace
+ *     Period (Apple supports up to 16 weeks; 16 days is a sane default).
+ *   • Google Play Console → Subscriptions → (each subscription) → Account
+ *     hold and grace period (Google supports 3, 7, 14, 30 days).
+ * Without these, RC delivers BILLING_ISSUE with grace_period_expiration_at_ms
+ * = null, which this function treats the same as ignore (tier stays, no
+ * expires_at extension), and the user's EXPIRATION arrives essentially
+ * simultaneously. Functionally OK either way; configuring grace just buys
+ * paying users a recovery window.
  */
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -101,6 +137,29 @@ const corsHeaders = {
   "Access-Control-Allow-Origin":  "*",
   "Access-Control-Allow-Headers": "authorization, content-type",
 };
+
+// ─── Type helpers ─────────────────────────────────────────────────────────
+//
+// Why this exists: @supabase/supabase-js v2's exported types have
+// tightened across minor versions. `ReturnType<typeof createClient>`
+// (the obvious choice for typing a passed-in client) now resolves to
+// `SupabaseClient<unknown, ..., never, never, ...>` because the declared
+// signature defaults `Database = unknown`, which collapses every schema
+// param to `never`. But the runtime client returned by
+// `createClient(url, key)` is `SupabaseClient<any, "public", "public",
+// any, any>`. Passing the runtime client into a helper typed against
+// the declared signature fails `deno check` even though it works fine
+// at runtime, and every `.from(...).update(...)` chain inside the
+// helper inherits `never` so the body fails too.
+//
+// We're not doing inference-heavy chained ops inside markProcessed or
+// handleTransfer, so widening to `any` is the honest type. This is the
+// same effective looseness the file had before the v2 minor bump.
+// Tighten this if/when we adopt a typed `Database` schema across the
+// whole repo (out of scope for this change).
+//
+// deno-lint-ignore no-explicit-any
+type DbClient = any;
 
 // Must match `ENTITLEMENT_PREMIUM` in lib/revenueCat.ts.
 const ENTITLEMENT_ID = "premium";
@@ -117,21 +176,22 @@ const EVENTS_GRANT_TIER = new Set([
 
 const EVENTS_REVOKE_TIER = new Set([
   "EXPIRATION",
-  // BILLING_ISSUE intentionally NOT here — see EVENTS_IGNORE for why.
   "REFUND",
   "SUBSCRIPTION_PAUSED",
+]);
+
+// Extend entitlement via grace period — no tier change, push expires_at
+// to grace_period_expiration_at_ms so the inline self-heal in
+// parent_has_premium() doesn't incorrectly revoke a card-decline-then-
+// retry-succeeds user. Stays a no-op when grace is null (see flow below).
+const EVENTS_EXTEND_GRACE = new Set([
+  "BILLING_ISSUE",
 ]);
 
 const EVENTS_IGNORE = new Set([
   "TEST",
   "NON_RENEWING_PURCHASE",
-  "CANCELLATION",   // wait for EXPIRATION
-  "BILLING_ISSUE",  // wait for EXPIRATION — RC fires this during the grace/
-                    // retry period, when the user still has entitlement.
-                    // Apple grace can be up to 60 days; Google up to 30.
-                    // Revoking here yanks-then-restores premium for any
-                    // card-decline-then-retry-succeeds user. EXPIRATION
-                    // remains the authoritative revoke signal.
+  "CANCELLATION",   // wait for EXPIRATION — entitlement remains until then
 ]);
 
 // ─── Tier mapping ─────────────────────────────────────────────────────────
@@ -183,6 +243,13 @@ function tierFromProductId(productId: string | null | undefined): "free" | "tier
   return PRODUCT_TIER_MAP[baseProductId] ?? "free";
 }
 
+/** Safely convert an RC `*_at_ms` epoch field to ISO-8601, or null. */
+function msToIso(ms: unknown): string | null {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return null;
+  // RC uses ms epoch; Postgres timestamptz round-trips through ISO.
+  return new Date(ms).toISOString();
+}
+
 // ─── Handler ──────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request) => {
@@ -224,6 +291,9 @@ Deno.serve(async (req: Request) => {
   const appUserId    = event.app_user_id as string | undefined;
   const productId    = event.product_id  as string | undefined;
   const expiresMs    = event.expiration_at_ms as number | undefined;
+  // Only present (non-null) on BILLING_ISSUE when the store has grace
+  // configured. Null for Stripe events and for stores without grace.
+  const graceMs      = event.grace_period_expiration_at_ms as number | undefined;
   // RC's authoritative source-side time for when this event occurred.
   // Present on every event type; monotonic per subscription from RC. Used
   // as the ordering guard key (see header / 20260518).
@@ -300,24 +370,49 @@ Deno.serve(async (req: Request) => {
   if (eventType === "TRANSFER") {
     const transferredFrom = event.transferred_from as string[] | undefined;
     const transferredTo   = event.transferred_to   as string[] | undefined;
-    return handleTransfer(supabase, eventId, transferredFrom, transferredTo, productId, eventTsMs);
+    return handleTransfer(supabase, eventId, transferredFrom, transferredTo, productId, expiresMs, eventTsMs);
   }
 
-  let newTier: "free" | "tier1" | "tier2" | "family";
+  // ── 5a. Decide what to write ───────────────────────────────────────────
+  //
+  // Three branches, mutually exclusive:
+  //   • EVENTS_GRANT_TIER   → write {tier, expires_at}
+  //   • EVENTS_REVOKE_TIER  → write {tier='free', expires_at as last-known}
+  //   • EVENTS_EXTEND_GRACE → write {expires_at = grace end}; no tier change.
+  //                           If grace is null, fall through to a no-op
+  //                           (functionally an ignore — the imminent
+  //                           EXPIRATION handles it).
+  //
+  // Any other event type is unknown — log and 200 so RC doesn't retry.
+
+  let newTier: "free" | "tier1" | "tier2" | "family" | null = null;  // null = unchanged
+  let newExpiresAtIso: string | null = null;                          // null = unchanged
+
   if (EVENTS_GRANT_TIER.has(eventType)) {
-    newTier = tierFromProductId(productId);
+    newTier         = tierFromProductId(productId);
+    newExpiresAtIso = msToIso(expiresMs);
   } else if (EVENTS_REVOKE_TIER.has(eventType)) {
-    newTier = "free";
+    newTier         = "free";
+    newExpiresAtIso = msToIso(expiresMs);   // last-known expiration; OK if past
+  } else if (EVENTS_EXTEND_GRACE.has(eventType)) {
+    const graceIso = msToIso(graceMs);
+    if (graceIso === null) {
+      // No grace from RC (Stripe path or grace not configured on the
+      // store). Effectively an ignore: the imminent EXPIRATION will
+      // revoke. Logging it so we can spot mis-configured grace later.
+      console.log(`[revenuecat-webhook] BILLING_ISSUE for ${appUserId} arrived without grace_period_expiration_at_ms — treating as ignore.`);
+      await markProcessed(supabase, eventId, "billing_issue_no_grace");
+      return jsonResponse({ ok: true, billing_issue: true, grace: false });
+    }
+    newExpiresAtIso = graceIso;
+    // newTier left null → tier column not in update payload.
   } else {
-    // Unknown event type — log and ignore so RC doesn't retry.
     console.warn(`[revenuecat-webhook] Unknown event type: ${eventType}. Treating as no-op.`);
     await markProcessed(supabase, eventId, "unknown_type");
     return jsonResponse({ ok: true, unknown: true });
   }
 
-  // Sanity: don't downgrade a parent in the brief window where two events
-  // race (e.g. RENEWAL arrives before BILLING_ISSUE clears). Defensive read.
-  // Also read the ordering watermark (20260518).
+  // ── 5b. Defensive read + ordering guard ────────────────────────────────
   const { data: parentRow } = await supabase
     .from("parents")
     .select("subscription_tier, last_rc_event_ts_ms")
@@ -333,33 +428,51 @@ Deno.serve(async (req: Request) => {
   // For GRANT events with an expiration in the past, treat as revoke.
   if (EVENTS_GRANT_TIER.has(eventType) && expiresMs && expiresMs < Date.now()) {
     newTier = "free";
+    // newExpiresAtIso already set to the (past) expiresMs above; correct.
   }
 
-  // ── Ordering guard (20260518) ──────────────────────────────────────────
-  // Skip if this event is OLDER than the last event already applied to
-  // this parent. Out-of-order / racing webhook deliveries must not let a
-  // stale event clobber a newer one. NULL watermark = nothing applied yet
-  // → always apply. Missing event_timestamp_ms (shouldn't happen on real
-  // RC events) → fail OPEN (apply) rather than risk dropping a valid event.
+  // Ordering guard (20260518). Skip if this event is OLDER than the last
+  // event already applied to this parent. Out-of-order / racing webhook
+  // deliveries must not let a stale event clobber a newer one. NULL
+  // watermark = nothing applied yet → always apply. Missing
+  // event_timestamp_ms (shouldn't happen on real RC events) → fail OPEN.
   const priorTsMs = parentRow.last_rc_event_ts_ms as number | null;
   if (eventTsMs !== null && priorTsMs !== null && eventTsMs < priorTsMs) {
     console.log(
       `[revenuecat-webhook] Stale event ${eventId} (${eventType}) for ${appUserId}: ` +
-      `event_ts=${eventTsMs} < applied_ts=${priorTsMs}. Skipping tier write.`,
+      `event_ts=${eventTsMs} < applied_ts=${priorTsMs}. Skipping write.`,
     );
-    await markProcessed(supabase, eventId, "stale_skipped", newTier);
+    await markProcessed(supabase, eventId, "stale_skipped", newTier ?? parentRow.subscription_tier);
     return jsonResponse({ ok: true, stale: true, tier: parentRow.subscription_tier });
   }
 
-  // Apply the update. Advance the watermark in the SAME statement so the
-  // tier and its ordering key move atomically (one row, one lock). Only
-  // advance the watermark when we actually have a newer timestamp; never
-  // move it backwards.
-  const updatePayload: { subscription_tier: string; last_rc_event_ts_ms?: number } = {
-    subscription_tier: newTier,
-  };
+  // ── 5c. Build payload + apply ──────────────────────────────────────────
+  // Advance the watermark in the SAME statement so the tier and its
+  // ordering key move atomically (one row, one lock). Only advance the
+  // watermark when we actually have a newer timestamp; never move it
+  // backwards.
+  const updatePayload: {
+    subscription_tier?:       string;
+    subscription_expires_at?: string;
+    last_rc_event_ts_ms?:     number;
+  } = {};
+
+  if (newTier !== null) {
+    updatePayload.subscription_tier = newTier;
+  }
+  if (newExpiresAtIso !== null) {
+    updatePayload.subscription_expires_at = newExpiresAtIso;
+  }
   if (eventTsMs !== null && (priorTsMs === null || eventTsMs >= priorTsMs)) {
     updatePayload.last_rc_event_ts_ms = eventTsMs;
+  }
+
+  // Sanity: if we have nothing to write (e.g. EXTEND_GRACE with no grace
+  // that somehow slipped past the early-return above), don't issue an
+  // empty UPDATE.
+  if (Object.keys(updatePayload).length === 0) {
+    await markProcessed(supabase, eventId, "no_change");
+    return jsonResponse({ ok: true, no_change: true });
   }
 
   const { error: updErr } = await supabase
@@ -374,19 +487,30 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Update failed", details: updErr.message }, 500);
   }
 
-  await markProcessed(supabase, eventId, "applied", newTier);
+  const appliedStatus = EVENTS_EXTEND_GRACE.has(eventType) ? "grace_extended" : "applied";
+  await markProcessed(supabase, eventId, appliedStatus, newTier ?? parentRow.subscription_tier);
 
-  console.log(`[revenuecat-webhook] Applied tier=${newTier} for parent=${appUserId} (was ${parentRow.subscription_tier})`);
-  return jsonResponse({ ok: true, tier: newTier });
+  console.log(
+    `[revenuecat-webhook] ${appliedStatus} ` +
+    `tier=${newTier ?? "(unchanged:" + parentRow.subscription_tier + ")"} ` +
+    `expires_at=${newExpiresAtIso ?? "(unchanged)"} ` +
+    `for parent=${appUserId}`,
+  );
+  return jsonResponse({
+    ok: true,
+    tier: newTier ?? parentRow.subscription_tier,
+    expires_at: newExpiresAtIso,
+    grace_extended: EVENTS_EXTEND_GRACE.has(eventType),
+  });
 });
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 async function markProcessed(
-  supabase: ReturnType<typeof createClient>,
+  supabase: DbClient,
   eventId:  string,
   status:   string,
-  appliedTier?: string,
+  appliedTier?: string | null,
 ): Promise<void> {
   await supabase
     .from("revenuecat_webhook_log")
@@ -398,14 +522,16 @@ async function markProcessed(
 }
 
 async function handleTransfer(
-  supabase: ReturnType<typeof createClient>,
-  eventId:  string,
-  fromIds:  string[] | undefined,
-  toIds:    string[] | undefined,
+  supabase:  DbClient,
+  eventId:   string,
+  fromIds:   string[] | undefined,
+  toIds:     string[] | undefined,
   productId: string | undefined,
+  expiresMs: number | undefined,
   eventTsMs: number | null,
 ): Promise<Response> {
-  const tier = tierFromProductId(productId);
+  const tier       = tierFromProductId(productId);
+  const expiresIso = msToIso(expiresMs);
 
   // Per-row ordering guard: only mutate a parent if this TRANSFER is not
   // older than the event already applied to that parent. Done per-id
@@ -427,7 +553,8 @@ async function handleTransfer(
 
   const tsPatch = eventTsMs !== null ? { last_rc_event_ts_ms: eventTsMs } : {};
 
-  // Revoke from old users
+  // Revoke from old users. Leave subscription_expires_at as last-known
+  // (tier='free' is the gate; expires_at remains as historical record).
   if (fromIds && fromIds.length > 0) {
     const ids = await eligibleIds(fromIds);
     if (ids.length > 0) {
@@ -438,13 +565,18 @@ async function handleTransfer(
     }
   }
 
-  // Grant to new users
+  // Grant to new users with the transferred expiration (if RC supplied one).
   if (toIds && toIds.length > 0) {
     const ids = await eligibleIds(toIds);
     if (ids.length > 0) {
+      const grantPatch: Record<string, unknown> = {
+        subscription_tier: tier,
+        ...tsPatch,
+      };
+      if (expiresIso) grantPatch.subscription_expires_at = expiresIso;
       await supabase
         .from("parents")
-        .update({ subscription_tier: tier, ...tsPatch })
+        .update(grantPatch)
         .in("id", ids);
     }
   }
