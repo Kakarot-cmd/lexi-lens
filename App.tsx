@@ -66,6 +66,18 @@ import { useAuthFlow, getAuthFlow } from "./lib/authFlow";
 
 import type { RootStackParamList, AuthStackParamList } from "./types/navigation";
 
+// ─── Backstory gate helpers (v6.6) ────────────────────────────────────────────
+//
+// `hasSeenBackstory()` and `markBackstorySeen()` are tiny AsyncStorage
+// readers/writers — safe to import eagerly. The actual <OnboardingBackstoryScreen/>
+// component (which transitively imports LumiMascot → Reanimated → SVG) is
+// lazy-loaded below, same pattern as the other Lumi-touching screens. This
+// preserves the iOS-safe boot path established in v4.5.8.
+import {
+  hasSeenBackstory,
+  markBackstorySeen,
+} from "./screens/OnboardingBackstoryScreen";
+
 // ─── Screens ──────────────────────────────────────────────────────────────────
 //
 // v4.5.8 (May 14, 2026) — iOS white-screen mitigation.
@@ -116,6 +128,17 @@ const ParentDashboard  = lazy(() =>
 );
 const OnboardingScreen = lazy(() =>
   import("./screens/OnboardingScreen").then((m) => ({ default: m.OnboardingScreen })),
+);
+
+// v6.6 — Backstory screen. Same lazy pattern: it transitively imports
+// LumiMascot (Reanimated + SVG), so we defer its module-init until the
+// first time the gate decides to show it. The gate read itself (the
+// `hasSeenBackstory()` call above) is a tiny AsyncStorage check — no
+// Lumi imports — so eager.
+const OnboardingBackstoryScreen = lazy(() =>
+  import("./screens/OnboardingBackstoryScreen").then((m) => ({
+    default: m.OnboardingBackstoryScreen,
+  })),
 );
 
 // Phase 4.4 — PaywallScreen is lazy-loaded for the same reason as the rest:
@@ -299,6 +322,39 @@ function App() {
   // v4.5 — password recovery state. Starts false, flipped true by deep link
   // or PASSWORD_RECOVERY auth event, cleared by AuthScreen after updateUser.
   const recoveryActive = useAuthFlow((s) => s.recoveryActive);
+
+  // ── Backstory gate (v6.6) ─────────────────────────────────────────────────
+  //
+  // null   = AsyncStorage read in flight (don't decide yet)
+  // true   = already seen → skip the story, go straight to the app
+  // false  = first launch → render <OnboardingBackstoryScreen/> before AppNavigator
+  //
+  // The read fires once at mount. It's intentionally NOT gated on session,
+  // because the flag is per-device (an AsyncStorage key), not per-user — a
+  // returning user signing in on a fresh install should still see the story
+  // once on that device. While the read is in flight we render the same
+  // splash as during auth init, so there's no extra loading flicker.
+  const [backstorySeen, setBackstorySeen] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    hasSeenBackstory()
+      .then((seen) => { if (!cancelled) setBackstorySeen(seen); })
+      .catch(() => { if (!cancelled) setBackstorySeen(true); /* fail-safe: skip */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const onBackstoryComplete = useCallback(async () => {
+    try {
+      await markBackstorySeen();
+    } catch {
+      // Even if persist fails, advance — we don't want the user trapped here.
+    }
+    setBackstorySeen(true);
+    addGameBreadcrumb({
+      category: "onboarding",
+      message:  "Backstory completed (or skipped)",
+    });
+  }, []);
 
   const navigationRef = useNavigationContainerRef();
 
@@ -640,8 +696,14 @@ function App() {
   }, []);
 
   // ── Loading splash ─────────────────────────────────────────────────────────
+  //
+  // v6.6 — also gates on backstorySeen still being null. The backstory flag
+  // read is fast (an AsyncStorage roundtrip), but we don't want to flash
+  // AppNavigator and then yank it away to show the story. If auth resolves
+  // first and the flag read is still in flight, we sit on the splash for the
+  // extra few ms it takes — never visible to the user in practice.
 
-  if (initialising) {
+  if (initialising || backstorySeen === null) {
     return (
       <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center" }}>
         <ActivityIndicator color="#f5c842" size="large" />
@@ -654,15 +716,44 @@ function App() {
   // before reaching the game).
   const showAuth = !session || recoveryActive;
 
+  // v6.6 — backstory gate sits BETWEEN auth-resolved and AppNavigator.
+  //   • showAuth      → AuthNavigator (no story; user isn't in the game yet)
+  //   • !backstorySeen → OnboardingBackstoryScreen (first launch, signed in)
+  //   • else          → AppNavigator (normal app)
+  //
+  // Note: recoveryActive users skip the story entirely on this device-pass.
+  // They're mid-password-reset; we don't want to ambush them with lore.
+  // They'll see it on their next clean app open if the flag is still false.
+  const showBackstory = !showAuth && backstorySeen === false;
+
   return (
     <ErrorBoundary screen="App">
       <SafeAreaProvider>
-        <NavigationContainer
-          ref={navigationRef}
-          onStateChange={handleNavigationStateChange}
-        >
-          {showAuth ? <AuthNavigator /> : <AppNavigator />}
-        </NavigationContainer>
+        {showBackstory ? (
+          // Standalone branch — backstory replaces NavigationContainer entirely
+          // for its lifetime. We don't push it as a screen inside AppNavigator
+          // because it owns the whole viewport and has its own back/skip flow.
+          // On completion it sets backstorySeen=true and we re-render into
+          // the AppNavigator branch below.
+          <ErrorBoundary screen="OnboardingBackstoryScreen">
+            <Suspense
+              fallback={
+                <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center" }}>
+                  <ActivityIndicator color="#f5c842" size="large" />
+                </View>
+              }
+            >
+              <OnboardingBackstoryScreen onComplete={onBackstoryComplete} />
+            </Suspense>
+          </ErrorBoundary>
+        ) : (
+          <NavigationContainer
+            ref={navigationRef}
+            onStateChange={handleNavigationStateChange}
+          >
+            {showAuth ? <AuthNavigator /> : <AppNavigator />}
+          </NavigationContainer>
+        )}
 
         {/* N4 — Badge toast overlay */}
         <AchievementToastOverlay />
