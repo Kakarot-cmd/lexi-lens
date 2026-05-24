@@ -8,12 +8,33 @@ import {
   addGameBreadcrumb,
 } from "./lib/sentry";
 
-initSentry();
+// v1.0.29 — pre-React boot diagnostics. iOS device logs are visible via
+// Mac's Console.app over USB. Filter by "[boot]" to see startup trace.
+// If iOS hangs before React mounts, the last [boot] line printed tells
+// us exactly which sync call (initSentry / assertEnvOrWarn / first
+// import) is the culprit.
+const __bootStart = Date.now();
+console.log(`[boot] +0ms module-load`);
+
+try {
+  console.log(`[boot] +${Date.now() - __bootStart}ms initSentry start`);
+  initSentry();
+  console.log(`[boot] +${Date.now() - __bootStart}ms initSentry end`);
+} catch (e) {
+  console.log(`[boot] +${Date.now() - __bootStart}ms initSentry threw: ${String(e).slice(0, 200)}`);
+}
 
 // ─── Env (also fires startup config validation) ──────────────────────────────
 
 import { ENV, assertEnvOrWarn } from "./lib/env";
-assertEnvOrWarn();
+
+try {
+  console.log(`[boot] +${Date.now() - __bootStart}ms assertEnvOrWarn start`);
+  assertEnvOrWarn();
+  console.log(`[boot] +${Date.now() - __bootStart}ms assertEnvOrWarn end`);
+} catch (e) {
+  console.log(`[boot] +${Date.now() - __bootStart}ms assertEnvOrWarn threw: ${String(e).slice(0, 200)}`);
+}
 
 // ─── React + RN ───────────────────────────────────────────────────────────────
 
@@ -303,10 +324,36 @@ function App() {
   // ── Auth listener ──────────────────────────────────────────────────────────
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session: s } }) => {
-      setSession(s);
+    console.log(`[boot] +${Date.now() - __bootStart}ms auth useEffect start`);
+
+    let cancelled = false;
+
+    // v1.0.29 — safety timeout. iOS bridgeless + Supabase PKCE has a
+    // documented promise-never-resolves edge case. Without this guard,
+    // initialising stays true forever → infinite loading screen →
+    // exactly the v1.0.15/16 white-screen symptom. Force-resolve as
+    // no-session after 5s so the app at least renders AuthScreen.
+    const safetyTimer = setTimeout(() => {
+      if (cancelled) return;
+      console.log(`[boot] +${Date.now() - __bootStart}ms getSession TIMEOUT after 5s — force-resolving as no-session`);
       setInitialising(false);
-    });
+    }, 5000);
+
+    console.log(`[boot] +${Date.now() - __bootStart}ms before getSession()`);
+    supabase.auth.getSession()
+      .then(({ data: { session: s } }) => {
+        if (cancelled) return;
+        console.log(`[boot] +${Date.now() - __bootStart}ms getSession resolved: ${s ? "has-session" : "no-session"}`);
+        clearTimeout(safetyTimer);
+        setSession(s);
+        setInitialising(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.log(`[boot] +${Date.now() - __bootStart}ms getSession rejected: ${String(err).slice(0, 200)}`);
+        clearTimeout(safetyTimer);
+        setInitialising(false);
+      });
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (event, s) => {
@@ -389,6 +436,8 @@ function App() {
     const linkingSub = Linking.addEventListener("url", handleDeepLink);
 
     return () => {
+      cancelled = true;
+      clearTimeout(safetyTimer);
       subscription.unsubscribe();
       linkingSub.remove();
     };
