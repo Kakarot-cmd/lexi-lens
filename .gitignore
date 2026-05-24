@@ -58,3 +58,5 @@ credentials/
 credentials.json 
 android/sentry.properties 
 android/gradle.properties 
+build-*.log
+pod-install.log
