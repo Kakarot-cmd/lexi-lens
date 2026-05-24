@@ -291,6 +291,7 @@ export type GameBreadcrumbCategory =
   | "quest"         // quest start / complete / hard-mode
   | "navigation"    // screen transitions
   | "auth"          // login / logout
+  | "onboarding"    // Lumi Backstory
   | "mastery"       // word mastery updates
   | "cache"         // Redis hit / miss
   | "xp"            // XP awarded

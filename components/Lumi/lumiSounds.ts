@@ -1,33 +1,33 @@
 /**
- * components/Lumi/lumiSounds.ts — v6.6
+ * components/Lumi/lumiSounds.ts — v6.7
  *
  * Sound + haptic dispatcher for the Lumi mascot.
  *
- * v6.6 CHANGES (matters for both Android + iOS)
+ * v6.7 CHANGES (iOS audio fix + dev diagnostics)
  * ─────────────────────────────────────────────────────────────────────────────
- *  1. SFX→Voice is now SEQUENTIAL, not overlapping.
- *     Old: `setTimeout(playVoice, 400)`. New: voice fires AFTER the lead
- *     SFX's measured duration, with a 60ms breathing gap. Reads the actual
- *     `player.duration` set at preload, with a safe 1000ms fallback if the
- *     player API doesn't expose duration (older expo-av path).
+ *  1. iOS audio session now uses `playsInSilentMode: true`.
+ *     Previously `false`, which respected the iOS hardware silent switch and
+ *     left Lumi completely mute on any iPhone with the silent toggle flipped.
+ *     For a kids' RPG where Lumi's voice IS the engagement loop, silent-switch
+ *     respect is the wrong default (matches Duolingo / Khan Academy Kids /
+ *     Roblox behavior). Parents who want quiet can use the in-app sound toggle
+ *     (ParentDashboard) or device volume to mute, both of which still work.
  *
- *  2. Voice picker EMITS the spoken text to subscribers.
- *     When a clip is chosen, we look up its phrase in lumiVoiceManifest and
- *     fire `_textListeners`. LumiMascot subscribes — bubble now shows the
- *     exact line the audio is speaking.
+ *  2. Dev-only `[lumi]` diagnostic logs in init, audio-session config,
+ *     player preload, and play paths. Gated on __DEV__ so prod builds are
+ *     unaffected (zero log calls). Lets us trace silent-failure modes from
+ *     the Metro terminal without rebuilding.
  *
- *  3. Cancellation on state change.
- *     Each `playLumiForState` call invalidates pending voice timers. Rapid
- *     scanning → success transitions no longer pile audio on top of itself.
- *
- *  4. iOS audio-session config preserved (`playsInSilentMode: false`,
- *     `mixWithOthers`). No new iOS surface area. Sequencing logic uses pure
- *     JS timers — safe on Fabric / bridgeless mode.
+ * v6.6 CHANGES (sequencing, preserved)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  - SFX→Voice sequential (measured duration + 60ms gap, not fixed 400ms)
+ *  - Voice picker emits spoken text to subscribers
+ *  - Pending voice cancelled on rapid state changes
  *
  * BACK-COMPAT
  * ─────────────────────────────────────────────────────────────────────────────
  *   Public API surface is unchanged. `playLumiForState(state)` still works
- *   from existing call sites; the new `subscribeLumiText` is additive.
+ *   from existing call sites; `subscribeLumiText` is additive.
  *   `LumiSoundKey` types unchanged.
  */
 
@@ -46,6 +46,23 @@ try {
 } catch {
   audio = null;
 }
+
+// ─── Dev logger (no-op in prod) ───────────────────────────────────────────────
+// __DEV__ is replaced with `true` by Metro in dev, `false` in prod. The
+// dead-code elimination at minify strips these calls entirely from the
+// release bundle.
+const dlog = (...args: unknown[]): void => {
+  if (__DEV__) {
+    // eslint-disable-next-line no-console
+    console.log('[lumi]', ...args);
+  }
+};
+const dwarn = (...args: unknown[]): void => {
+  if (__DEV__) {
+    // eslint-disable-next-line no-console
+    console.warn('[lumi]', ...args);
+  }
+};
 
 // ─── Keys ─────────────────────────────────────────────────────────────────────
 
@@ -176,7 +193,7 @@ const SFX_VOICE_GAP_MS = 60;
 
 // Conservative fallback when player.duration is unknown (older API, etc).
 // Slightly longer than the spec'd ~800ms SFX so we never overlap by accident.
-const SCAN_SFX_FALLBACK_MS  = 950;
+const SCAN_SFX_FALLBACK_MS   = 950;
 const APPEAR_SFX_FALLBACK_MS = 320;
 const SLEEP_SFX_FALLBACK_MS  = 700;
 const CHEER_SFX_FALLBACK_MS  = 900;
@@ -209,6 +226,8 @@ export async function initLumiSounds(): Promise<void> {
   if (_initialized) return;
   _initialized = true;
 
+  dlog('initLumiSounds: start, audio module =', audio ? 'available' : 'NULL (expo-audio missing)');
+
   try {
     const [s, h] = await Promise.all([
       AsyncStorage.getItem(KEY_SOUND),
@@ -220,9 +239,14 @@ export async function initLumiSounds(): Promise<void> {
     // fail-safe: defaults stand
   }
 
+  dlog('initLumiSounds: persisted prefs loaded, soundEnabled =', _soundEnabled, 'hapticsEnabled =', _hapticsEnabled);
+
   if (_soundEnabled) {
     await configureLumiAudioSession();
     preloadPlayers();
+    dlog('initLumiSounds: done. Players loaded =', Object.keys(_players).length, '/ expected =', Object.keys(assets).length);
+  } else {
+    dlog('initLumiSounds: sound disabled by prefs — skipping audio session config and preload');
   }
 }
 
@@ -333,24 +357,37 @@ export function playLumiGreeting(): void {
 // ─── Internals ────────────────────────────────────────────────────────────────
 
 async function configureLumiAudioSession(): Promise<void> {
-  if (!audio?.setAudioModeAsync) return;
+  if (!audio?.setAudioModeAsync) {
+    dwarn('configureLumiAudioSession: setAudioModeAsync not exported by expo-audio — skipping');
+    return;
+  }
   try {
     await audio.setAudioModeAsync({
-      playsInSilentMode:           false,   // respect iOS silent switch
+      // v6.7: override iOS silent switch. Lumi is the engagement loop;
+      // a kid (or parent) using the in-app mute is the right control surface,
+      // not the hardware toggle. Matches Duolingo / Khan Academy Kids / Roblox.
+      playsInSilentMode:           true,
       interruptionMode:            'mixWithOthers',
       shouldPlayInBackground:      false,
       shouldRouteThroughEarpiece:  false,
     });
-  } catch {
+    dlog('configureLumiAudioSession: setAudioModeAsync OK (playsInSilentMode: true)');
+  } catch (err) {
+    dwarn('configureLumiAudioSession: setAudioModeAsync threw —', err);
     // Non-fatal
   }
 }
 
 function preloadPlayers(): void {
-  if (!audio?.createAudioPlayer) return;
+  if (!audio?.createAudioPlayer) {
+    dwarn('preloadPlayers: createAudioPlayer not exported by expo-audio — skipping');
+    return;
+  }
+  let loaded = 0;
+  let skipped = 0;
   for (const [key, asset] of Object.entries(assets)) {
     if (_players[key as LumiSoundKey]) continue;
-    if (asset == null) continue;
+    if (asset == null) { skipped += 1; continue; }
     try {
       const player = audio.createAudioPlayer(asset);
       // Make sure each cue is a one-shot
@@ -363,10 +400,13 @@ function preloadPlayers(): void {
       // `player.duration` (seconds, sometimes via status update). We try
       // multiple paths and fall back to silent if none work.
       tryCaptureDuration(key as LumiSoundKey, player);
-    } catch {
+      loaded += 1;
+    } catch (err) {
+      dwarn('preloadPlayers: failed to create player for', key, '—', err);
       // skip this cue, keep going
     }
   }
+  dlog('preloadPlayers: loaded =', loaded, 'skipped (null asset) =', skipped);
 }
 
 /**
@@ -405,14 +445,25 @@ function tryCaptureDuration(key: LumiSoundKey, player: any): void {
 
 function playSoundKey(key: LumiSoundKey): void {
   const player = _players[key];
-  if (!player) return;
+  if (!player) {
+    dwarn('playSoundKey: no player for', key, '— preload may have failed');
+    return;
+  }
   try {
     if (typeof player.seekTo === 'function')                 player.seekTo(0);
     else if (typeof player.setPositionAsync === 'function')  player.setPositionAsync(0);
 
-    if (typeof player.play === 'function')           player.play();
-    else if (typeof player.playAsync === 'function') player.playAsync();
-  } catch {
+    if (typeof player.play === 'function') {
+      player.play();
+      dlog('playSoundKey:', key, '→ play() called');
+    } else if (typeof player.playAsync === 'function') {
+      player.playAsync();
+      dlog('playSoundKey:', key, '→ playAsync() called');
+    } else {
+      dwarn('playSoundKey:', key, '— neither play() nor playAsync() available on player');
+    }
+  } catch (err) {
+    dwarn('playSoundKey:', key, '— threw —', err);
     // soft-fail
   }
 }
