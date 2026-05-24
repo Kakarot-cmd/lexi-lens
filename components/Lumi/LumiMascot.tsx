@@ -57,7 +57,7 @@ import {
   type QuoteIntent,
 } from './lumiTypes';
 import { LUMI_QUOTES, pickLumiQuote } from './lumiQuotes';
-import { playLumiForState } from './lumiSounds';
+import { playLumiForState, subscribeLumiText } from './lumiSounds';
 
 // ─── Animation profiles per state ─────────────────────────────────────────────
 
@@ -361,11 +361,39 @@ export function LumiMascot(props: LumiMascotProps): React.ReactElement {
   const salt = state === 'idle'
     ? `idle:${idleAttempt}`
     : `${state}:${Math.floor(Date.now() / 6000)}`;
+  // ─── v6.6: "what is Lumi saying right now?" ─────────────────────
+  // lumiSounds.ts emits the spoken text from the voice manifest
+  // whenever a voice clip starts playing. We mirror that into local
+  // state so the bubble can render the exact phrase the audio is
+  // speaking.
+  //
+  // For states with NO voice (idle / out-of-juice / guide / fail with
+  // sound off), voiceText stays null and we fall back to the lumiQuotes
+  // pool below.
+  const [voiceText, setVoiceText] = useState<string | null>(null);
+  useEffect(() => {
+    const unsub = subscribeLumiText(setVoiceText);
+    return unsub;
+  }, []);
+  // Auto-expire so the bubble doesn't linger forever if a clip finishes
+  // without the next state-change emitting a new text or null.
+  useEffect(() => {
+    if (!voiceText) return;
+    const id = setTimeout(() => setVoiceText(null), 3500);
+    return () => clearTimeout(id);
+  }, [voiceText]);
+
+  // Priority order:
+  //   1. Explicit `message` prop (parent override) — always wins
+  //   2. Active voice text (audio is currently speaking it)
+  //   3. Quote-pool fallback (no audio, e.g. sound disabled or idle)
   const bubbleText = message !== undefined
     ? message
-    : LUMI_QUOTES[intent]?.length
-      ? pickLumiQuote(intent, salt)
-      : '';
+    : voiceText
+      ? voiceText
+      : LUMI_QUOTES[intent]?.length
+        ? pickLumiQuote(intent, salt)
+        : '';
 
   // BUG FIX (vs v1): show bubble whenever there's text, regardless of state.
   // Empty strings in idle-flavor pool give Lumi natural quiet windows.
