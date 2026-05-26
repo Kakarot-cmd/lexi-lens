@@ -58,3 +58,8 @@ credentials/
 credentials.json 
 android/sentry.properties 
 android/gradle.properties 
+build-*.log
+pod-install.log
+build-*.log
+Build_LexiLensStaging_*.txt
+pod-install.log
