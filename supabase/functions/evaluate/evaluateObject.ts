@@ -1,6 +1,19 @@
 /**
  * supabase/functions/evaluate/evaluateObject.ts
- * Lexi-Lens — model call + result composition (v6.0)
+ * Lexi-Lens — model call + result composition (v6.9)
+ *
+ * v6.9 (2026-05-26): kid_msg/verdict consistency hardening
+ *   • Prompt: KID_MSG RULES gained an explicit pass-vs-fail example pair
+ *     plus a "CRITICAL — kid_msg MUST match the verdict" clause. Closes
+ *     the failure mode observed in PROD where a borderline passes:false
+ *     property got a praise-shaped kid_msg ("This pillow is nice and
+ *     fluffy, perfect for resting your head.") that contradicted the
+ *     "Almost…" header. ~60 tokens added; no cache invalidation since
+ *     cache keys don't include prompt version.
+ *   • Composer: near-miss prefix prepended when the all-fail branch
+ *     produced a non-empty model message that doesn't already start
+ *     with a soft opener. Belt-and-braces in case the model still
+ *     drifts on a borderline scan.
  *
  * v6.0 (2026-05-10): Cache v6 + Mistral primary
  *   • Per-property output now includes kid_msg.{young,older} and optional
@@ -229,6 +242,24 @@ export function computeXp(opts: {
 const FALLBACK_PASS_FEEDBACK = "Nice find!";
 const FALLBACK_FAIL_FEEDBACK = "Hmm, not quite — try a different angle!";
 
+// v6.9 — frames the fail-branch body text with a clear near-miss prefix
+// when the model-generated kid_msg might otherwise read as praise on a
+// failing scan. Specifically guards against the production failure mode
+// where a borderline "fluffy" pillow scored 0.65 (passes:false) but the
+// model wrote kid_msg="This pillow is nice and fluffy, perfect for
+// resting your head." — header said "Almost…" while the body sentence
+// read as confirmation. The prompt change in buildSystemPrompt is the
+// durable solution; this prefix is the floor under that, ensuring a
+// child can never read the body as a pass when overallMatch is false.
+//
+// Skipped when the kid_msg already starts with a recognisably-soft
+// opener so we don't stutter ("Almost — Almost there..."). Detection is
+// intentionally narrow: only ASCII-leading single words, case
+// insensitive, so a model that opens with "almost" or "hmm" doesn't get
+// double-prefixed but normal sentences do.
+const NEAR_MISS_PREFIX = "Almost — ";
+const SOFT_OPENERS = /^(almost|hmm|close|nice try|oops|not quite)\b/i;
+
 function joinSentences(sentences: string[]): string {
   // Trim each, drop empties, join with single space. The model is prompted
   // to make per-property kid_msg strings that read naturally on their own
@@ -273,6 +304,14 @@ export function composeChildFeedback(
       .map((p) => p.kid_msg?.[ageBand] ?? "")
       .filter((s) => typeof s === "string" && s.trim().length > 0);
     msg = failMsgs.length > 0 ? joinSentences(failMsgs) : FALLBACK_FAIL_FEEDBACK;
+
+    // v6.9 — near-miss framing. Only when the composed body could read as
+    // praise (any non-empty model-generated message) AND doesn't already
+    // open with a soft opener. The fallback string already includes
+    // "Hmm" so it matches SOFT_OPENERS and is left alone.
+    if (failMsgs.length > 0 && !SOFT_OPENERS.test(msg)) {
+      msg = NEAR_MISS_PREFIX + msg;
+    }
   } else {
     msg = FALLBACK_FAIL_FEEDBACK;
   }
@@ -434,6 +473,23 @@ KID_MSG RULES (the child sees these, not your reasoning):
 - Each kid_msg.young/older should be a complete short sentence that reads naturally on its own AND chains naturally if joined with other property kid_msgs from the same scan.
 - For passes:true → celebratory tone, name what they found.
 - For passes:false → gentle, factual, no negative judgment ("Apples aren't stretchy — they're firm and stay the same shape!").
+
+CRITICAL — kid_msg MUST match the verdict. A kid_msg that reads as praise on a passes:false property is the worst failure mode. The child sees ONLY the kid_msg (not your score or reasoning), so the kid_msg IS the verdict from the child's perspective.
+
+  GOOD pair (pillow, "fluffy" passes — score 0.9):
+    kid_msg.young: "So fluffy and squishy — like a cloud!"
+    kid_msg.older: "Beautifully fluffy — soft and full of air."
+
+  GOOD pair (flat pillow, "fluffy" fails — score 0.5):
+    kid_msg.young: "This one is flat — not very fluffy."
+    kid_msg.older: "This pillow is firm and flat, not really fluffy."
+
+  BAD on passes:false (DO NOT DO THIS):
+    kid_msg.young: "This pillow is nice and fluffy!"   ← reads as a PASS, contradicts the verdict
+    kid_msg.young: "It's a bit fluffy and very comfy."  ← affirms the property when it failed
+
+If passes:false, the kid_msg MUST contain a clear "no" signal. Use words like "not", "isn't", "not very", "barely", "more X than fluffy", or contrast ("flat, not fluffy"). Never write a passes:false kid_msg that the child could read as confirmation that the property applied.
+
 - Do NOT use the child's name. Do NOT ask questions. Do NOT mention the camera or scanning.
 
 NUDGE RULES:

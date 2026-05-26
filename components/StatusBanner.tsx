@@ -73,7 +73,12 @@ function getBannerText(
       // figuring out what this is" without naming the underlying step.
       return "Spotting the magic…";
     case "evaluating":
-      return detectedLabel ? `Reading "${detectedLabel}"…` : "Consulting the tomes…";
+      // v6.8 — softened from `Reading "${detectedLabel}"…` to Lumi-voice
+      // copy. "Reading" is functionally accurate but bone-dry; "Peeking"
+      // matches the existing Lumi quote pool ("Hmm, let me peek...") and
+      // reads as warm/magical to ages 5-7. Fallback unchanged — it's
+      // already good.
+      return detectedLabel ? `Peeking at the ${detectedLabel}…` : "Consulting the tomes…";
     case "match":
       return "✦ Component found!";
     case "no-match":

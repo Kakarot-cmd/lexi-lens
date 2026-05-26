@@ -53,6 +53,42 @@ const API_BASE              = "https://generativelanguage.googleapis.com/v1beta/
 const DEFAULT_MAX_TOKENS    = 700;
 const DEFAULT_TIMEOUT_MS    = 30_000;
 
+// ─── Native safety filters (v6.9) ────────────────────────────────────────────
+//
+// Gemini's REST API exposes a `safetySettings` array that runs alongside the
+// system-prompt safety prefix in childSafety.ts. The two layers are
+// independent: the prefix shapes what the model TRIES to output, the
+// safetySettings score the output and block delivery if a HARM_CATEGORY
+// probability crosses the threshold.
+//
+// When omitted, Gemini uses ITS OWN defaults (typically MEDIUM_AND_ABOVE),
+// which are tuned for general consumer apps — NOT for a Designed-for-Families
+// product under-13. BLOCK_LOW_AND_ABOVE is the strictest configurable
+// threshold for these four categories (core child-safety filters in the
+// underlying model stay on regardless and cannot be lowered).
+//
+// What happens when Gemini refuses on safety grounds:
+//   • API returns candidates[] empty (or candidate.finishReason="SAFETY")
+//   • gemini.ts line ~205 throws ModelCallError (existing path)
+//   • evaluate/index.ts catches it and returns HTTP 500 to the client
+//   • Client (useLexiEvaluate) sets status="error"
+//   • StatusBanner shows "Lens flickered"
+//   • No unsafe content reaches the child; no echo of the unsafe input
+//
+// Refusal rate impact: in normal household-object scans, none. Could fire
+// on a sharp knife (HARM_CATEGORY_DANGEROUS_CONTENT), images with people,
+// medical/medication scans, etc. — all of which we WANT to block in a
+// child product.
+//
+// NOTE: Categories are hard-coded category constants in Gemini's API. Spelling
+// is exact and case-sensitive; see https://ai.google.dev/api/generate-content#harmcategory
+const SAFETY_SETTINGS = [
+  { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_LOW_AND_ABOVE" },
+  { category: "HARM_CATEGORY_HATE_SPEECH",       threshold: "BLOCK_LOW_AND_ABOVE" },
+  { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_LOW_AND_ABOVE" },
+  { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_LOW_AND_ABOVE" },
+] as const;
+
 // Maps the wire-format model variant string back to our stable ModelId.
 // Add a new variant by appending a row here AND a corresponding entry to
 // the ModelId union in types.ts.
@@ -158,6 +194,11 @@ export const geminiAdapter: ModelAdapter = {
           systemInstruction: { parts: [{ text: opts.systemPrompt }] },
           contents:          [{ role: "user", parts }],
           generationConfig,
+          // v6.9 — strictest configurable thresholds. See SAFETY_SETTINGS
+          // block at the top of this file for rationale and refusal-path
+          // notes. Independent of CHILD_SAFETY_PREFIX in the system
+          // prompt; the two are belt-and-braces.
+          safetySettings: SAFETY_SETTINGS,
         }),
         signal: controller.signal,
       });
@@ -202,11 +243,19 @@ export const geminiAdapter: ModelAdapter = {
     // refused to produce output (safety filter, length cap, etc.). Treat as
     // a soft error — caller falls back to its own error path.
     if (!candidate || !candidate.content?.parts) {
+      // v6.9 — finishReason="SAFETY" is the explicit signal that
+      // safetySettings blocked the response. Surface it cleanly in logs
+      // since it's now a routine (and expected) occurrence after the
+      // BLOCK_LOW_AND_ABOVE move.
+      const reason = candidate?.finishReason ?? "unknown";
+      const detail = reason === "SAFETY"
+        ? `Gemini blocked response on safety policy (finishReason=SAFETY)`
+        : `Gemini returned no candidate (finishReason=${reason})`;
       throw new ModelCallError(
         modelId,
         200,
         JSON.stringify(apiResponse).slice(0, 500),
-        `Gemini returned no candidate (finishReason=${candidate?.finishReason ?? "unknown"})`,
+        detail,
       );
     }
 

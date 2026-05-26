@@ -8,33 +8,13 @@ import {
   addGameBreadcrumb,
 } from "./lib/sentry";
 
-// v1.0.29 — pre-React boot diagnostics. iOS device logs are visible via
-// Mac's Console.app over USB. Filter by "[boot]" to see startup trace.
-// If iOS hangs before React mounts, the last [boot] line printed tells
-// us exactly which sync call (initSentry / assertEnvOrWarn / first
-// import) is the culprit.
-const __bootStart = Date.now();
-console.log(`[boot] +0ms module-load`);
-
-try {
-  console.log(`[boot] +${Date.now() - __bootStart}ms initSentry start`);
-  initSentry();
-  console.log(`[boot] +${Date.now() - __bootStart}ms initSentry end`);
-} catch (e) {
-  console.log(`[boot] +${Date.now() - __bootStart}ms initSentry threw: ${String(e).slice(0, 200)}`);
-}
+initSentry();
 
 // ─── Env (also fires startup config validation) ──────────────────────────────
 
 import { ENV, assertEnvOrWarn } from "./lib/env";
 
-try {
-  console.log(`[boot] +${Date.now() - __bootStart}ms assertEnvOrWarn start`);
-  assertEnvOrWarn();
-  console.log(`[boot] +${Date.now() - __bootStart}ms assertEnvOrWarn end`);
-} catch (e) {
-  console.log(`[boot] +${Date.now() - __bootStart}ms assertEnvOrWarn threw: ${String(e).slice(0, 200)}`);
-}
+assertEnvOrWarn();
 
 // ─── React + RN ───────────────────────────────────────────────────────────────
 
@@ -380,34 +360,16 @@ function App() {
   // ── Auth listener ──────────────────────────────────────────────────────────
 
   useEffect(() => {
-    console.log(`[boot] +${Date.now() - __bootStart}ms auth useEffect start`);
-
     let cancelled = false;
 
-    // v1.0.29 — safety timeout. iOS bridgeless + Supabase PKCE has a
-    // documented promise-never-resolves edge case. Without this guard,
-    // initialising stays true forever → infinite loading screen →
-    // exactly the v1.0.15/16 white-screen symptom. Force-resolve as
-    // no-session after 5s so the app at least renders AuthScreen.
-    const safetyTimer = setTimeout(() => {
-      if (cancelled) return;
-      console.log(`[boot] +${Date.now() - __bootStart}ms getSession TIMEOUT after 5s — force-resolving as no-session`);
-      setInitialising(false);
-    }, 5000);
-
-    console.log(`[boot] +${Date.now() - __bootStart}ms before getSession()`);
     supabase.auth.getSession()
       .then(({ data: { session: s } }) => {
         if (cancelled) return;
-        console.log(`[boot] +${Date.now() - __bootStart}ms getSession resolved: ${s ? "has-session" : "no-session"}`);
-        clearTimeout(safetyTimer);
         setSession(s);
         setInitialising(false);
       })
-      .catch((err) => {
+      .catch(() => {
         if (cancelled) return;
-        console.log(`[boot] +${Date.now() - __bootStart}ms getSession rejected: ${String(err).slice(0, 200)}`);
-        clearTimeout(safetyTimer);
         setInitialising(false);
       });
 
@@ -493,7 +455,6 @@ function App() {
 
     return () => {
       cancelled = true;
-      clearTimeout(safetyTimer);
       subscription.unsubscribe();
       linkingSub.remove();
     };
@@ -517,8 +478,20 @@ function App() {
 
   // ── Lumi daily greeting ────────────────────────────────────────────────────
   // v4.5.8 — dynamic imports; same rationale as the sound bootstrap above.
+  //
+  // v6.8 — also gates on `backstorySeen === true`. Two reasons:
+  //   1. During the first-launch backstory, panels 1+2 are narrated by a
+  //      third-person Narrator and panels 3-5 by Lumi herself. Firing the
+  //      "Good morning, my magic is full again ✨" greeting on top of that
+  //      audio is a collision.
+  //   2. We also defer `markGreetedToday()` to *after* the greeting actually
+  //      plays. The old code marked-then-played, which meant a user who
+  //      closed the app mid-backstory on day 1 would never hear their
+  //      first daily greeting at all — the flag would say "already greeted
+  //      today" on relaunch even though no audio had fired.
   useEffect(() => {
     if (!session || !activeChild?.id) return;
+    if (backstorySeen !== true) return; // skip during/before backstory
     let cancelled = false;
     (async () => {
       try {
@@ -536,7 +509,7 @@ function App() {
       }
     })();
     return () => { cancelled = true; };
-  }, [session?.user?.id, activeChild?.id]);
+  }, [session?.user?.id, activeChild?.id, backstorySeen]);
 
   // ── RevenueCat lifecycle ───────────────────────────────────────────────────
   //

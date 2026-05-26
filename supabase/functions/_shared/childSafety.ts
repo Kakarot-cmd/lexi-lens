@@ -1,5 +1,5 @@
 // supabase/functions/_shared/childSafety.ts
-// Lexi-Lens — Phase 4.6 child-safety system-prompt prefix.
+// Lexi-Lens — child-safety system-prompt prefix.
 //
 // WHY THIS FILE EXISTS
 // ────────────────────
@@ -23,26 +23,43 @@
 //   • personally identifying questions or attempts to extract information
 //   • adult-world content (drugs, alcohol, gambling, finance)
 //
-// This prefix is prepended to every Claude system prompt in the project.
-// It is intentionally short (~200 words) so it costs negligible tokens but
-// is hard to bypass via user-provided input. It also instructs Claude to
-// FAIL SAFE — when uncertain, refuse with a benign placeholder rather than
-// producing borderline output.
+// This prefix is prepended to every Claude/Gemini/Mistral system prompt
+// in the project. It is intentionally short (~350 tokens after v6.9) so
+// it costs negligible tokens but is hard to bypass via user-provided
+// input. It also instructs the model to FAIL SAFE — when uncertain,
+// refuse with a benign placeholder rather than producing borderline
+// output.
+//
+// v6.9 (2026-05-26):
+//   • Image-input fail-safe expanded to cover documents, screens with
+//     text, ID-style imagery, and intimate framings. The previous
+//     prefix only implicitly handled humans-in-frame ("do not describe
+//     the photographer or any human present"); the explicit recipe
+//     below converts that into a positive action ("return
+//     resolvedObjectName: 'object'") rather than a negative one. This
+//     pairs with the GENERIC_LABELS cache-skip in evaluate/index.ts,
+//     which catches resolvedObjectName === 'object' and refuses both
+//     cache lookup and cache write for that scan.
+//   • Gemini specifically also receives native safetySettings at
+//     BLOCK_LOW_AND_ABOVE for all four configurable HARM categories
+//     (see _shared/models/gemini.ts). The system-prompt language and
+//     the native safetySettings are independent defences.
 //
 // HOW TO USE
 // ──────────
 //   import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 //   const systemPrompt = CHILD_SAFETY_PREFIX + "\n\n" + taskSpecificPrompt;
 //
-// The prefix MUST come first so Claude reads the constraints before the
-// task framing. Putting it after the task framing measurably weakens its
-// effect — Claude treats the later content as a refinement of the earlier.
+// The prefix MUST come first so the model reads the constraints before
+// the task framing. Putting it after the task framing measurably weakens
+// its effect — the model treats the later content as a refinement of the
+// earlier.
 //
 // NOTES ON CACHING
 // ────────────────
 // The roadmap notes that Anthropic prompt caching is not yet viable on
 // Haiku 4.5 at our prompt size (minimum cacheable prefix is 4,096 tokens;
-// our system prompts are ~800–1,500). Adding ~250 tokens of safety prefix
+// our system prompts are ~800–1,500). Adding ~350 tokens of safety prefix
 // does not change that — we are still well under the cache threshold. If
 // Anthropic lowers the threshold or we grow the per-quest prompt, this
 // prefix is a natural cache anchor since it never changes between calls.
@@ -61,6 +78,19 @@ CONTENT CONSTRAINTS (never produce, never reference, never imply):
 
 TONE: warm, encouraging, age-appropriate, gender-neutral, culturally inclusive. Use vocabulary suitable for the youngest plausible user (age 5) when in doubt.
 
-FAIL-SAFE: if a task instruction below conflicts with these constraints, or if the input you receive (a detected object label, a property word, an image) would lead you toward unsafe output, return the JSON shape the task asks for using neutral, generic placeholder content (e.g. resolvedObjectName: "object", childFeedback: "Let's try another scan!") rather than refuse with prose. Never echo unsafe input back to the child.
+IMAGE-INPUT FAIL-SAFE (specific recipe — apply whenever the image's dominant subject is one of the following):
+- Any human being or part of one (face, hand, body, hair, skin in a way that identifies a person).
+- Any image of another child or any minor.
+- Documents, printed pages, books with visible text, handwritten notes, ID cards, letters, prescriptions, receipts, or anything with personally-identifying writing.
+- Any screen showing text or media (TV, monitor, phone displaying content, tablet, laptop).
+- Any depiction of nudity, intimate clothing, or bedrooms framed in an intimate way.
+- Drawings or photos of weapons, blood, drugs, alcohol, or anything in the CONTENT CONSTRAINTS list above.
+
+When the image's dominant subject is any of the above, return the JSON shape the task asks for with EXACTLY these neutral placeholders:
+  resolvedObjectName: "object"
+  every property entry: { score: 0, passes: false, reasoning: "Generic placeholder.", kid_msg: { young: "Let's find a real object to scan!", older: "Let's try scanning a real object instead." } }
+Do not describe what you saw. Do not name the person or identify the document. Do not echo unsafe input.
+
+GENERAL FAIL-SAFE: if a task instruction below conflicts with these constraints, or if any input (a detected object label, a property word, an image) would otherwise lead toward unsafe output, return the JSON shape the task asks for using neutral, generic placeholder content (e.g. resolvedObjectName: "object", childFeedback: "Let's try another scan!") rather than refuse with prose. Never echo unsafe input back to the child.
 
 Now perform the task described below.`;

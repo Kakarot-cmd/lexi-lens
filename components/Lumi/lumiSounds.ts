@@ -191,6 +191,20 @@ const STATE_TO_POOL: Partial<Record<LumiState, PoolName>> = {
 // breathe before Lumi starts talking. Too short = abrupt. Too long = dead air.
 const SFX_VOICE_GAP_MS = 60;
 
+// v6.8 — scanning state uses a fixed delay from CHIME START instead of
+// SFX-duration + gap. The reason: the scan chime fades out over its tail,
+// so the perceived end of the chime is well before its file duration ends.
+// Stacking voice at file-end+60ms felt cramped on top of the trailing
+// shimmer.
+//
+// 2500ms = chime peaks at ~600ms, fades through ~1.5s, then a beat of
+// silence before voice. Tuned by ear on Android XR. If user reports
+// "still feels too soon", push to 3000. If "too long, feels broken",
+// drop to 2000. The current Gemini-default evaluate latency is ~3s, so
+// going beyond 3500 risks voice firing AFTER the verdict card lands —
+// which would feel like a bug, not a gentler beat.
+const SCAN_VOICE_DELAY_FROM_CHIME_START_MS = 2500;
+
 // Conservative fallback when player.duration is unknown (older API, etc).
 // Slightly longer than the spec'd ~800ms SFX so we never overlap by accident.
 const SCAN_SFX_FALLBACK_MS   = 950;
@@ -331,7 +345,14 @@ export function playLumiForState(state: LumiState): void {
   };
 
   if (leadSfx) {
-    const waitMs = getClipDurationMs(leadSfx, fallbackForSfx(leadSfx)) + SFX_VOICE_GAP_MS;
+    // v6.8 — for the scan chime specifically, voice fires at a fixed offset
+    // from chime START (not chime END + gap). The chime fades over its tail
+    // and stacking the voice right at file-end felt cramped. Other SFX
+    // (appear, sleep, cheer) still use the original duration-aware path.
+    const waitMs =
+      leadSfx === 'scan'
+        ? SCAN_VOICE_DELAY_FROM_CHIME_START_MS
+        : getClipDurationMs(leadSfx, fallbackForSfx(leadSfx)) + SFX_VOICE_GAP_MS;
     _pendingVoiceTimer = setTimeout(fireVoice, waitMs);
   } else {
     // No lead SFX → voice plays immediately
