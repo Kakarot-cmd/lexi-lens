@@ -1,5 +1,30 @@
 /**
- * screens/OnboardingBackstoryScreen.tsx (v3 — fullscreen-immersive)
+ * screens/OnboardingBackstoryScreen.tsx (v3.1 — personalised greeting)
+ *
+ * Shown ONCE per device, the very first time a child opens Lexi-Lens.
+ * Tells the story of who Lumi is and why she lives in the Lens.
+ *
+ * v3.1 (2026-05-27): single child-name personalisation
+ *   • Accepts an optional `childName` prop. When supplied, panel 3's
+ *     opening line becomes "I'm Lumi! And you must be {name}." instead
+ *     of "I'm Lumi! I'm one of those sparks…". The name appears EXACTLY
+ *     ONCE across the full 5-panel arc — Lumi's first-meeting moment.
+ *     Multiple mentions tested poorly with kids 5-7 in similar products
+ *     (feels like the app is using their name on them, not greeting them).
+ *   • Falls back to the original copy when childName is missing,
+ *     null, empty, or contains nothing renderable after trim. Robust
+ *     to a profile whose display_name was never set.
+ *   • Panels 1, 2 (Narrator voice) and 4, 5 (Lumi's gameplay tips
+ *     and bedtime) deliberately do NOT include the name. Narrator
+ *     using the name would read transactionally; later Lumi mentions
+ *     would dilute the panel-3 entrance.
+ *
+ * v3 (earlier): fullscreen images + storybook card backdrop
+ *   See v3 header block below for the layout-rationale notes.
+ */
+
+/**
+ * ─── v3 history (for reference) ──────────────────────────────────────────────
  *
  * Shown ONCE per device, the very first time a child opens Lexi-Lens.
  * Tells the story of who Lumi is and why she lives in the Lens.
@@ -95,6 +120,12 @@ import { LumiMascot } from '../components/Lumi';
 // CAST: Lumi is the only recurring character. Panels 1, 2, and 5 have no
 // figures at all. Panels 3 and 4 feature Lumi + an object. This is a
 // deliberate choice — see LUMI_BACKSTORY.md (v2 rationale).
+//
+// PERSONALISATION (v3.1): the child's name appears EXACTLY ONCE — panel
+// 3, opening line, when Lumi first speaks. When `childName` is missing
+// or whitespace-only, the line falls back to the non-personalised v3
+// copy. Defensive: trim + length check so accidental whitespace in
+// display_name doesn't produce "And you must be  ." artefacts.
 
 type Panel = {
   title: string;
@@ -110,78 +141,115 @@ type Panel = {
   cta: string;
 };
 
-const PANELS: Panel[] = [
-  {
-    title: 'The First Word',
-    body: [
-      'A long time ago, before there were books, before there were even letters, the world was silent.',
-      'Trees, stones, rivers, stars — all quiet.',
-    ],
-    image: require('../assets/backstory/01.png'),
-    lumiMood: 'thinking',
-    cta: 'Next',
-  },
-  {
-    title: 'The First Spark',
-    body: [
-      'Then the very first word was spoken — and the world lit up.',
-      'Every true word — cloud, warm, crinkly, brave — left a tiny spark behind.',
-      'Some sparks hide in books. Some still float around your house.',
-    ],
-    image: require('../assets/backstory/02.png'),
-    lumiMood: 'curious',
-    cta: 'Next',
-  },
-  {
-    title: 'Meet Lumi',
-    body: [
-      'I\'m Lumi! I\'m one of those sparks — the friendliest, my mum says.',
-      'I live inside your Lens.',
-      'Point me at the right thing and a new spark comes home with you. Forever.',
-    ],
-    image: require('../assets/backstory/03.png'),
-    lumiMood: 'excited',
-    cta: 'Next',
-  },
-  {
-    title: 'The Quest Tome',
-    body: [
-      'The Tome tells you what to find — maybe "something that crinkles".',
-      'Look around. Tap to scan.',
-      'I peek with you, so wait for me to nod ✨',
-    ],
-    image: require('../assets/backstory/04.png'),
-    lumiMood: 'happy',
-    cta: 'Next',
-  },
-  {
-    title: 'When my spark fizzles',
-    body: [
-      'After lots of scanning I get sleepy.',
-      'I rest until sunrise, then come back full of magic.',
-      'Tomorrow is always a bigger adventure ✨',
-    ],
-    image: require('../assets/backstory/05.png'),
-    lumiMood: 'sleeping',
-    cta: 'Let\'s find magic!',
-  },
-];
+/**
+ * Build the panel array. `childName` is interpolated only into panel 3,
+ * and only when it's a non-empty trimmed string. Safety against bad
+ * profile data is here, not at every callsite.
+ */
+function buildPanels(childName?: string | null): Panel[] {
+  const cleanName =
+    typeof childName === 'string' && childName.trim().length > 0
+      ? childName.trim()
+      : null;
+
+  // Panel 3 — the only place the name lives. See header v3.1 notes for why.
+  const panel3OpenLine = cleanName
+    ? `I'm Lumi! And you must be ${cleanName}.`
+    : `I'm Lumi! I'm one of those sparks — the friendliest, my mum says.`;
+
+  return [
+    {
+      title: 'The First Word',
+      body: [
+        'A long time ago, before there were books, before there were even letters, the world was silent.',
+        'Trees, stones, rivers, stars — all quiet.',
+      ],
+      image: require('../assets/backstory/01.png'),
+      lumiMood: 'thinking',
+      cta: 'Next',
+    },
+    {
+      title: 'The First Spark',
+      body: [
+        'Then the very first word was spoken — and the world lit up.',
+        'Every true word — cloud, warm, crinkly, brave — left a tiny spark behind.',
+        'Some sparks hide in books. Some still float around your house.',
+      ],
+      image: require('../assets/backstory/02.png'),
+      lumiMood: 'curious',
+      cta: 'Next',
+    },
+    {
+      title: 'Meet Lumi',
+      body: [
+        panel3OpenLine,
+        // Second line shifts slightly when personalised: without the
+        // "I'm one of those sparks" framing in the opening line, we
+        // need the spark identity here.
+        cleanName
+          ? `I'm one of those sparks — and I live inside your Lens.`
+          : `I live inside your Lens.`,
+        'Point me at the right thing and a new spark comes home with you. Forever.',
+      ],
+      image: require('../assets/backstory/03.png'),
+      lumiMood: 'excited',
+      cta: 'Next',
+    },
+    {
+      title: 'The Quest Tome',
+      body: [
+        'The Tome tells you what to find — maybe "something that crinkles".',
+        'Look around. Tap to scan.',
+        'I peek with you, so wait for me to nod ✨',
+      ],
+      image: require('../assets/backstory/04.png'),
+      lumiMood: 'happy',
+      cta: 'Next',
+    },
+    {
+      title: 'When my spark fizzles',
+      body: [
+        'After lots of scanning I get sleepy.',
+        'I rest until sunrise, then come back full of magic.',
+        'Tomorrow is always a bigger adventure ✨',
+      ],
+      image: require('../assets/backstory/05.png'),
+      lumiMood: 'sleeping',
+      cta: 'Let\'s find magic!',
+    },
+  ];
+}
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
 export interface OnboardingBackstoryScreenProps {
   /** Called when the user finishes (or skips) the story. */
   onComplete: () => void;
+  /**
+   * v3.1 — optional. When provided as a non-empty string, panel 3's
+   * opening line becomes a personalised greeting ("And you must be
+   * {name}."). When missing/empty/whitespace, falls back silently to
+   * the non-personalised v3 copy. Pass `activeChild?.display_name`
+   * from App.tsx; safe to pass `null` or `undefined`.
+   */
+  childName?: string | null;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function OnboardingBackstoryScreen({
   onComplete,
+  childName,
 }: OnboardingBackstoryScreenProps): React.ReactElement {
   const insets = useSafeAreaInsets();
   const { width, height } = useWindowDimensions();
   const [index, setIndex] = useState(0);
+
+  // v3.1 — Panels are now built per-render-stable from childName.
+  // useMemo means a parent re-render that doesn't change the name
+  // doesn't rebuild the panel array (it's small, but the cleanName
+  // trim + ternaries are pure waste on every keystroke).
+  const PANELS = useMemo(() => buildPanels(childName), [childName]);
 
   // Cross-fade between panels. Both the image and the text fade together,
   // so the panel feels like a single thing changing — not two layers

@@ -70,6 +70,13 @@ type Props = NativeStackScreenProps<RootStackParamList, "ParentDashboard">;
 import { useGameStore } from "../store/gameStore";
 import { FREE_SUBSCRIPTION, type SubscriptionDetails } from "../lib/revenueCat";
 
+// v3.1 — Replay-Lumi-story modal. Imports the full backstory screen
+// eagerly (it's small post-prefetch, and a parent tapping Replay would
+// see a Suspense flash if it were lazy). Same screen used at first
+// launch; we just call it with a no-op `onComplete` that closes the
+// modal — does NOT mutate the seen-flag.
+import { OnboardingBackstoryScreen } from "./OnboardingBackstoryScreen";
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface ChildProfile {
@@ -458,10 +465,23 @@ const subStyles = StyleSheet.create({
 // ─── LumiSettingsCard ─────────────────────────────────────────────────────────
 // Mounted between AchievementBadgeGrid and Word Tome. Sound row only renders
 // if expo-audio is actually installed (isLumiAudioAvailable returns true).
+//
+// v3.1 (2026-05-27): added "Replay Lumi's story" row. Renders the
+// OnboardingBackstoryScreen as a full-screen modal. Does NOT reset
+// the seen-flag — replay is a one-off view, the auto-trigger remains
+// gated on first-install. Personalised with the currently-selected
+// child's display_name when one is selected; falls back gracefully
+// when the parent hasn't picked a child yet.
 
-function LumiSettingsCard() {
+interface LumiSettingsCardProps {
+  /** Currently-selected child's name for the replay screen, or null. */
+  selectedChildName: string | null;
+}
+
+function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
   const [soundOn,    setSoundOn]    = useState(false);
   const [hapticsOn,  setHapticsOn]  = useState(true);
+  const [showReplay, setShowReplay] = useState(false);
   const audioAvailable = isLumiAudioAvailable();
 
   // Hydrate from AsyncStorage on mount
@@ -544,7 +564,44 @@ function LumiSettingsCard() {
             Sound effects ship in a future update. Haptics work today.
           </Text>
         )}
+
+        {/* v3.1 — Replay Lumi's story.
+            Always rendered (no audio dep). Sits below sound/haptics
+            because it's a less-frequent action than the toggles. */}
+        <TouchableOpacity
+          style={[styles.lumiRow, styles.lumiRowDivider, styles.lumiReplayRow]}
+          onPress={() => {
+            try { Haptics.selectionAsync(); } catch {}
+            setShowReplay(true);
+          }}
+          accessibilityRole="button"
+          accessibilityLabel="Replay Lumi's story"
+          accessibilityHint="Plays the welcome story your child saw on first launch"
+        >
+          <View style={{ flex: 1 }}>
+            <Text style={styles.lumiRowLabel}>Replay Lumi's story</Text>
+            <Text style={styles.lumiRowSub}>
+              The 5-page welcome your child saw on first launch
+            </Text>
+          </View>
+          <Text style={styles.lumiReplayChevron}>›</Text>
+        </TouchableOpacity>
       </View>
+
+      {/* Full-screen modal. Backstory screen owns the viewport while
+          showing. onComplete just closes the modal — does NOT call
+          markBackstorySeen() (already true) and does NOT reset it. */}
+      <Modal
+        visible={showReplay}
+        animationType="fade"
+        presentationStyle="fullScreen"
+        onRequestClose={() => setShowReplay(false)}
+      >
+        <OnboardingBackstoryScreen
+          onComplete={() => setShowReplay(false)}
+          childName={selectedChildName}
+        />
+      </Modal>
     </View>
   );
 }
@@ -874,7 +931,7 @@ export function ParentDashboard({ navigation }: Props) {
           )}
 
           {/* ── Lumi (Mascot) settings ───────────────────── */}
-          <LumiSettingsCard />
+          <LumiSettingsCard selectedChildName={selectedChild?.display_name ?? null} />
 
           {/* ── Word Tome ────────────────────────────────── */}
           <View style={styles.section}>
@@ -1292,6 +1349,19 @@ const styles = StyleSheet.create({
     fontStyle:  "italic",
     marginTop:  8,
     textAlign:  "center",
+  },
+  // v3.1 — Replay row uses same row dimensions as toggle rows so the
+  // card reads as one unified group. Chevron is a passive affordance,
+  // not a chevron icon — keeps us free of vector-icon deps.
+  lumiReplayRow: {
+    flexDirection:  "row",
+    alignItems:     "center",
+  },
+  lumiReplayChevron: {
+    fontSize:    24,
+    color:       P.inkFaint,
+    marginLeft:  8,
+    lineHeight:  24,
   },
 
   notifSection: { backgroundColor: P.parchment, borderRadius: 14, padding: 16, borderWidth: 1, borderColor: P.warmBorder },

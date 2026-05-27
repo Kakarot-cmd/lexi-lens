@@ -140,6 +140,18 @@ import { useGameStore } from "./store/gameStore";
 
 import { useAnalytics } from "./hooks/useAnalytics";
 
+// ─── Lazy-screen prefetch (v6.9.1) ────────────────────────────────────────────
+//
+// The lazy(...) declarations above shield cold-start from
+// Reanimated/VisionCamera/Lumi module-init crashes (see v4.5.8 history),
+// but the tradeoff is a one-time Suspense fallback flash the first time
+// the user navigates to each lazy screen in a session. We close that
+// gap by silently warming every lazy module in the background after
+// first paint and after the auth state settles. Implementation is
+// guarded with InteractionManager + per-module try/catch so a prefetch
+// failure cannot affect the rest of the app.
+import { prefetchLazyScreens } from "./lib/prefetchLazyScreens";
+
 // ─── Lumi mascot (lazy) ──────────────────────────────────────────────────────
 //
 // v4.5.8 — Lumi imports are deferred. They previously loaded at module-init
@@ -511,6 +523,32 @@ function App() {
     return () => { cancelled = true; };
   }, [session?.user?.id, activeChild?.id, backstorySeen]);
 
+  // ── Lazy-screen prefetch (v6.9.1) ─────────────────────────────────────────
+  //
+  // Eliminates the one-time Suspense fallback flash on first navigation
+  // to each lazy screen in a session. Conditions for kicking off:
+  //   • Auth has resolved (session set, not initialising)
+  //   • Backstory state is determined (not null — gate has completed read)
+  //   • Not currently mid-recovery (user hasn't reset their password yet)
+  //   • Not on the standalone backstory branch (where we don't want to
+  //     compete with the backstory screen's own module-init)
+  //
+  // The prefetcher itself is internally idempotent — the !_kickedOff guard
+  // inside it means a re-fire from any state churn (e.g. activeChild
+  // switch) is harmless. We still gate here so we don't fire BEFORE the
+  // user is in the main app surface, which would waste resolves if the
+  // session turns out invalid.
+  useEffect(() => {
+    if (initialising)                  return;
+    if (backstorySeen === null)        return;
+    if (!session)                      return;
+    if (recoveryActive)                return;
+    if (backstorySeen === false)       return; // wait until backstory done
+    prefetchLazyScreens({
+      hasBackstoryShown: backstorySeen === true,
+    });
+  }, [initialising, backstorySeen, session, recoveryActive]);
+
   // ── RevenueCat lifecycle ───────────────────────────────────────────────────
   //
   // Phase 4.4. Wires the RC SDK to the Supabase auth session:
@@ -716,7 +754,13 @@ function App() {
                 </View>
               }
             >
-              <OnboardingBackstoryScreen onComplete={onBackstoryComplete} />
+              <OnboardingBackstoryScreen
+                onComplete={onBackstoryComplete}
+                // v3.1 — personalised greeting in panel 3. activeChild
+                // may briefly be null at first session if the child profile
+                // hasn't loaded yet; the screen falls back gracefully.
+                childName={activeChild?.display_name ?? null}
+              />
             </Suspense>
           </ErrorBoundary>
         ) : (
