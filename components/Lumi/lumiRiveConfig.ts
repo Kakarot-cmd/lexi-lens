@@ -44,7 +44,7 @@ import type { LumiMood }  from './LumiBodySvg';
  * dev and prod. Gate with a feature flag in Supabase if you want runtime
  * control (not implemented here — keep it static for first ship).
  */
-export const LUMI_RIVE_ENABLED = true;
+export const LUMI_RIVE_ENABLED = false;
 
 // ─── Asset locator ────────────────────────────────────────────────────────────
 
