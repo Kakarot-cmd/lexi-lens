@@ -220,6 +220,8 @@ export default {
     plugins: [
       'react-native-vision-camera',
 	  './plugins/withReleaseSigningConfig.js',
+	  './plugins/withGradleMemory.js',
+	  './plugins/withXcode26Compat.js',
       [
         'expo-build-properties',
         {
