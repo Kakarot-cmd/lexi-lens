@@ -170,7 +170,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.31',
+    version: '1.0.33',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -184,6 +184,15 @@ export default {
 
     ios: {
       bundleIdentifier: id.iosBundle,
+      // iOS CFBundleVersion (the "(N)" build number shown in Xcode Organizer).
+      // SOURCE OF TRUTH for local Xcode archives: this value is baked into
+      // Info.plist by `expo prebuild` and is what ships. Editing the Build
+      // field in Xcode's General tab does NOT survive the next prebuild
+      // (ios/ is gitignored CNG), so bump it HERE before each TestFlight
+      // archive. Must be unique + higher than any build already uploaded for
+      // the current `version` string. (appVersionSource:"remote" in eas.json
+      // only affects EAS cloud builds, not local archives — this wins here.)
+      buildNumber: '33',
       supportsTablet: true,
       entitlements: {
         'aps-environment': VARIANT === 'production' ? 'production' : 'development',
