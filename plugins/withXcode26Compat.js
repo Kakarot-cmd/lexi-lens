@@ -20,7 +20,11 @@
  * Mirrors the proven pattern of plugins/withReleaseSigningConfig.js
  * (Android) and plugins/withGradleMemory.js (Android Gradle memory).
  *
- * ─── What it automates (the 4 Xcode 26 sharp edges) ──────────────────────
+ * ─── What it automates (5 Xcode 26 / RN 0.81 sharp edges) ────────────────
+ *
+ * Three modifiers, covering five sharp edges. Fix #3 carries two of them
+ * (the node-path edge was added 2026-05-30 after a fresh-prebuild archive
+ * died in the Hermes script — see Fix #3a below).
  *
  *   Fix #1  (Podfile post_install → Pods/Pods.xcodeproj):
  *     - SWIFT_ENABLE_EXPLICIT_MODULES = NO on ALL Pod targets. Xcode 26
@@ -40,13 +44,39 @@
  *       withXcodeProject so it covers every build configuration regardless
  *       of the baked variant name (LexiLensStaging / LexiLensDev / LexiLens).
  *
- *   Fix #3  (ios/.xcode.env.local):
- *     - SENTRY_DISABLE_AUTO_UPLOAD=true. Without a SENTRY_AUTH_TOKEN the
- *       Sentry "Upload Debug Symbols" build phase fails the archive. CLI env
- *       vars passed to `expo run:ios` do NOT propagate to Xcode Archive
- *       (different process tree), so this must live in the env file.
- *       TODO (separate item): when SENTRY_AUTH_TOKEN is configured for real
- *       symbolication, drop this and let symbols upload.
+ *   Fix #3  (ios/.xcode.env.local) — TWO env keys:
+ *
+ *     (a) NODE_BINARY=<absolute path to node>  [Sharp Edge #5, added 2026-05-30]
+ *         React Native's scripts/xcode/with-environment.sh initialises
+ *         NODE_BINARY from `command -v node`. When Xcode is launched from
+ *         Finder/Dock (not a terminal with nvm active), that resolves to
+ *         EMPTY — and the auto-generated ios/.xcode.env uses the same empty
+ *         `$(command -v node)`. with-environment.sh then falls back to
+ *         scripts/find-node-for-xcode.sh, which puts `node` on PATH (the
+ *         "Now using node vXX" line) but NEVER sets NODE_BINARY. The Hermes
+ *         "[Hermes] Replace Hermes for the right configuration" build phase
+ *         then runs `"$NODE_BINARY" .../replace_hermes_version.js` with
+ *         NODE_BINARY="" → bash executes an empty command word →
+ *         `PhaseScriptExecution failed ... line 9: : command not found`.
+ *         The archive dies before compiling a single file.
+ *
+ *         Fix: pin NODE_BINARY to an ABSOLUTE path in .xcode.env.local, which
+ *         with-environment.sh sources AFTER .xcode.env, so it wins and the
+ *         fragile nvm fallback is never entered. We resolve the path from
+ *         `process.execPath` — the node binary currently running prebuild,
+ *         which on the Mac IS the developer's active nvm/Homebrew node. It is
+ *         REWRITTEN on every prebuild, so it self-heals across node upgrades
+ *         (no stale version path can linger). Assumption: the node you run
+ *         `expo prebuild` with is the node Xcode should use for the archive —
+ *         true for a single-machine solo build; revisit only if prebuild and
+ *         archive ever run under different node managers.
+ *
+ *     (b) SENTRY_DISABLE_AUTO_UPLOAD=true. Without a SENTRY_AUTH_TOKEN the
+ *         Sentry "Upload Debug Symbols" build phase fails the archive. CLI env
+ *         vars passed to `expo run:ios` do NOT propagate to Xcode Archive
+ *         (different process tree), so this must live in the env file.
+ *         TODO (separate item): when SENTRY_AUTH_TOKEN is configured for real
+ *         symbolication, drop this and let symbols upload.
  *
  * ─── Android safety ──────────────────────────────────────────────────────
  *
@@ -158,14 +188,23 @@ const withXcode26Sandboxing = (config) =>
     return config;
   });
 
-// ── Fix #3 — SENTRY_DISABLE_AUTO_UPLOAD in ios/.xcode.env.local ──────────────
+// ── Fix #3 — ios/.xcode.env.local (NODE_BINARY + SENTRY_DISABLE_AUTO_UPLOAD) ──
 //
 // withDangerousMod is the right primitive for a raw file the Xcode templates
-// don't model. Gated on 'ios'. Idempotent: appends only if the line is absent.
+// don't model. Gated on 'ios' — never fires for `expo prebuild --platform
+// android`. The two keys use deliberately different write strategies:
+//
+//   • NODE_BINARY        → SELF-HEALING: any prior NODE_BINARY line is stripped
+//                          and rewritten to the current `process.execPath` on
+//                          every prebuild, so a stale node-version path can
+//                          never survive a node upgrade. (Sharp Edge #5.)
+//   • SENTRY_DISABLE_...  → IDEMPOTENT APPEND: added only if absent, never
+//                          churned, so a manually-added SENTRY_AUTH_TOKEN or
+//                          other lines in the file are preserved untouched.
 
-const ENV_LINE = 'export SENTRY_DISABLE_AUTO_UPLOAD=true';
+const SENTRY_LINE = 'export SENTRY_DISABLE_AUTO_UPLOAD=true';
 
-const withXcode26SentryEnv = (config) =>
+const withXcode26EnvLocal = (config) =>
   withDangerousMod(config, [
     'ios',
     (config) => {
@@ -181,20 +220,53 @@ const withXcode26SentryEnv = (config) =>
         existing = ''; // file may not exist yet — we'll create it
       }
 
-      if (existing.includes('SENTRY_DISABLE_AUTO_UPLOAD')) {
-        return config; // already present — idempotent
+      // ── (a) NODE_BINARY — resolve absolute path of the node running prebuild.
+      // process.execPath is always an absolute path to the active node binary.
+      // Light guard: if it somehow doesn't look like a real path, skip rather
+      // than write a broken line (never break prebuild over this).
+      const nodePath = process.execPath;
+      const nodeOk =
+        typeof nodePath === 'string' &&
+        nodePath.startsWith('/') &&
+        fs.existsSync(nodePath);
+
+      // Strip ANY pre-existing NODE_BINARY line (self-heal across upgrades).
+      let lines = existing
+        .split('\n')
+        .filter((l) => !/^\s*export\s+NODE_BINARY=/.test(l));
+
+      if (nodeOk) {
+        lines.push(`export NODE_BINARY="${nodePath}"`);
+        console.log(
+          `[withXcode26Compat] Set NODE_BINARY="${nodePath}" in ` +
+            'ios/.xcode.env.local (Fix #3a — Sharp Edge #5). This prevents the ' +
+            'Hermes "Replace Hermes" phase from failing with ' +
+            '"line 9: : command not found" when Xcode is launched without ' +
+            'node on PATH.',
+        );
+      } else {
+        console.error(
+          '[withXcode26Compat] WARNING: could not resolve a valid absolute node ' +
+            `path from process.execPath ("${nodePath}"). NODE_BINARY was NOT ` +
+            'written. If the archive fails in the Hermes script with ' +
+            '"line 9: : command not found", set NODE_BINARY manually in ' +
+            'ios/.xcode.env.local (see iOS runbook Sharp Edge #5).',
+        );
       }
 
-      const next =
-        existing && !existing.endsWith('\n')
-          ? existing + '\n' + ENV_LINE + '\n'
-          : existing + ENV_LINE + '\n';
+      // ── (b) SENTRY_DISABLE_AUTO_UPLOAD — idempotent append.
+      if (!lines.some((l) => l.includes('SENTRY_DISABLE_AUTO_UPLOAD'))) {
+        lines.push(SENTRY_LINE);
+        console.log(
+          '[withXcode26Compat] Appended SENTRY_DISABLE_AUTO_UPLOAD=true to ' +
+            'ios/.xcode.env.local (Fix #3b).',
+        );
+      }
 
+      // Normalise: drop all blank lines (file is export statements only),
+      // exactly one trailing newline.
+      const next = lines.filter((l) => l.trim() !== '').join('\n') + '\n';
       fs.writeFileSync(file, next);
-      console.log(
-        '[withXcode26Compat] Appended SENTRY_DISABLE_AUTO_UPLOAD=true to ' +
-          'ios/.xcode.env.local (Fix #3).',
-      );
       return config;
     },
   ]);
@@ -204,7 +276,7 @@ const withXcode26SentryEnv = (config) =>
 const withXcode26Compat = (config) => {
   config = withXcode26Podfile(config);
   config = withXcode26Sandboxing(config);
-  config = withXcode26SentryEnv(config);
+  config = withXcode26EnvLocal(config);
   return config;
 };
 

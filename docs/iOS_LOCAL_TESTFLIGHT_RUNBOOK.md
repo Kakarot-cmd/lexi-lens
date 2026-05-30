@@ -1,7 +1,7 @@
 # iOS Local TestFlight Archive — Runbook
 
 **Authored:** May 24, 2026, after the 9-hour session that produced the first successful TestFlight build (1.0.31).
-**Status:** Working recipe. **As of 2026-05-30, the four manual Xcode 26 edits are automated by `plugins/withXcode26Compat.js`** — Phase 2 below is now mostly automatic (see the note at its head). The plugin covers Fixes #1–#3; only the workspace-not-xcodeproj rule (Fix #4) remains a human action.
+**Status:** Working recipe. **As of 2026-05-30, the four manual Xcode 26 edits are automated by `plugins/withXcode26Compat.js`** — Phase 2 below is now mostly automatic (see the note at its head). The plugin covers Fixes #1–#3 (Fix #3 now also pins `NODE_BINARY` — Sharp Edge #5, added 2026-05-30); only the workspace-not-xcodeproj rule (Fix #4) remains a human action.
 **Audience:** Future NJ (most likely), or anyone else inheriting this project.
 
 ---
@@ -91,13 +91,25 @@ sed -i '' 's/ENABLE_USER_SCRIPT_SANDBOXING = YES/ENABLE_USER_SCRIPT_SANDBOXING =
 (Substitute `LexiLensDev` if you prebuilt with `APP_VARIANT=development`.)
 Without this, the "Bundle React Native code and images" build phase fails because it can't write `ip.txt`.
 
-#### Fix 3 — Sentry symbol upload bypass
+#### Fix 3 — `.xcode.env.local`: node path + Sentry symbol upload bypass
 
 ```bash
+echo "export NODE_BINARY=\"$(command -v node)\"" >> ios/.xcode.env.local
 echo "export SENTRY_DISABLE_AUTO_UPLOAD=true" >> ios/.xcode.env.local
 ```
 
-Without this, archive succeeds compile but fails at the final "Upload Debug Symbols to Sentry" build phase because no `SENTRY_AUTH_TOKEN` is configured. This is non-fatal long-term (we want to upload symbols eventually) but blocks tonight's builds.
+**NODE_BINARY (Sharp Edge #5):** Without an absolute `NODE_BINARY` here, an
+archive launched from Finder/Dock (no nvm node inherited) dies in the Hermes
+"Replace Hermes" build phase with `line 9: : command not found`. See Sharp
+Edge #5 for the full mechanism. The plugin writes this automatically using
+`process.execPath`; the manual line above is only for a no-plugin fallback —
+and `$(command -v node)` only resolves correctly when run from a terminal
+where node is on PATH, so prefer the plugin.
+
+**SENTRY_DISABLE_AUTO_UPLOAD:** Without this, archive succeeds compile but
+fails at the final "Upload Debug Symbols to Sentry" build phase because no
+`SENTRY_AUTH_TOKEN` is configured. Non-fatal long-term (we want to upload
+symbols eventually) but blocks the build.
 
 #### Fix 4 — Install pods
 
@@ -110,12 +122,15 @@ Wait for "Pod installation complete!" line — should report 111 dependencies, 1
 ### Phase 3 — Verify the fixes landed (~30 sec)
 
 ```bash
-# All three checks should print non-zero numbers
+# All four checks should print non-zero numbers
 echo "SWIFT_ENABLE_EXPLICIT_MODULES NO count:"
 grep -c "SWIFT_ENABLE_EXPLICIT_MODULES = NO" ios/Pods/Pods.xcodeproj/project.pbxproj
 
 echo "ENABLE_USER_SCRIPT_SANDBOXING NO count:"
 grep -c "ENABLE_USER_SCRIPT_SANDBOXING = NO" ios/LexiLensStaging.xcodeproj/project.pbxproj
+
+echo "NODE_BINARY set (absolute path):"
+grep "NODE_BINARY" ios/.xcode.env.local
 
 echo "SENTRY_DISABLE_AUTO_UPLOAD set:"
 grep -c "SENTRY_DISABLE_AUTO_UPLOAD" ios/.xcode.env.local
@@ -228,6 +243,54 @@ cd ..
 
 This was the actual fix on May 24 — even after correcting the workspace-vs-xcodeproj confusion, the dependency graph stayed broken until deintegrate.
 
+### Sharp Edge #5 — Hermes script dies with `line 9: : command not found` (NODE_BINARY empty)
+
+**Symptom:** Archive fails almost immediately in the `hermes-engine` target.
+Build log shows the `[Hermes] Replace Hermes for the right configuration`
+script phase (`.../hermes-engine.build/Script-XXXX.sh`) failing:
+
+```
+[Warning] You need to configure your node path in the ".xcode.env" file ...
+Now using node v20.20.2 (npm v10.8.2)
+.../hermes-engine.build/Script-XXXX.sh: line 9: : command not found
+Command PhaseScriptExecution failed with a nonzero exit code
+```
+
+**Cause:** React Native's `scripts/xcode/with-environment.sh` initialises
+`NODE_BINARY=$(command -v node || echo "")`. When Xcode is launched from
+Finder/Dock (rather than a terminal that has nvm's node active), `command -v
+node` returns **empty**. The auto-generated `ios/.xcode.env` uses the same
+empty `$(command -v node)`, and `ios/.xcode.env.local` (before this fix) only
+held `SENTRY_DISABLE_AUTO_UPLOAD`. So `NODE_BINARY` stays empty, and
+`with-environment.sh` falls back to `scripts/find-node-for-xcode.sh`, which
+sources nvm and puts `node` on PATH — that is the misleading "Now using node
+v20.20.2" line — but **never sets `NODE_BINARY`**. The Hermes script then runs
+`"$NODE_BINARY" .../replace_hermes_version.js` with `NODE_BINARY=""`, so bash
+tries to execute an empty command word → `line 9: : command not found`.
+
+**Why it's intermittent:** if Xcode was launched from a Terminal where nvm's
+node was already on PATH (or you ran `expo run:ios` from that shell first),
+`command -v node` resolves and the archive succeeds. The first 1.0.31 archive
+likely got lucky this way, which is why this edge wasn't caught until a clean
+fresh-prebuild archive from Finder.
+
+**Fix:** Pin `NODE_BINARY` to an **absolute** path in `ios/.xcode.env.local`,
+which `with-environment.sh` sources after `.xcode.env`, so it wins and the
+fragile fallback is never entered. `plugins/withXcode26Compat.js` now writes
+this automatically (Fix #3a) using `process.execPath` — the node running
+prebuild on your Mac — and rewrites it on every prebuild so it self-heals
+across node-version upgrades. Manual fallback (no plugin), run from a terminal
+with node on PATH:
+
+```bash
+echo "export NODE_BINARY=\"$(command -v node)\"" >> ios/.xcode.env.local
+```
+
+**Confirmation the fix is working:** the archive log line changes from the
+warning + "Now using node" to `Node found at: /Users/<you>/.../bin/node`, and
+`grep NODE_BINARY ios/.xcode.env.local` shows an absolute path.
+
+
 ---
 
 ## Build configuration / variant matrix
@@ -285,7 +348,7 @@ Phase 4.4l. To actually exercise IAP on TestFlight:
 |---|---|---|
 | `ios/Podfile` | Pod dependencies + the post_install hook from Fix #1 | Manual edit every prebuild (until config plugin exists) |
 | `ios/LexiLensStaging.xcodeproj/project.pbxproj` | Xcode project with the sandboxing fix from Fix #2 | sed patch every prebuild |
-| `ios/.xcode.env.local` | Env vars including `SENTRY_DISABLE_AUTO_UPLOAD` | Append every prebuild |
+| `ios/.xcode.env.local` | `NODE_BINARY` (absolute) + `SENTRY_DISABLE_AUTO_UPLOAD` | Written by `withXcode26Compat.js` every prebuild |
 | `ios/Pods/` | Installed pods (133 of them) | `pod install` |
 
 ### Build artifacts (never commit):
@@ -305,7 +368,7 @@ The current state requires four manual edits after every `expo prebuild --clean`
 Built and registered in `app.config.js`. Single Expo config plugin applying on every prebuild:
 - Fix #1 via `withPodfile` — injects the per-Pod-target loop INSIDE the existing `post_install` block (after `react_native_post_install(...)`), setting `SWIFT_ENABLE_EXPLICIT_MODULES = NO` on all Pod targets and `CLANG_CXX_LANGUAGE_STANDARD = c++17` on fmt + RCT-Folly.
 - Fix #2 via `withXcodeProject` — sets `ENABLE_USER_SCRIPT_SANDBOXING = NO` on every build configuration of the **app** project (variant-agnostic; no hard-coded `LexiLensStaging` name, so it works for dev/staging/production alike). Structural edit, not a sed.
-- Fix #3 via `withDangerousMod('ios', …)` — appends `export SENTRY_DISABLE_AUTO_UPLOAD=true` to `ios/.xcode.env.local` if absent.
+- Fix #3 via `withDangerousMod('ios', …)` — writes `ios/.xcode.env.local`: an absolute `NODE_BINARY` (from `process.execPath`, rewritten each prebuild — Sharp Edge #5) plus `SENTRY_DISABLE_AUTO_UPLOAD=true` (appended if absent).
 
 All three are idempotent (re-running prebuild never duplicates). The recipe is now: `expo prebuild → pod install → archive` (three commands; verify with Phase 3). If the Podfile anchor ever moves, Fix #1 logs a WARNING and passes through — the archive then fails with a clear modulemap error, the documented fallback being the manual Phase 2 Fix #1 edit. Fix #4 (workspace not xcodeproj) is intentionally NOT automated — it is a human action in Xcode.
 
