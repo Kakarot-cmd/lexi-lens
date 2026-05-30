@@ -20,11 +20,18 @@
  * Mirrors the proven pattern of plugins/withReleaseSigningConfig.js
  * (Android) and plugins/withGradleMemory.js (Android Gradle memory).
  *
- * ─── What it automates (5 Xcode 26 / RN 0.81 sharp edges) ────────────────
+ * ─── What it automates ───────────────────────────────────────────────────
  *
- * Three modifiers, covering five sharp edges. Fix #3 carries two of them
- * (the node-path edge was added 2026-05-30 after a fresh-prebuild archive
- * died in the Hermes script — see Fix #3a below).
+ * Four modifiers:
+ *   Fix #1  Podfile post_install (SWIFT_ENABLE_EXPLICIT_MODULES=NO, fmt c++17)
+ *   Fix #2  ENABLE_USER_SCRIPT_SANDBOXING=NO on the app project
+ *   Fix #3  ios/.xcode.env.local — absolute NODE_BINARY (Sharp Edge #5) +
+ *           SENTRY_DISABLE_AUTO_UPLOAD
+ *   Fix #4  "Copy Hermes dSYM into archive" build phase (formerly TODO 2 —
+ *           kills the "Upload Symbols Failed" warning at Distribute)
+ *
+ * The only iOS-archive step that stays manual is opening the .xcworkspace
+ * (not the .xcodeproj) in Xcode — a user action, not a file edit.
  *
  *   Fix #1  (Podfile post_install → Pods/Pods.xcodeproj):
  *     - SWIFT_ENABLE_EXPLICIT_MODULES = NO on ALL Pod targets. Xcode 26
@@ -271,12 +278,130 @@ const withXcode26EnvLocal = (config) =>
     },
   ]);
 
+// ── Fix #4 — Copy Hermes dSYM into the archive (formerly runbook TODO 2) ────
+//
+// Symptom this kills: Xcode Organizer → Distribute → Upload finishes with
+// "Upload Symbols Failed: The archive did not include a dSYM for the
+// hermes.framework with the UUIDs [...]". Non-fatal (the binary still ships),
+// but Hermes-engine-internal crash frames won't symbolicate on App Store
+// Connect (and the same dSYM is what Sentry needs once SENTRY_AUTH_TOKEN is
+// wired — see runbook TODO 3).
+//
+// Cause: this project uses the PREBUILT Hermes release tarball, which on RN
+// 0.81 ships iOS as an XCFramework. Its dSYM lives INSIDE the xcframework
+// (e.g. .../hermes.xcframework/ios-arm64/dSYMs/hermes.framework.dSYM) and is
+// NOT copied into the archive's DWARF dSYM folder automatically. We add a
+// run-script build phase to the app target that copies it there during the
+// archive, after the framework is in place.
+//
+// Robustness:
+//   • Locates the dSYM with `find` rather than a hardcoded path (the exact
+//     layout differs between prebuilt-xcframework and from-source Hermes, and
+//     across RN versions). Verified: the runbook's old hardcoded
+//     `universal/hermes.framework.dSYM` path does NOT exist for RN 0.81
+//     prebuilt — it's inside the xcframework slice.
+//   • Excludes the simulator slice — its UUID won't match a device archive,
+//     so copying it would leave the warning in place.
+//   • Guards on DWARF_DSYM_FOLDER_PATH so it no-ops on normal (non-archive)
+//     builds and never fails them.
+//   • Idempotent: skips if a phase with our marker name already exists.
+
+const HERMES_DSYM_PHASE_NAME = 'Copy Hermes dSYM into archive (withXcode26Compat)';
+
+const HERMES_DSYM_SCRIPT = [
+  'set -e',
+  '# Apple symbol upload wants a dSYM for the prebuilt Hermes xcframework.',
+  '# Only relevant during archive (DWARF_DSYM_FOLDER_PATH is set then).',
+  'if [ -z "${DWARF_DSYM_FOLDER_PATH}" ]; then',
+  '  echo "[hermes-dsym] Not an archive build — skipping."',
+  '  exit 0',
+  'fi',
+  '# Find the device-slice Hermes dSYM (exclude simulator: its UUID will not',
+  '# match the archived arm64 binary).',
+  'HERMES_DSYM=$(find "${PODS_ROOT}/hermes-engine" -type d -name "hermes.framework.dSYM" 2>/dev/null | grep -vi "simulator\\|maccatalyst\\|tvos\\|visionos\\|xros\\|watchos\\|macosx" | head -1)',
+  'if [ -z "${HERMES_DSYM}" ] || [ ! -d "${HERMES_DSYM}" ]; then',
+  '  echo "[hermes-dsym] hermes.framework.dSYM not found under ${PODS_ROOT}/hermes-engine — skipping (Apple symbol upload may warn)."',
+  '  exit 0',
+  'fi',
+  'echo "[hermes-dsym] Copying ${HERMES_DSYM} -> ${DWARF_DSYM_FOLDER_PATH}/"',
+  'cp -R "${HERMES_DSYM}" "${DWARF_DSYM_FOLDER_PATH}/"',
+  'echo "[hermes-dsym] Done."',
+].join('\n');
+
+const withHermesDsymCopyPhase = (config) =>
+  withXcodeProject(config, (config) => {
+    const project = config.modResults;
+
+    // Idempotency: bail if our phase is already present.
+    const existingPhases =
+      (project.hash &&
+        project.hash.project &&
+        project.hash.project.objects &&
+        project.hash.project.objects.PBXShellScriptBuildPhase) ||
+      {};
+    for (const key of Object.keys(existingPhases)) {
+      const phase = existingPhases[key];
+      if (
+        phase &&
+        typeof phase === 'object' &&
+        typeof phase.name === 'string' &&
+        phase.name.includes('Copy Hermes dSYM')
+      ) {
+        console.log(
+          '[withXcode26Compat] Hermes dSYM copy phase already present — skipping (Fix #4).',
+        );
+        return config;
+      }
+    }
+
+    // Target the application target specifically (not a test/extension target).
+    const nativeTargets = project.pbxNativeTargetSection();
+    let appTargetUuid;
+    for (const key of Object.keys(nativeTargets)) {
+      const t = nativeTargets[key];
+      if (
+        t &&
+        typeof t === 'object' &&
+        typeof t.productType === 'string' &&
+        t.productType.includes('com.apple.product-type.application')
+      ) {
+        appTargetUuid = key;
+        break;
+      }
+    }
+
+    if (!appTargetUuid) {
+      console.error(
+        '[withXcode26Compat] WARNING: could not find an application target to ' +
+          'attach the Hermes dSYM copy phase. Fix #4 NOT applied — the archive ' +
+          'will still upload, but Apple will warn "Upload Symbols Failed" for ' +
+          'hermes.framework. See iOS runbook Sharp Edge #3 / TODO 2.',
+      );
+      return config;
+    }
+
+    project.addBuildPhase(
+      [],
+      'PBXShellScriptBuildPhase',
+      HERMES_DSYM_PHASE_NAME,
+      appTargetUuid,
+      { shellPath: '/bin/sh', shellScript: HERMES_DSYM_SCRIPT },
+    );
+
+    console.log(
+      '[withXcode26Compat] Added "Copy Hermes dSYM into archive" build phase ' +
+        'to the app target (Fix #4 — formerly TODO 2).',
+    );
+    return config;
+  });
+
 // ── Compose ──────────────────────────────────────────────────────────────────
 
 const withXcode26Compat = (config) => {
   config = withXcode26Podfile(config);
   config = withXcode26Sandboxing(config);
   config = withXcode26EnvLocal(config);
+  config = withHermesDsymCopyPhase(config);
   return config;
 };
 

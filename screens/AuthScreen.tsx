@@ -190,28 +190,37 @@ export function AuthScreen() {
 
   // ── Validation ──────────────────────────────────────────────────────────────
   const validate = (): boolean => {
-    let ok = true;
+    const problems: string[] = [];
 
     if (mode === "sign_up" && !displayName.value.trim()) {
-      touchDisplayName(); ok = false;
+      touchDisplayName(); problems.push("your name");
     }
 
     // Email is needed for sign_in, sign_up, forgot_request only.
     if (mode === "sign_in" || mode === "sign_up" || mode === "forgot_request") {
-      if (validateEmail(email.value)) { touchEmail(); ok = false; }
+      if (validateEmail(email.value)) { touchEmail(); problems.push("a valid email address"); }
     }
 
     // Password is needed for sign_in, sign_up, reset_confirm.
     if (mode === "sign_in" || mode === "sign_up" || mode === "reset_confirm") {
-      if (validatePassword(password.value)) { touchPassword(); ok = false; }
+      if (validatePassword(password.value)) { touchPassword(); problems.push("a password of at least 8 characters"); }
     }
 
     // Confirm-password match is needed for sign_up + reset_confirm.
     if ((mode === "sign_up" || mode === "reset_confirm") && password.value !== confirm.value) {
-      touchConfirm(); ok = false;
+      touchConfirm(); problems.push("matching password confirmation");
     }
 
-    return ok;
+    if (problems.length > 0) {
+      // Surface ONE explicit banner instead of failing silently. The per-field
+      // red text alone sits below the fold and is easy to miss — which reads to
+      // the user as "the Create account button does nothing".
+      setApiError("Please check: " + problems.join(", ") + ".");
+      return false;
+    }
+
+    setApiError(null);
+    return true;
   };
 
   // ── Sign-in ─────────────────────────────────────────────────────────────────
@@ -379,7 +388,9 @@ export function AuthScreen() {
 
   // ── Submit dispatcher ─────────────────────────────────────────────────────
   const handleSubmit = useCallback(() => {
-    if (!validate()) return;
+    const ok = validate();
+    if (__DEV__) console.log(`[auth] submit mode=${mode} valid=${ok} name="${displayName.value}"`);
+    if (!ok) return;
     Haptics.selectionAsync();
 
     switch (mode) {
@@ -388,6 +399,7 @@ export function AuthScreen() {
         break;
       case "sign_up":
         // Open consent gate first
+        if (__DEV__) console.log("[auth] opening consent gate");
         setShowConsentGate(true);
         break;
       case "forgot_request":
@@ -400,7 +412,15 @@ export function AuthScreen() {
         // forgot_sent has no submit
         break;
     }
-  }, [mode, performSignIn, performForgotRequest, performResetConfirm]);
+    // NOTE: field values are in the dep array so handleSubmit always closes over
+    // a FRESH validate(). Previously only email/password were tracked (via
+    // performSignIn), so filling Display name LAST left a stale validate that
+    // saw an empty name → silent no-op with no on-screen error.
+  }, [
+    mode,
+    displayName.value, email.value, password.value, confirm.value,
+    performSignIn, performForgotRequest, performResetConfirm,
+  ]);
 
   // ── Consent gate handlers ─────────────────────────────────────────────────
   const handleConsented = useCallback((meta: ConsentMetadata) => {

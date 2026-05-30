@@ -1,7 +1,7 @@
 # iOS Local TestFlight Archive — Runbook
 
 **Authored:** May 24, 2026, after the 9-hour session that produced the first successful TestFlight build (1.0.31).
-**Status:** Working recipe. **As of 2026-05-30, the four manual Xcode 26 edits are automated by `plugins/withXcode26Compat.js`** — Phase 2 below is now mostly automatic (see the note at its head). The plugin covers Fixes #1–#3 (Fix #3 now also pins `NODE_BINARY` — Sharp Edge #5, added 2026-05-30); only the workspace-not-xcodeproj rule (Fix #4) remains a human action.
+**Status:** Working recipe. **As of 2026-05-30, the Xcode 26 edits are automated by `plugins/withXcode26Compat.js`** — Phase 2 below is now mostly automatic (see the note at its head). The plugin applies: the Podfile post_install fixes, `ENABLE_USER_SCRIPT_SANDBOXING=NO`, the `ios/.xcode.env.local` env (absolute `NODE_BINARY` — Sharp Edge #5 — plus `SENTRY_DISABLE_AUTO_UPLOAD`), and the Hermes dSYM archive copy (TODO 2). The only remaining human action is opening the `.xcworkspace` (not the `.xcodeproj`) in Xcode.
 **Audience:** Future NJ (most likely), or anyone else inheriting this project.
 
 ---
@@ -154,10 +154,27 @@ In Xcode:
 1. **Verify left sidebar shows BOTH `LexiLensStaging` AND `Pods` projects.** If you only see one, you've opened the wrong file.
 2. **Top bar:** scheme = `LexiLensStaging`, destination = "Any iOS Device (arm64)" (NOT a simulator).
 3. **Edit Scheme → Run → Info tab:** Build Configuration = `Release`.
-4. **General tab (LexiLensStaging target) → Identity:** Build = some integer higher than any previously uploaded build for `com.navinj.lexilens` on TestFlight. As of 5/24/2026, anything ≥ 30 is safe.
+4. **Build number (CFBundleVersion):** set it in **`app.config.js` → `ios.buildNumber`** BEFORE prebuild, not in Xcode. The Xcode General-tab "Build" field is wiped by the next `prebuild --clean` (ios/ is gitignored CNG), which is why a fresh-prebuild archive silently reverts to `(1)` and gets rejected by ASC as a duplicate. The value must be unique and higher than any build already uploaded for the current `version` string. (If you must fix an already-prebuilt archive without re-prebuilding, see the in-place override below.)
 5. **Signing & Capabilities tab:** "Automatically manage signing" checked, Team = Naveen Juttiga (9A8R9ZM546).
 6. **Product → Clean Build Folder** (Shift+Cmd+K). Optional but recommended on first build.
 7. **Product → Archive.** Wait 15-25 min for a clean build, 1-2 min for incremental.
+
+#### Build-number quick-fix (already prebuilt, don't want to re-prebuild)
+
+If `ios/` is already generated and you only need to correct the build number
+on an archive (e.g. it came out `(1)` and ASC will reject it as a duplicate),
+override CFBundleVersion in place and re-archive — no prebuild, no pod install:
+
+```bash
+# Locate the app Info.plist (name varies with APP_VARIANT)
+PLIST=$(find ios -maxdepth 2 -name Info.plist -path "*LexiLens*" | head -1)
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion 33" "$PLIST"
+/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$PLIST"   # confirm 33
+```
+
+Then Product → Archive again. This is a one-shot patch; still set
+`ios.buildNumber` in `app.config.js` so the value survives the next prebuild.
+
 
 ### Phase 5 — Distribute (~10-30 min)
 
@@ -173,7 +190,7 @@ When Organizer auto-opens:
 8. Upload progress ~3-10 min
 9. "Upload completed with warnings" or "Upload Successful" → **Done**
 
-If you see "Upload Symbols Failed: archive did not include a dSYM for hermes.framework" — **this is a warning, not an error**. Upload succeeded. Hermes-internal crashes won't be symbolicated in Sentry, but your JS stack traces will. Acceptable for now; see TODO list for fix.
+If you see "Upload Symbols Failed: archive did not include a dSYM for hermes.framework" — **this is a warning, not an error**. Upload succeeded. As of the `withXcode26Compat.js` Fix #4 (2026-05-30), the Hermes dSYM is copied into the archive automatically, so this warning should no longer appear from the next archive onward. If it does reappear, the dSYM wasn't found under `Pods/hermes-engine` — check the build log for a `[hermes-dsym]` line.
 
 ### Phase 6 — App Store Connect (~10-30 min wait)
 
@@ -372,9 +389,20 @@ Built and registered in `app.config.js`. Single Expo config plugin applying on e
 
 All three are idempotent (re-running prebuild never duplicates). The recipe is now: `expo prebuild → pod install → archive` (three commands; verify with Phase 3). If the Podfile anchor ever moves, Fix #1 logs a WARNING and passes through — the archive then fails with a clear modulemap error, the documented fallback being the manual Phase 2 Fix #1 edit. Fix #4 (workspace not xcodeproj) is intentionally NOT automated — it is a human action in Xcode.
 
-### TODO 2 — Hermes dSYM upload fix
+### TODO 2 — Hermes dSYM upload fix ✅ DONE 2026-05-30
 
-The "Upload Symbols Failed" warning on every archive. Fix is a build phase script that copies `Pods/hermes-engine/destroot/Library/Frameworks/universal/hermes.framework.dSYM` into the archive's dSYMs folder before Sentry's symbol upload phase runs.
+The "Upload Symbols Failed" warning on every archive. Automated by
+`withXcode26Compat.js` Fix #4 — a "Copy Hermes dSYM into archive" run-script
+build phase on the app target.
+
+**Path correction (verified against RN 0.81.5):** the prebuilt Hermes ships
+iOS as an **XCFramework**, so the dSYM is *inside* it
+(`Pods/hermes-engine/destroot/Library/Frameworks/universal/hermes.xcframework/ios-arm64/dSYMs/hermes.framework.dSYM`),
+NOT at the `universal/hermes.framework.dSYM` path noted earlier — that path
+doesn't exist. The plugin locates it with `find` (excluding the simulator
+slice, whose UUID won't match a device archive) and copies it into
+`${DWARF_DSYM_FOLDER_PATH}` during archive. Guarded so it no-ops on
+non-archive builds.
 
 Alternatively, when SENTRY_AUTH_TOKEN is configured, do the upload via `@sentry/react-native` which handles Hermes dSYM correctly.
 
