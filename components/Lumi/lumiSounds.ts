@@ -1,44 +1,81 @@
 /**
- * components/Lumi/lumiSounds.ts — v6.7
+ * components/Lumi/lumiSounds.ts — v6.10
  *
  * Sound + haptic dispatcher for the Lumi mascot.
  *
- * v6.7 CHANGES (iOS audio fix + dev diagnostics)
+ * v6.10 CHANGES (iOS Release: preloaded players were dead on arrival)
  * ─────────────────────────────────────────────────────────────────────────────
- *  1. iOS audio session now uses `playsInSilentMode: true`.
- *     Previously `false`, which respected the iOS hardware silent switch and
- *     left Lumi completely mute on any iPhone with the silent toggle flipped.
- *     For a kids' RPG where Lumi's voice IS the engagement loop, silent-switch
- *     respect is the wrong default (matches Duolingo / Khan Academy Kids /
- *     Roblox behavior). Parents who want quiet can use the in-app sound toggle
- *     (ParentDashboard) or device volume to mute, both of which still work.
+ *  WHAT v6.9 GOT RIGHT, AND WHAT IT MISSED
+ *    v6.9 correctly fixed asset *localization*: every clip is downloaded to a
+ *    file:// URI before use (see localizeAllSources below — kept). On-device
+ *    diagnostics in a Release build confirmed it: localizedSources = 23/23,
+ *    and a one-off RAW player (create → wait → play) was AUDIBLE.
  *
- *  2. Dev-only `[lumi]` diagnostic logs in init, audio-session config,
- *     player preload, and play paths. Gated on __DEV__ so prod builds are
- *     unaffected (zero log calls). Lets us trace silent-failure modes from
- *     the Metro terminal without rebuilding.
+ *    But the MODULE path stayed silent, and the diagnostic showed the smoking
+ *    gun: of the 23 players preloaded at startup, durationsKnown = 0 — i.e.
+ *    NONE of them ever finished loading their audio, despite being created at
+ *    app boot with ample time. A single fresh on-demand player loads in
+ *    ~350ms; 23 created in a synchronous loop at cold start all stay unloaded.
  *
- * v6.6 CHANGES (sequencing, preserved)
- * ─────────────────────────────────────────────────────────────────────────────
- *  - SFX→Voice sequential (measured duration + 60ms gap, not fixed 400ms)
- *  - Voice picker emits spoken text to subscribers
- *  - Pending voice cancelled on rapid state changes
+ *  ROOT CAUSE
+ *    Batch-creating ~two dozen expo-audio players (each backing an iOS
+ *    AVPlayerItem) in one tight startup loop leaves them in a non-loaded
+ *    state — iOS does not ready that many concurrent items created that way,
+ *    and they never recover. The RAW test worked precisely because it did the
+ *    one thing the module didn't: create a SINGLE player on demand and play it.
+ *
+ *  FIX — replicate the proven RAW pattern: LAZY, ON-DEMAND PLAYERS
+ *    • No players are created at startup anymore. Startup only LOCALIZES the
+ *      sources (cheap; just materializes bundled assets to file:// URIs).
+ *    • A player is created the first time a cue actually plays, from its
+ *      localized URI — exactly the configuration proven audible on-device.
+ *    • Players are retained and REUSED on subsequent plays (instant), capped at
+ *      MAX_LIVE_PLAYERS via LRU eviction so we never hold a large pool of live
+ *      AVPlayerItems again. Evicted players are release()'d.
+ *    • Playback waits for `player.isLoaded` (the real readiness flag) before
+ *      starting, so a freshly-created player is audible on its first play.
+ *    • The audio session is re-asserted (debounced) right before play — the
+ *      RAW path's setAudioModeAsync-then-play ordering — as cheap insurance
+ *      against a session that went inactive while idle.
+ *
+ *  CROSS-PLATFORM
+ *    Identical, safe on Android. Lazy creation from a localized file URI is the
+ *    same path Android already handled; reducing the live-player count only
+ *    helps. No native changes — JS-only, OTA-eligible.
+ *
+ * ── carried forward from v6.9 ─────────────────────────────────────────────────
+ *  Asset localization via Asset.fromModule(...).downloadAsync() before playback
+ *  (so iOS AVPlayer can infer the mp3 type from a real file:// extension).
+ *
+ * ── carried forward from v6.7 ─────────────────────────────────────────────────
+ *  iOS audio session uses `playsInSilentMode: true` so Lumi is heard with the
+ *  hardware ringer off (kids' app; the in-app sound toggle is the mute control,
+ *  not the silent switch). Dev-only `[lumi]` diagnostics, gated on __DEV__.
+ *
+ * ── carried forward from v6.6 ─────────────────────────────────────────────────
+ *  SFX→Voice sequential (measured duration + gap; scan uses a fixed offset).
+ *  Voice picker emits spoken text to subscribers; pending voice cancelled on
+ *  rapid state changes.
  *
  * BACK-COMPAT
  * ─────────────────────────────────────────────────────────────────────────────
- *   Public API surface is unchanged. `playLumiForState(state)` still works
- *   from existing call sites; `subscribeLumiText` is additive.
- *   `LumiSoundKey` types unchanged.
+ *   Public API surface is unchanged. `lumiAudioStatus()` keeps every field; the
+ *   numbers now reflect the lazy model:
+ *     • playersLoaded   — LIVE retained players (0 at boot is now CORRECT;
+ *                         grows as cues play, capped at MAX_LIVE_PLAYERS)
+ *     • localizedSources— clips materialized to file:// at init (the real
+ *                         "did this build run the fix" signal; expect = cues)
+ *     • durationsKnown  — retained players that have reported a duration
  */
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Haptics from 'expo-haptics';
+import { Asset } from 'expo-asset';
 import type { LumiState } from './lumiTypes';
 import { LUMI_SOUND_ASSETS } from './lumiSoundAssets';
 import { getVoiceText } from './lumiVoiceManifest';
 
 // expo-audio is optional — module degrades cleanly if absent.
-// (Same pattern as v6.5 — don't change the resolution path.)
 let audio: any = null;
 try {
   // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
@@ -48,9 +85,6 @@ try {
 }
 
 // ─── Dev logger (no-op in prod) ───────────────────────────────────────────────
-// __DEV__ is replaced with `true` by Metro in dev, `false` in prod. The
-// dead-code elimination at minify strips these calls entirely from the
-// release bundle.
 const dlog = (...args: unknown[]): void => {
   if (__DEV__) {
     // eslint-disable-next-line no-console
@@ -99,15 +133,40 @@ const SOUND_POOLS: Record<PoolName, LumiSoundKey[]> = {
 const KEY_SOUND   = 'lexilens.lumi.soundEnabled';
 const KEY_HAPTICS = 'lexilens.lumi.hapticsEnabled';
 
+// ─── Tuning ───────────────────────────────────────────────────────────────────
+
+// Max simultaneously-retained players. Cues fire at most 2 at once (lead SFX +
+// voice); 6 gives generous reuse headroom while keeping live AVPlayerItems far
+// below any iOS concurrency ceiling — the thing that killed the old 23-at-boot
+// pool. Least-recently-used players beyond this are release()'d.
+const MAX_LIVE_PLAYERS = 6;
+
+// Re-assert the audio session at most this often (ms). The RAW test's
+// distinguishing trait was setAudioModeAsync immediately before play; we
+// replicate that, debounced, so rapid cues don't thrash the session.
+const SESSION_REASSERT_DEBOUNCE_MS = 1500;
+
+// First-play readiness polling. A freshly-created player may not be loaded the
+// instant we want to play it; we check isLoaded at these offsets and play the
+// moment it's ready, with a final forced attempt so we never swallow a cue.
+const READY_POLL_MS = [0, 60, 150, 320, 650, 1100];
+
 // ─── Module state ─────────────────────────────────────────────────────────────
 
-let _initialized   = false;
-let _soundEnabled  = true;   // default ON (v6.5 flipped this from OFF)
+let _initialized    = false;
+let _soundEnabled   = true;   // default ON (v6.5 flipped this from OFF)
 let _hapticsEnabled = true;
 
+/** Live, retained players (lazy — created on first play, reused after). */
 const _players: Partial<Record<LumiSoundKey, any>> = {};
-/** Measured duration in ms for each preloaded clip. 0 if unknown. */
+/** Localized file:// URI per cue, populated at init. */
+const _localUriByKey: Partial<Record<LumiSoundKey, string>> = {};
+/** Measured duration in ms per cue. 0/absent if unknown. */
 const _durationsMs: Partial<Record<LumiSoundKey, number>> = {};
+/** Most-recently-used last → eviction takes from the front. */
+const _lru: LumiSoundKey[] = [];
+/** Timestamp of last successful setAudioModeAsync (debounce gate). */
+let _lastSessionAssertMs = 0;
 
 const assets = LUMI_SOUND_ASSETS;
 
@@ -139,28 +198,18 @@ function pickFromPool(pool: PoolName): LumiSoundKey | null {
   return choice;
 }
 
-/**
- * Look up a preloaded clip's duration. Returns the measured value, or a
- * conservative default if the player never reported one (older API, or
- * preload failed silently).
- */
 function getClipDurationMs(key: LumiSoundKey, fallback: number): number {
   const d = _durationsMs[key];
   if (typeof d === 'number' && d > 0) return d;
   return fallback;
 }
 
-/**
- * Notify subscribers (LumiMascot) what Lumi is *currently* saying out loud.
- * Pass null to clear the bubble (e.g. on cancel / silence).
- */
 function emitText(text: string | null): void {
   for (const fn of _textListeners) {
     try { fn(text); } catch { /* no-op */ }
   }
 }
 
-/** Cancel any pending voice timer and stop any running voice clip. */
 function cancelPendingVoice(): void {
   if (_pendingVoiceTimer) {
     clearTimeout(_pendingVoiceTimer);
@@ -187,26 +236,11 @@ const STATE_TO_POOL: Partial<Record<LumiState, PoolName>> = {
   'boss-help':     'boss_hint',
 };
 
-// Gap between SFX end and voice start — gives the SFX tail a moment to
-// breathe before Lumi starts talking. Too short = abrupt. Too long = dead air.
 const SFX_VOICE_GAP_MS = 60;
 
-// v6.8 — scanning state uses a fixed delay from CHIME START instead of
-// SFX-duration + gap. The reason: the scan chime fades out over its tail,
-// so the perceived end of the chime is well before its file duration ends.
-// Stacking voice at file-end+60ms felt cramped on top of the trailing
-// shimmer.
-//
-// 2500ms = chime peaks at ~600ms, fades through ~1.5s, then a beat of
-// silence before voice. Tuned by ear on Android XR. If user reports
-// "still feels too soon", push to 3000. If "too long, feels broken",
-// drop to 2000. The current Gemini-default evaluate latency is ~3s, so
-// going beyond 3500 risks voice firing AFTER the verdict card lands —
-// which would feel like a bug, not a gentler beat.
+// v6.8 — scanning state uses a fixed delay from CHIME START. See history.
 const SCAN_VOICE_DELAY_FROM_CHIME_START_MS = 2500;
 
-// Conservative fallback when player.duration is unknown (older API, etc).
-// Slightly longer than the spec'd ~800ms SFX so we never overlap by accident.
 const SCAN_SFX_FALLBACK_MS   = 950;
 const APPEAR_SFX_FALLBACK_MS = 320;
 const SLEEP_SFX_FALLBACK_MS  = 700;
@@ -253,23 +287,28 @@ export async function initLumiSounds(): Promise<void> {
     // fail-safe: defaults stand
   }
 
-  dlog('initLumiSounds: persisted prefs loaded, soundEnabled =', _soundEnabled, 'hapticsEnabled =', _hapticsEnabled);
+  dlog('initLumiSounds: prefs loaded, soundEnabled =', _soundEnabled, 'hapticsEnabled =', _hapticsEnabled);
 
   if (_soundEnabled) {
-    await configureLumiAudioSession();
-    preloadPlayers();
-    dlog('initLumiSounds: done. Players loaded =', Object.keys(_players).length, '/ expected =', Object.keys(assets).length);
+    await ensureSessionActive(true);
+    await localizeAllSources();
+    dlog(
+      'initLumiSounds: done. localized =', Object.keys(_localUriByKey).length,
+      '/ expected =', Object.keys(assets).length,
+      '(players are created lazily on first play)',
+    );
   } else {
-    dlog('initLumiSounds: sound disabled by prefs — skipping audio session config and preload');
+    dlog('initLumiSounds: sound disabled by prefs — skipping session + localization');
   }
 }
 
 export async function setLumiSoundEnabled(on: boolean): Promise<void> {
   _soundEnabled = on;
   try { await AsyncStorage.setItem(KEY_SOUND, JSON.stringify(on)); } catch {}
-  if (on && Object.keys(_players).length === 0) {
-    await configureLumiAudioSession();
-    preloadPlayers();
+  if (on) {
+    // Make sure sources are localized + session live; players still lazy.
+    await ensureSessionActive(true);
+    if (Object.keys(_localUriByKey).length === 0) await localizeAllSources();
   }
 }
 export async function setLumiHapticsEnabled(on: boolean): Promise<void> {
@@ -280,47 +319,24 @@ export function isLumiSoundEnabled():   boolean { return _soundEnabled; }
 export function isLumiHapticsEnabled(): boolean { return _hapticsEnabled; }
 export function isLumiAudioAvailable(): boolean { return audio !== null; }
 
-/**
- * Subscribe to "what Lumi is currently speaking" events.
- * LumiMascot uses this to keep the speech bubble in sync with the voice clip
- * actually playing through expo-audio.
- *
- * Returns an unsubscribe function (call it on component unmount).
- */
 export function subscribeLumiText(listener: TextListener): () => void {
   _textListeners.add(listener);
   return () => { _textListeners.delete(listener); };
 }
 
-/**
- * Fire the sound + haptic mapped to a Lumi state.
- *
- * v6.6 sequencing:
- *   1. Haptic fires immediately (silent — never opt-in gated)
- *   2. Lead SFX (if any) plays immediately
- *   3. Voice clip (if any) is scheduled at SFX_DURATION + gap, NOT at a
- *      fixed 400ms
- *   4. When the voice clip plays, the matching phrase from lumiVoiceManifest
- *      is emitted to subscribers (bubble syncs)
- *   5. Any prior pending voice is cancelled so rapid state changes don't
- *      stack
- */
+/** Fire the sound + haptic mapped to a Lumi state. (Sequencing unchanged.) */
 export function playLumiForState(state: LumiState): void {
-  // Bump token — late-arriving timers from prior calls will no-op.
   _sequenceToken += 1;
   const myToken = _sequenceToken;
 
-  // Cancel any voice still pending from a previous call.
   cancelPendingVoice();
 
-  // Haptics ALWAYS try (they're not opt-in gated)
   if (_hapticsEnabled) {
     const fn = STATE_TO_HAPTIC[state];
     if (fn) { try { void fn(); } catch { /* no-op */ } }
   }
 
   if (!_soundEnabled || !audio) {
-    // Sound off → also clear any stale bubble text
     emitText(null);
     return;
   }
@@ -333,11 +349,9 @@ export function playLumiForState(state: LumiState): void {
 
   if (!poolKey) return;
 
-  // Resolve text NOW (before async wait) so we can emit it in sync with audio.
   const text = getVoiceText(poolKey);
 
   const fireVoice = () => {
-    // Was this dispatch superseded mid-wait? If so, do nothing.
     if (myToken !== _sequenceToken) return;
     playSoundKey(poolKey);
     if (text != null) emitText(text);
@@ -345,17 +359,12 @@ export function playLumiForState(state: LumiState): void {
   };
 
   if (leadSfx) {
-    // v6.8 — for the scan chime specifically, voice fires at a fixed offset
-    // from chime START (not chime END + gap). The chime fades over its tail
-    // and stacking the voice right at file-end felt cramped. Other SFX
-    // (appear, sleep, cheer) still use the original duration-aware path.
     const waitMs =
       leadSfx === 'scan'
         ? SCAN_VOICE_DELAY_FROM_CHIME_START_MS
         : getClipDurationMs(leadSfx, fallbackForSfx(leadSfx)) + SFX_VOICE_GAP_MS;
     _pendingVoiceTimer = setTimeout(fireVoice, waitMs);
   } else {
-    // No lead SFX → voice plays immediately
     fireVoice();
   }
 }
@@ -377,133 +386,219 @@ export function playLumiGreeting(): void {
 
 // ─── Internals ────────────────────────────────────────────────────────────────
 
-async function configureLumiAudioSession(): Promise<void> {
+/**
+ * Idempotent-ish audio-session activation. Re-asserts setAudioModeAsync at most
+ * once per SESSION_REASSERT_DEBOUNCE_MS (or always when force=true). Models the
+ * RAW path's "configure session right before play" — the trait that made the
+ * one-off RAW player audible — without thrashing the session on rapid cues.
+ */
+async function ensureSessionActive(force = false): Promise<void> {
   if (!audio?.setAudioModeAsync) {
-    dwarn('configureLumiAudioSession: setAudioModeAsync not exported by expo-audio — skipping');
+    if (force) dwarn('ensureSessionActive: setAudioModeAsync not exported — skipping');
     return;
   }
+  const now = Date.now();
+  if (!force && now - _lastSessionAssertMs < SESSION_REASSERT_DEBOUNCE_MS) return;
   try {
     await audio.setAudioModeAsync({
-      // v6.7: override iOS silent switch. Lumi is the engagement loop;
-      // a kid (or parent) using the in-app mute is the right control surface,
-      // not the hardware toggle. Matches Duolingo / Khan Academy Kids / Roblox.
       playsInSilentMode:           true,
       interruptionMode:            'mixWithOthers',
       shouldPlayInBackground:      false,
       shouldRouteThroughEarpiece:  false,
     });
-    dlog('configureLumiAudioSession: setAudioModeAsync OK (playsInSilentMode: true)');
+    _lastSessionAssertMs = Date.now();
+    dlog('ensureSessionActive: setAudioModeAsync OK (playsInSilentMode: true)');
   } catch (err) {
-    dwarn('configureLumiAudioSession: setAudioModeAsync threw —', err);
-    // Non-fatal
+    dwarn('ensureSessionActive: setAudioModeAsync threw —', err);
   }
-}
-
-function preloadPlayers(): void {
-  if (!audio?.createAudioPlayer) {
-    dwarn('preloadPlayers: createAudioPlayer not exported by expo-audio — skipping');
-    return;
-  }
-  let loaded = 0;
-  let skipped = 0;
-  for (const [key, asset] of Object.entries(assets)) {
-    if (_players[key as LumiSoundKey]) continue;
-    if (asset == null) { skipped += 1; continue; }
-    try {
-      const player = audio.createAudioPlayer(asset);
-      // Make sure each cue is a one-shot
-      if (typeof player?.setIsLoopingAsync === 'function') {
-        try { player.setIsLoopingAsync(false); } catch {}
-      }
-      _players[key as LumiSoundKey] = player;
-
-      // Capture duration as soon as it's available. expo-audio reports it on
-      // `player.duration` (seconds, sometimes via status update). We try
-      // multiple paths and fall back to silent if none work.
-      tryCaptureDuration(key as LumiSoundKey, player);
-      loaded += 1;
-    } catch (err) {
-      dwarn('preloadPlayers: failed to create player for', key, '—', err);
-      // skip this cue, keep going
-    }
-  }
-  dlog('preloadPlayers: loaded =', loaded, 'skipped (null asset) =', skipped);
 }
 
 /**
- * Capture clip duration into _durationsMs. expo-audio exposes `duration` on
- * the player (in seconds, becomes valid once asset metadata loads). On older
- * expo-av (createSound), duration comes via `getStatusAsync().durationMillis`.
- * Either path is fine — we tolerate either, or none (fallback constants).
+ * Localize every bundled clip to a file:// URI (v6.9 fix, retained). This is
+ * the ONLY audio work done at startup now — it's cheap (asset copy, not
+ * AVPlayerItem creation) and makes lazy player creation fast + release-safe.
+ * NO players are created here. That batch was what broke iOS Release.
  */
-function tryCaptureDuration(key: LumiSoundKey, player: any): void {
-  // Polling: expo-audio populates player.duration shortly after creation.
-  // Two checks at 250ms and 1000ms cover the common load times without
-  // requiring an event subscription that may not fire on iOS bridgeless.
-  const captureNow = () => {
+async function localizeAllSources(): Promise<void> {
+  await Promise.all(
+    Object.entries(assets).map(async ([key, asset]) => {
+      if (asset == null) return;
+      try {
+        const a = Asset.fromModule(asset as number);
+        if (!a.localUri) await a.downloadAsync();
+        if (a.localUri) _localUriByKey[key as LumiSoundKey] = a.localUri;
+      } catch (err) {
+        dwarn('localizeAllSources: failed for', key, '—', err);
+        // Non-fatal — getOrCreatePlayer falls back to the raw module.
+      }
+    }),
+  );
+  dlog('localizeAllSources: localized', Object.keys(_localUriByKey).length, 'of', Object.keys(assets).length);
+}
+
+/** Move a key to MRU position. */
+function touchLru(key: LumiSoundKey): void {
+  const i = _lru.indexOf(key);
+  if (i !== -1) _lru.splice(i, 1);
+  _lru.push(key);
+}
+
+/** Release the least-recently-used idle player(s) until under the cap. */
+function evictIfNeeded(): void {
+  while (_lru.length > MAX_LIVE_PLAYERS) {
+    // Find the oldest player that isn't currently playing.
+    let victimIdx = -1;
+    for (let i = 0; i < _lru.length; i++) {
+      const k = _lru[i];
+      const p = _players[k];
+      if (!p || !p.playing) { victimIdx = i; break; }
+    }
+    if (victimIdx === -1) break; // everything live is playing — let it ride
+    const victim = _lru.splice(victimIdx, 1)[0];
+    const p = _players[victim];
+    try { p?.release?.(); } catch { /* no-op */ }
+    delete _players[victim];
+    dlog('evictIfNeeded: released player', victim, '→ live =', _lru.length);
+  }
+}
+
+/**
+ * Lazily create (or reuse) the player for a cue. Creation mirrors the proven
+ * RAW path: a single player from a localized file:// URI. Retained for reuse;
+ * subject to LRU eviction.
+ */
+function getOrCreatePlayer(key: LumiSoundKey): any | null {
+  const existing = _players[key];
+  if (existing) {
+    touchLru(key);
+    return existing;
+  }
+  if (!audio?.createAudioPlayer) {
+    dwarn('getOrCreatePlayer: createAudioPlayer not exported');
+    return null;
+  }
+
+  const localUri = _localUriByKey[key];
+  const rawModule = assets[key] as number | undefined;
+  if (!localUri && rawModule == null) {
+    dwarn('getOrCreatePlayer: no source for', key);
+    return null;
+  }
+  const source = localUri ? { uri: localUri } : rawModule;
+
+  try {
+    const player = audio.createAudioPlayer(source);
+    try { if (player && 'loop' in player) player.loop = false; } catch {}
+    try { if (player && 'volume' in player) player.volume = 1.0; } catch {}
+
+    _players[key] = player;
+    touchLru(key);
+    evictIfNeeded();
+
+    attachDurationCapture(key, player);
+    dlog('getOrCreatePlayer: created', key, '(localized =', !!localUri, ') live =', _lru.length);
+    return player;
+  } catch (err) {
+    dwarn('getOrCreatePlayer: create failed for', key, '—', err);
+    return null;
+  }
+}
+
+/**
+ * Capture duration into _durationsMs as soon as the player reports it. Prefers
+ * the playbackStatusUpdate event; falls back to a couple of polls of
+ * player.duration. Purely for SFX→voice timing + diagnostics; never blocks play.
+ */
+function attachDurationCapture(key: LumiSoundKey, player: any): void {
+  const set = (secs: unknown) => {
+    if (typeof secs === 'number' && secs > 0) _durationsMs[key] = Math.round(secs * 1000);
+  };
+  try {
+    if (typeof player?.addListener === 'function') {
+      const sub = player.addListener('playbackStatusUpdate', (st: any) => {
+        if (st?.duration > 0) {
+          set(st.duration);
+          try { sub?.remove?.(); } catch { /* no-op */ }
+        }
+      });
+    }
+  } catch { /* fall through to polling */ }
+
+  const poll = () => { if (!_durationsMs[key]) set(player?.duration); };
+  setTimeout(poll, 250);
+  setTimeout(poll, 1000);
+}
+
+/**
+ * Play a loaded player from the start; if not yet loaded, wait for readiness
+ * (the RAW test's behavior) then play — with a final forced attempt so a cue is
+ * never silently dropped.
+ */
+function playWhenReady(key: LumiSoundKey, player: any): void {
+  let done = false;
+
+  const start = () => {
+    if (done) return;
+    done = true;
     try {
-      // expo-audio (new): seconds → ms
-      if (typeof player?.duration === 'number' && player.duration > 0) {
-        _durationsMs[key] = Math.round(player.duration * 1000);
-        return true;
-      }
-      // expo-av (old): getStatusAsync → durationMillis
-      if (typeof player?.getStatusAsync === 'function') {
-        // Don't await — fire and forget; we'll poll again
-        player.getStatusAsync().then((st: any) => {
-          if (st?.durationMillis > 0) _durationsMs[key] = st.durationMillis;
-        }).catch(() => { /* ignore */ });
-      }
-    } catch { /* ignore */ }
-    return false;
+      // Restart from 0 for reused players (fresh ones are already at 0).
+      if (typeof player.seekTo === 'function') { player.seekTo(0); }
+      else if (typeof player.currentTime === 'number') { player.currentTime = 0; }
+    } catch { /* non-fatal */ }
+    try {
+      player.play();
+      dlog('playWhenReady:', key, '→ play()');
+    } catch (err) {
+      dwarn('playWhenReady:', key, '→ play() threw —', err);
+    }
   };
 
-  if (!captureNow()) {
-    setTimeout(captureNow, 250);
-    setTimeout(captureNow, 1000);
-  }
+  // Already loaded → go now.
+  if (player?.isLoaded) { start(); return; }
+
+  // Otherwise poll readiness; play the moment it's loaded.
+  READY_POLL_MS.forEach((ms, idx) => {
+    setTimeout(() => {
+      if (done) return;
+      if (player?.isLoaded || idx === READY_POLL_MS.length - 1) start();
+    }, ms);
+  });
 }
 
 function playSoundKey(key: LumiSoundKey): void {
-  const player = _players[key];
-  if (!player) {
-    dwarn('playSoundKey: no player for', key, '— preload may have failed');
-    return;
-  }
-  try {
-    if (typeof player.seekTo === 'function')                 player.seekTo(0);
-    else if (typeof player.setPositionAsync === 'function')  player.setPositionAsync(0);
-
-    if (typeof player.play === 'function') {
-      player.play();
-      dlog('playSoundKey:', key, '→ play() called');
-    } else if (typeof player.playAsync === 'function') {
-      player.playAsync();
-      dlog('playSoundKey:', key, '→ playAsync() called');
-    } else {
-      dwarn('playSoundKey:', key, '— neither play() nor playAsync() available on player');
+  if (!_soundEnabled || !audio) return;
+  // Async so we can re-assert the session before play (RAW-path ordering)
+  // without blocking the synchronous dispatch in playLumiForState.
+  (async () => {
+    try {
+      await ensureSessionActive(false);
+      const player = getOrCreatePlayer(key);
+      if (!player) { dwarn('playSoundKey: no player for', key); return; }
+      playWhenReady(key, player);
+    } catch (err) {
+      dwarn('playSoundKey:', key, '— threw —', err);
     }
-  } catch (err) {
-    dwarn('playSoundKey:', key, '— threw —', err);
-    // soft-fail
-  }
+  })();
 }
 
-/** Diagnostics for ParentDashboard. */
+/** Diagnostics for ParentDashboard / LumiAudioDiagnostics. */
 export function lumiAudioStatus(): {
-  audioAvailable: boolean;
-  soundEnabled:   boolean;
-  hapticsEnabled: boolean;
-  playersLoaded:  number;
-  durationsKnown: number;
-  expectedCues:   number;
+  audioAvailable:   boolean;
+  soundEnabled:     boolean;
+  hapticsEnabled:   boolean;
+  playersLoaded:    number;
+  localizedSources: number;
+  durationsKnown:   number;
+  expectedCues:     number;
 } {
   return {
-    audioAvailable: audio !== null,
-    soundEnabled:   _soundEnabled,
-    hapticsEnabled: _hapticsEnabled,
-    playersLoaded:  Object.keys(_players).length,
-    durationsKnown: Object.keys(_durationsMs).length,
-    expectedCues:   Object.keys(assets).length,
+    audioAvailable:   audio !== null,
+    soundEnabled:     _soundEnabled,
+    hapticsEnabled:   _hapticsEnabled,
+    // Live retained players (lazy). 0 at boot is expected; grows as cues play.
+    playersLoaded:    Object.keys(_players).length,
+    localizedSources: Object.keys(_localUriByKey).length,
+    durationsKnown:   Object.keys(_durationsMs).length,
+    expectedCues:     Object.keys(assets).length,
   };
 }
