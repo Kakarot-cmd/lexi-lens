@@ -496,7 +496,7 @@ function buildPortfolioHtml(data: PortfolioData): string {
   <!-- FOOTER                                              -->
   <!-- ═══════════════════════════════════════════════════ -->
   <div class="footer">
-    <strong style="color:#d97706;">⚔️ Lexi-Lens RPG</strong>
+    <strong style="color:#d97706;">⚔️ Skanlore</strong>
     &nbsp;·&nbsp; Verified Vocabulary Portfolio
     &nbsp;·&nbsp; Generated ${genDate}<br/>
     <span style="margin-top:3px;display:block;">

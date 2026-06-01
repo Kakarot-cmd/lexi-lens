@@ -455,7 +455,7 @@ function reasonCopy(reason: string): string {
     case "parent-dashboard":
       return "Take your child's adventure further with the full Premium experience.";
     default:
-      return "Unlock the full Lexi-Lens adventure for your child.";
+      return "Unlock the full Skanlore adventure for your child.";
   }
 }
 

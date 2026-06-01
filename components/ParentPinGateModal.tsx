@@ -235,7 +235,7 @@ function ForgotPinView({
     <View style={styles.forgotWrap}>
       <Text style={styles.forgotTitle}>Confirm your identity</Text>
       <Text style={styles.forgotSub}>
-        Enter your Lexi-Lens account password to reset your PIN.
+        Enter your Skanlore account password to reset your PIN.
       </Text>
 
       <Text style={styles.emailLabel}>{parentEmail}</Text>

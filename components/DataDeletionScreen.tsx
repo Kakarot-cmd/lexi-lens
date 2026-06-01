@@ -219,7 +219,7 @@ function ReasonStep({
     <>
       <Text style={styles.stepTitle}>Why are you leaving?</Text>
       <Text style={styles.stepBody}>
-        Completely optional. Your feedback helps us improve Lexi-Lens for
+        Completely optional. Your feedback helps us improve Skanlore for
         other families. You can skip this step.
       </Text>
 

@@ -251,7 +251,7 @@ function DiagnosticFallback({ fault }: { fault: Fault }) {
   return (
     <View style={styles.root}>
       <View style={styles.banner}>
-        <Text style={styles.title}>LEXI-LENS — DIAGNOSTIC FALLBACK</Text>
+        <Text style={styles.title}>SKANLORE — DIAGNOSTIC FALLBACK</Text>
         <Text style={styles.subtitle}>{SAFETY_NET_VERSION} · production app did not mount cleanly</Text>
       </View>
 

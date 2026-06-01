@@ -93,7 +93,7 @@ const P = {
 const STEPS = [
   {
     title: "Your Magic Lens",
-    body:  "Point your camera at anything around you — a chair, a cup, a leaf. Lexi-Lens spots it and builds a quest just for that object.",
+    body:  "Point your camera at anything around you — a chair, a cup, a leaf. Skanlore spots it and builds a quest just for that object.",
     cta:   "Show me →",
   },
   {

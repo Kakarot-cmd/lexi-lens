@@ -67,7 +67,7 @@ function getBannerText(
       // v3.1 — show what ML Kit currently sees
       return liveLabel ? `I see: ${liveLabel}` : "Point at an object";
     case "converting":
-      return "Focusing the Lexi-Lens…";
+      return "Focusing the lens…";
     case "looking-up":
       // v6.2 Phase 2 — CC1 in flight. Bridge copy that points to "I'm
       // figuring out what this is" without naming the underlying step.

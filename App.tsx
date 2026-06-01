@@ -166,7 +166,7 @@ function ScanPlaceholder() {
   return (
     <View style={{ flex: 1, alignItems: "center", justifyContent: "center", padding: 32 }}>
       <Text style={{ fontSize: 18, color: "#7c3aed", textAlign: "center" }}>
-        Camera scanning is only available on iOS and Android. Try Lexi-Lens on a phone or tablet.
+        Camera scanning is only available on iOS and Android. Try Skanlore on a phone or tablet.
       </Text>
     </View>
   );

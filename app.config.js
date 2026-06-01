@@ -137,19 +137,19 @@ const VARIANT = (process.env.APP_VARIANT ?? 'development').trim();
 
 const IDENTIFIERS = {
   production: {
-    name:               'Lexi-Lens',
+    name:               'Skanlore',
     iosBundle:          'com.navinj.lexilens',
     androidPackage:     'com.navinj.lexilore',
     scheme:             'lexilens',
   },
   staging: {
-    name:               'Lexi-Lens (Staging)',
+    name:               'Skanlore (Staging)',
     iosBundle:          'com.navinj.lexilens',
     androidPackage:     'com.navinj.lexilore',
     scheme:             'lexilensstaging',
   },
   development: {
-    name:               'Lexi-Lens (Dev)',
+    name:               'Skanlore (Dev)',
     iosBundle:          'com.navinj.lexilens.dev',
     androidPackage:     'com.navinj.lexilore.dev',
     scheme:             'lexilensdev',
@@ -199,14 +199,14 @@ export default {
       },
       infoPlist: {
         NSCameraUsageDescription:
-          'Lexi-Lens uses your camera to scan real-world objects and bring vocabulary quests to life.',
+          'Skanlore uses your camera to scan real-world objects and bring vocabulary quests to life.',
         // Apple ITMS-90683 preempt. Bundled library references location APIs.
         // Lexi-Lens does not actually use location → no user prompt.
         NSLocationWhenInUseUsageDescription:
-          'Lexi-Lens does not use your location. This declaration is required by a bundled library and the API is never actually called.',
+          'Skanlore does not use your location. This declaration is required by a bundled library and the API is never actually called.',
         // Defensive — expo-audio iOS may probe AVAudioSession.
         NSMicrophoneUsageDescription:
-          'Lexi-Lens does not record audio. This declaration is required by a bundled audio library and the API is never actually called.',
+          'Skanlore does not record audio. This declaration is required by a bundled audio library and the API is never actually called.',
         ITSAppUsesNonExemptEncryption: false,
       },
     },

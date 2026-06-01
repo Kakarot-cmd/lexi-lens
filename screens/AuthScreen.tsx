@@ -502,7 +502,7 @@ export function AuthScreen() {
           {/* ── Wordmark ──────────────────────────────────── */}
           <View style={styles.wordmark}>
             <Text style={styles.wordmarkEmoji}>📚</Text>
-            <Text style={styles.wordmarkTitle}>Lexi-Lens</Text>
+            <Text style={styles.wordmarkTitle}>Skanlore</Text>
             <Text style={styles.wordmarkSub}>Vocabulary quests for curious kids</Text>
           </View>
 
@@ -729,7 +729,7 @@ export function AuthScreen() {
             <View style={styles.toggleRow}>
               {mode === "sign_in" && (
                 <>
-                  <Text style={styles.toggleText}>New to Lexi-Lens?</Text>
+                  <Text style={styles.toggleText}>New to Skanlore?</Text>
                   <TouchableOpacity onPress={() => switchMode("sign_up")}>
                     <Text style={styles.toggleLink}>Create account</Text>
                   </TouchableOpacity>
@@ -764,7 +764,7 @@ export function AuthScreen() {
               Privacy Policy
             </Text>
             .{"\n"}
-            Lexi-Lens complies with COPPA — no personal data is collected from children.
+            Skanlore complies with COPPA — no personal data is collected from children.
           </Text>
         </ScrollView>
       </KeyboardAvoidingView>

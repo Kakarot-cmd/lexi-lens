@@ -362,7 +362,7 @@ function buildFallbackSummary(
   const recent      = words.slice(-2).map(w => w.word).join(" and ");
 
   if (words.length === 0) {
-    return `${child.display_name} is just beginning their vocabulary journey with Lexi-Lens RPG. Every great lexicon starts with the first word — exciting progress is ahead.`;
+    return `${child.display_name} is just beginning their vocabulary journey with Skanlore. Every great lexicon starts with the first word — exciting progress is ahead.`;
   }
 
   const masteryNote = expertCount > 0

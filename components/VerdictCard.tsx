@@ -315,7 +315,7 @@ function ReportSheet({
               <Text style={reportStyles.successEmoji}>✦</Text>
               <Text style={reportStyles.successTitle}>Thanks — report sent</Text>
               <Text style={reportStyles.successBody}>
-                We'll review this verdict to make Lexi-Lens better.
+                We'll review this verdict to make Skanlore better.
               </Text>
               <TouchableOpacity
                 style={reportStyles.doneBtn}

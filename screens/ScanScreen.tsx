@@ -344,7 +344,7 @@ function QuestIntro({
         onPress={onBegin}
       >
         <Text style={styles.beginBtnText}>
-          {isHardMode ? "⚔ Begin Hard Mode" : "Open Lexi-Lens ✦"}
+          {isHardMode ? "⚔ Begin Hard Mode" : "Begin Scan ✦"}
         </Text>
       </TouchableOpacity>
     </Animated.View>
@@ -772,7 +772,7 @@ export function ScanScreen({ route, navigation }: Props) {
         <Text style={{ fontSize: 48, marginBottom: 16 }}>📷</Text>
         <Text style={styles.permText}>Camera access needed</Text>
         <Text style={{ color: "#a78bfa", fontSize: 14, textAlign: "center", lineHeight: 22, marginBottom: 24 }}>
-          Lexi-Lens needs camera access to scan objects for your quest.
+          Skanlore needs camera access to scan objects for your quest.
         </Text>
         <TouchableOpacity
           onPress={requestPermission}

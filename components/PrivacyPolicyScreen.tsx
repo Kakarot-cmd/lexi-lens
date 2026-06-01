@@ -63,7 +63,7 @@ const SECTIONS: PolicySection[] = [
     id:    "who",
     emoji: "👋",
     title: "Who we are",
-    body: `Lexi-Lens is an augmented-reality vocabulary game built for children aged 5–12. The app is operated by the Lexi-Lens developer team ("we", "us", "our").
+    body: `Skanlore is a camera-based vocabulary game built for children aged 5–12. The app is operated by the Skanlore developer team ("we", "us", "our").
 
 We take children's privacy very seriously. We comply fully with the Children's Online Privacy Protection Act (COPPA), the provisions of the EU General Data Protection Regulation that apply to children (GDPR-K), and the requirements of the Google Play "Designed for Families" programme and Apple App Store Kids category.
 
@@ -238,7 +238,7 @@ VULNERABILITY DISCLOSURE: If you discover a security issue, please email securit
     id:    "children",
     emoji: "👧🧒",
     title: "Special note on children's data",
-    body: `Lexi-Lens is specifically designed for children aged 5–12, which means we apply the strictest possible data practices:
+    body: `Skanlore is specifically designed for children aged 5–12, which means we apply the strictest possible data practices:
 
 • We do not allow children to create their own accounts. Only a parent or guardian may create an account and add child profiles.
 
@@ -361,7 +361,7 @@ export function PrivacyPolicyScreen({ onClose }: Props) {
 
         <Text style={styles.footer}>
           This privacy policy is effective as of April 2025 and applies to all
-          users of the Lexi-Lens mobile application on iOS and Android.{"\n"}
+          users of the Skanlore mobile application on iOS and Android.{"\n"}
           Policy version 1.0.
         </Text>
       </ScrollView>

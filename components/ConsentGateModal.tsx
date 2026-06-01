@@ -191,7 +191,7 @@ function GateStep({
       <Text style={styles.stepEmoji}>🔐</Text>
       <Text style={styles.stepTitle}>Parent Verification</Text>
       <Text style={styles.stepBody}>
-        Lexi-Lens is built for children. To protect your child's data under{" "}
+        Skanlore is built for children. To protect your child's data under{" "}
         <Text style={styles.boldInk}>COPPA</Text>, we must confirm you are an
         adult before creating an account.
       </Text>
@@ -314,7 +314,7 @@ function ConsentStep({
         <ConsentCheckbox
           checked={coppaCheck}
           onToggle={onToggleCoppa}
-          label="I understand Lexi-Lens stores only a display name and age band for my child — no email, date of birth, or location — in compliance with COPPA."
+          label="I understand Skanlore stores only a display name and age band for my child — no email, date of birth, or location — in compliance with COPPA."
           linkText="Read Privacy Policy →"
           onLinkPress={onPrivacyPolicy}
         />
