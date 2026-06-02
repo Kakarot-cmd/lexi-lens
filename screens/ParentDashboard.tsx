@@ -115,8 +115,11 @@ interface StreakInfo {
 interface DashboardData {
   child:            ChildProfile;
   wordTome:         WordTomeEntry[];
-  questCompletions: QuestCompletion[];
-  questsCompleted:  number;
+  questCompletions: QuestCompletion[];   // recent-5 list for display only
+  /** Distinct quests completed (normal+hard collapsed). NOT questCompletions.length. */
+  distinctQuestsCompleted: number;
+  /** Words with mastery_score >= 0.80 (MASTERY_RETIREMENT_THRESHOLD). NOT wordTome.length. */
+  masteredWordCount: number;
 }
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
@@ -684,7 +687,7 @@ export function ParentDashboard({ navigation }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const [childRes, tomeRes, completionsRes] = await Promise.all([
+      const [childRes, tomeRes, completionsRes, allCompletionIdsRes] = await Promise.all([
         supabase
           .from("child_profiles")
           .select("id, display_name, age, age_band, level, total_xp, avatar_key")
@@ -695,21 +698,42 @@ export function ParentDashboard({ navigation }: Props) {
           .select("*")
           .eq("child_id", childId)
           .order("first_used_at", { ascending: false }),
+        // Recent-5 list for the "Recent Adventures" display only.
         supabase
           .from("quest_completions")
           .select("*, quests(name, enemy_emoji)")
           .eq("child_id", childId)
           .order("completed_at", { ascending: false })
           .limit(5),
+        // Full set of completed quest_ids (one column, no limit) for the TRUE
+        // "Quests done" count. quest_completions has up to 2 rows per quest
+        // (normal + hard via onConflict child_id,quest_id,mode), so we dedupe
+        // on quest_id — "quests done" means distinct quests, not completions.
+        supabase
+          .from("quest_completions")
+          .select("quest_id")
+          .eq("child_id", childId),
       ]);
 
       if (childRes.error) throw childRes.error;
 
+      const wordTome = tomeRes.data ?? [];
+      // "Words mastered" = score >= 0.80 (MASTERY_RETIREMENT_THRESHOLD), not
+      // every word ever encountered. Matches the PDF + Mastery Radar definition.
+      const masteredWordCount = wordTome.filter(
+        (w: { mastery_score?: number | null }) => (w.mastery_score ?? 0) >= 0.80
+      ).length;
+
+      const distinctQuestsCompleted = new Set(
+        (allCompletionIdsRes.data ?? []).map((r: { quest_id: string }) => r.quest_id)
+      ).size;
+
       setDashboard({
-        child:            childRes.data,
-        wordTome:         tomeRes.data ?? [],
-        questCompletions: completionsRes.data ?? [],
-        questsCompleted:  completionsRes.data?.length ?? 0,
+        child:                   childRes.data,
+        wordTome,
+        questCompletions:        completionsRes.data ?? [],
+        distinctQuestsCompleted,
+        masteredWordCount,
       });
     } catch (err: any) {
       setError(err.message ?? "Failed to load dashboard");
@@ -756,6 +780,15 @@ export function ParentDashboard({ navigation }: Props) {
       }
     } catch (e) {
       console.warn("[notifications] toggle failed:", e);
+      // Roll back the optimistic switch — otherwise it reads ON while no
+      // reminder is actually scheduled (e.g. notification permission denied),
+      // silently lying to the parent.
+      setNotifEnabled(!val);
+      if (val) {
+        alert(
+          "Couldn't turn on reminders. Please allow notifications for Skanlore in your device Settings, then try again."
+        );
+      }
     }
   };
 
@@ -890,9 +923,9 @@ export function ParentDashboard({ navigation }: Props) {
 
           {/* ── Stats grid ──────────────────────────────── */}
           <View style={styles.statsGrid}>
-            <StatCard value={dashboard.wordTome.length} label="Words mastered" accent />
+            <StatCard value={dashboard.masteredWordCount} label="Words mastered" accent />
             <StatCard value={selectedChild?.level ?? 1} label="Level" />
-            <StatCard value={dashboard.questCompletions.length} label="Quests done" />
+            <StatCard value={dashboard.distinctQuestsCompleted} label="Quests done" />
             <StatCard
               value={`${streakInfo.currentStreak}🔥`}
               label="Day streak"

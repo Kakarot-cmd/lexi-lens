@@ -81,6 +81,9 @@ export interface PortfolioData {
   child:       PortfolioChild;
   words:       PortfolioWord[];
   quests:      PortfolioQuest[];
+  /** True distinct-quest count from the server (uncapped). The quests[] array
+   *  above is capped at 30 for the history list, so do NOT count it for totals. */
+  distinctQuestsCompleted: number;
   summary:     string;
   generatedAt: string;
 }
@@ -212,10 +215,6 @@ function fmtShortDate(iso: string): string {
   }
 }
 
-function totalXpFromQuests(quests: PortfolioQuest[]): number {
-  return quests.reduce((sum, q) => sum + (q.total_xp ?? 0), 0);
-}
-
 function activeDaysCount(words: PortfolioWord[], quests: PortfolioQuest[]): number {
   const days = new Set<string>();
   words.forEach(w => {
@@ -258,16 +257,29 @@ function tierLabel(tier: string | undefined): string {
  *   7. Footer — Lexi-Lens branding + generation date
  */
 function buildPortfolioHtml(data: PortfolioData): string {
-  const { child, words, quests, summary, generatedAt } = data;
+  const { child, words, quests, distinctQuestsCompleted, summary, generatedAt } = data;
 
   // ── Computed stats ─────────────────────────────────────────────────────────
-  const totalXp      = totalXpFromQuests(quests);
+  // XP truth = child_profiles.total_xp (the authoritative lifetime total that
+  // drives the child's level and matches the on-screen dashboard + the PDF
+  // header). The old totalXpFromQuests() summed quest_completions.total_xp,
+  // which (a) double-counted normal+hard rows, (b) missed daily-quest and
+  // in-progress XP, so it disagreed with the header XP in the SAME document.
+  const totalXp      = child.total_xp;
   const activeDays   = activeDaysCount(words, quests);
-  const expertCount  = words.filter(w => (w.mastery_score ?? 0) >= 0.80).length;
+  // "Mastered" = score >= 0.80 (MASTERY_RETIREMENT_THRESHOLD), the same bar the
+  // app uses to retire a word and the dashboard uses for "Words mastered".
+  const masteredCount = words.filter(w => (w.mastery_score ?? 0) >= 0.80).length;
+  const expertCount  = masteredCount;
   const profCount    = words.filter(w => { const s = w.mastery_score ?? 0; return s >= 0.60 && s < 0.80; }).length;
   const devCount     = words.filter(w => { const s = w.mastery_score ?? 0; return s >= 0.30 && s < 0.60; }).length;
   const novCount     = words.filter(w => (w.mastery_score ?? 0) < 0.30).length;
   const retiredCount = words.filter(w => w.is_retired).length;
+
+  // Distinct quests completed — use the server's uncapped count. The quests[]
+  // array is capped at 30 (history list) and does not carry quest_id, so we
+  // must NOT compute this client-side.
+  const distinctQuests = distinctQuestsCompleted;
 
   const genDate      = fmtDate(generatedAt);
 
@@ -426,8 +438,8 @@ function buildPortfolioHtml(data: PortfolioData): string {
   <!-- STATS OVERVIEW                                      -->
   <!-- ═══════════════════════════════════════════════════ -->
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:${summary ? "0" : "20px"} 0 0;">
-    ${statCard(words.length.toString(), "Words Mastered", "#d97706", "#fef3c7", "#fde68a")}
-    ${statCard(quests.length.toString(), "Quests Done", "#166534", "#f0fdf4", "#86efac")}
+    ${statCard(masteredCount.toString(), "Words Mastered", "#d97706", "#fef3c7", "#fde68a")}
+    ${statCard(distinctQuests.toString(), "Quests Done", "#166534", "#f0fdf4", "#86efac")}
     ${statCard(totalXp.toLocaleString(), "XP Earned", "#6d28d9", "#f5f3ff", "#ddd6fe")}
     ${statCard(activeDays.toString(), "Active Days", "#9c7540", "#f5edda", "#e8d5b0")}
   </div>

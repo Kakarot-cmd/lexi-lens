@@ -240,14 +240,32 @@ Deno.serve(async (req: Request) => {
   // shape is unchanged — Supabase still returns the same JSON.
   const quests: QuestCompletion[] = (questsData ?? []) as unknown as QuestCompletion[];
 
+  // Distinct quests completed — separate uncapped query (quest_id only). The
+  // list above is capped at 30 for display; this is the TRUE total. dedupe on
+  // quest_id because quest_completions holds up to 2 rows per quest (normal +
+  // hard via onConflict child_id,quest_id,mode). "Quests Done" = distinct
+  // quests, matching the on-screen dashboard.
+  const { data: allQuestIds, error: questIdsErr } = await admin
+    .from("quest_completions")
+    .select("quest_id")
+    .eq("child_id", childId);
+
+  if (questIdsErr) {
+    console.warn("[export-word-tome] quest_id count fetch warn:", questIdsErr.message);
+  }
+  const distinctQuestsCompleted = new Set(
+    (allQuestIds ?? []).map((r: { quest_id: string }) => r.quest_id)
+  ).size;
+
   // ── 7. Generate AI portfolio summary ──────────────────────────────────────
-  const summary = await generatePortfolioSummary(admin, child, words, quests);
+  const summary = await generatePortfolioSummary(admin, child, words, distinctQuestsCompleted);
 
   // ── 8. Return assembled portfolio data ────────────────────────────────────
   return json({
     child,
     words,
     quests,
+    distinctQuestsCompleted,
     summary,
     generatedAt: new Date().toISOString(),
   });
@@ -273,7 +291,7 @@ async function generatePortfolioSummary(
   admin:  SupabaseClient,
   child:  ChildProfile,
   words:  WordTomeEntry[],
-  quests: QuestCompletion[]
+  distinctQuestsCompleted: number
 ): Promise<string> {
   try {
     // Build mastery stats for the prompt
@@ -294,7 +312,7 @@ async function generatePortfolioSummary(
       .map(w => `"${w.word}"`)
       .join(", ");
 
-    const totalXp = quests.reduce((sum, q) => sum + (q.total_xp ?? 0), 0);
+    const totalXp = child.total_xp;
 
     const prompt = `You are writing a short vocabulary portfolio summary for a teacher or parent to receive as a PDF.
 
@@ -305,13 +323,13 @@ CHILD INFO:
 - Total XP earned: ${totalXp}
 
 VOCABULARY PROGRESS:
-- Total words mastered: ${words.length}
+- Total words mastered: ${expertCount}
 - Expert tier (≥80% mastery): ${expertCount} words
 - Proficient tier (60–79%): ${proficientCount} words
 - Words retired to harder synonyms: ${retiredCount}
 - Expert/proficient sample: ${starWords || "none yet"}
 - Most recently learned: ${recentWords || "none yet"}
-- Quests completed: ${quests.length}
+- Quests completed: ${distinctQuestsCompleted}
 
 Write 2 sentences:
 1. A warm, specific observation about this child's vocabulary journey (mention a word or two by name if possible).
@@ -334,7 +352,7 @@ Rules:
     const text = (response.rawText ?? "").trim().replace(/^["']|["']$/g, "");
     if (!text) {
       console.warn("[export-word-tome] model returned empty summary — fallback");
-      return buildFallbackSummary(child, words, quests);
+      return buildFallbackSummary(child, words, distinctQuestsCompleted);
     }
     console.log(
       `[export-word-tome] summary model=${response.modelId} ` +
@@ -344,7 +362,7 @@ Rules:
 
   } catch (err) {
     console.warn("[export-word-tome] model summary failed:", err);
-    return buildFallbackSummary(child, words, quests);
+    return buildFallbackSummary(child, words, distinctQuestsCompleted);
   }
 }
 
@@ -356,7 +374,7 @@ Rules:
 function buildFallbackSummary(
   child:  ChildProfile,
   words:  WordTomeEntry[],
-  quests: QuestCompletion[]
+  distinctQuestsCompleted: number
 ): string {
   const expertCount = words.filter(w => (w.mastery_score ?? 0) >= 0.80).length;
   const recent      = words.slice(-2).map(w => w.word).join(" and ");
@@ -369,5 +387,5 @@ function buildFallbackSummary(
     ? `${expertCount} word${expertCount > 1 ? "s" : ""} have reached Expert mastery`
     : "vocabulary is growing steadily with each session";
 
-  return `${child.display_name} has built a vocabulary of ${words.length} words through hands-on AR scanning sessions, with ${masteryNote}. ${recent ? `Most recently, they added "${recent}" to their collection, showing` : "Their consistent engagement shows"} strong vocabulary development across ${quests.length} completed quest${quests.length !== 1 ? "s" : ""}.`;
+  return `${child.display_name} has built a vocabulary of ${words.length} words through hands-on AR scanning sessions, with ${masteryNote}. ${recent ? `Most recently, they added "${recent}" to their collection, showing` : "Their consistent engagement shows"} strong vocabulary development across ${distinctQuestsCompleted} completed quest${distinctQuestsCompleted !== 1 ? "s" : ""}.`;
 }
