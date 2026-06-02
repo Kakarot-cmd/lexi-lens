@@ -144,6 +144,11 @@ export interface EvaluateObjectOptions {
 export const PROPERTY_PASS_THRESHOLD = 0.7;
 export const CONTRADICTION_THRESHOLD = 0.7;
 export const CONTRADICTION_CAP       = 0.55;
+/** Exact score the model uses to signal "can't be judged from a photo"
+ *  (see VERDICT RULE 6). Exempt from the negative-phrase hard-fail so an
+ *  honest "not visible" reasoning string doesn't get forced to 0.0 — it
+ *  must remain a neutral non-fail, distinct from a definite 0.0 absence. */
+export const UNVERIFIABLE_SCORE      = 0.5;
 export const XP_FIRST_TRY            = 40;
 export const XP_SECOND_TRY           = 25;
 export const XP_THIRD_PLUS           = 10;
@@ -176,6 +181,13 @@ export const HEDGING_PHRASES: string[] = [
 
 function validatePropertyV6(prop: PropertyScoreV6): PropertyScoreV6 {
   const reasoning = (prop.reasoning ?? "").toLowerCase();
+
+  // Deliberate "undetermined from a photo" signal (VERDICT RULE 6): leave the
+  // neutral 0.5 intact. Its reasoning will naturally contain "is not visible"
+  // etc., which must NOT be treated as a self-contradiction hard-fail.
+  if (prop.score === UNVERIFIABLE_SCORE) {
+    return { ...prop, passes: false };
+  }
 
   // Trust the model when score >= 0.7.
   if (prop.score < PROPERTY_PASS_THRESHOLD) {
@@ -466,6 +478,7 @@ VERDICT RULES:
 3. If the object clearly does NOT have a property, say so directly in reasoning.
 4. The "properties" array MUST contain exactly one entry per word listed under "Properties to evaluate THIS scan" — no more, no fewer. Use the exact spelling and case.
 5. Do NOT include any property word that wasn't listed under "Properties to evaluate THIS scan".
+6. UNVERIFIABLE-FROM-IMAGE backstop: if a property genuinely cannot be determined from a still photo (e.g. magnetism, temperature, electrical conductivity, absorbency, whether something is waterproof), do NOT guess and do NOT mark it as failing. Score it exactly 0.5, set passes:false, and explain in reasoning that the property is not something a photo can show. Never tell a child their correct object is "wrong" for a property the camera cannot see. (Generation no longer uses such words; this guards legacy quests only.)
 
 KID_MSG RULES (the child sees these, not your reasoning):
 - "young" (ages 5-7): SHORT. 5-10 words. Simple words. Concrete comparisons ("like a ball", "as fluffy as a cloud"). Exclamation if passing.

@@ -61,32 +61,86 @@ function json(body: unknown, status = 200): Response {
 
 // ─── Vocabulary taxonomy ──────────────────────────────────────────────────────
 
+// ─── Vocabulary taxonomy ──────────────────────────────────────────────────────
+//
+// v5.0 (2026-06-02): Restructured from a single flat material-property list into
+// MULTIPLE PERCEPTUAL AXES. Rationale:
+//   • The old pool was one conceptual axis ("material/physical property"). At
+//     age 5-6 that was only 20 words → the daily-quest generator kept hitting
+//     property_set_collision and falling back to recycled seed quests.
+//   • Color / shape / size / count / pattern are MORE reliably evaluable from a
+//     single camera frame than the material words, and are core early-childhood
+//     vocabulary. Adding them multiplies the generation space (sensory × color ×
+//     shape ≫ sensory alone), which is the real fix for collisions.
+//   • CAMERA-UNVERIFIABLE words were RETIRED. A property the vision model cannot
+//     see in a still image (magnetism, temperature, conductivity, absorbency)
+//     forces the model to hedge, and evaluateObject's hedging-cap then scores it
+//     0.55 → passes:false. Net effect: a child scans a genuinely-magnetic object,
+//     is correct in reality, and the app tells them "no" — the worst UX we ship.
+//     Those words are removed from generation so they stop reaching kids.
+//
+// AXIS ESCALATION:
+//   escalates:true  → has meaningful upward synonyms; eligible for hard-mode
+//                     (e.g. soft → squishy → pliable). Sensory + material axes.
+//   escalates:false → no sensible higher register (red has no Latinate upgrade).
+//                     Hard mode for these axes = ADD a property / COMBINE axes,
+//                     handled in the prompt — never "find a fancier word".
+//                     Prevents the flat→planar/laminated/stratified mis-scaling
+//                     bug seen on 5-6 quests.
+
+interface Axis {
+  name:       string;   // human-readable axis label used in the prompt
+  words:      string[];
+  escalates:  boolean;  // see AXIS ESCALATION above
+}
+
 const TAXONOMY: Record<string, {
-  propertyType:    string;
-  wordPool:        string[];
-  hardModePool:    string;
-  maxSyllables:    number;
-  defaultPropCount: Record<string, number>;  // renamed from propertyCount for clarity
-  objectExamples:  string;
-  feedbackCeiling: string;
+  propertyType:     string;
+  axes:             Axis[];
+  /** Flattened convenience view — preserves the old `wordPool` contract.
+   *  Populated by the rebuild loop below (NOT in the literals), so it is
+   *  optional at definition time but always present at runtime. */
+  wordPool?:        string[];
+  hardModePool:     string;
+  maxSyllables:     number;
+  defaultPropCount: Record<string, number>;
+  objectExamples:   string;
+  feedbackCeiling:  string;
 }> = {
   "5-6": {
-    propertyType:  "basic sensory",
-    wordPool: [
-      "hard", "soft", "rough", "smooth", "heavy", "light", "shiny", "dull",
-      "wet", "dry", "hot", "cold", "bumpy", "flat", "fuzzy", "sticky",
-      "squishy", "crunchy", "slippery", "stretchy",
+    propertyType: "basic sensory + color, shape, size, count",
+    axes: [
+      { name: "sensory", escalates: true, words: [
+        "hard", "soft", "rough", "smooth", "shiny", "dull",
+        "bumpy", "flat", "fuzzy", "squishy", "stretchy",
+      ] },
+      { name: "color", escalates: false, words: [
+        "red", "blue", "green", "yellow", "orange", "purple",
+        "pink", "brown", "black", "white",
+      ] },
+      { name: "shape", escalates: false, words: [
+        "round", "square", "flat", "pointy", "curved", "straight", "long",
+      ] },
+      { name: "size", escalates: false, words: [
+        "big", "small", "tall", "tiny", "wide",
+      ] },
+      { name: "count", escalates: false, words: [
+        "one", "two", "many",
+      ] },
     ],
+    // RETIRED from 5-6: heavy, light (weight ≈ guessable but unreliable from a
+    // photo), wet, dry, hot, cold (temperature/moisture not visible), sticky,
+    // crunchy, slippery (require touch/sound, not sight).
     hardModePool: `
       hard → solid
       soft → squishy → pliable
       shiny → gleaming → lustrous (pick ONE next step up, not both)
-      heavy → weighty
       rough → bumpy → textured
-      stretchy → flexible`,
-    maxSyllables:     2,
+      stretchy → flexible
+      (color / shape / size / count words do NOT escalate — see hard-mode rules)`,
+    maxSyllables: 2,
     defaultPropCount: { apprentice: 1, scholar: 1, sage: 1, archmage: 1 },
-    objectExamples:   "spoon, pillow, stone, leaf, sock, cup, pencil, crayon, toy block, blanket",
+    objectExamples: "spoon, pillow, stone, leaf, sock, cup, pencil, crayon, toy block, blanket, ball, book",
     feedbackCeiling: `
       - Maximum sentence length: 8 words.
       - No compound sentences ("and", "but", "because" are fine; semicolons are not).
@@ -95,22 +149,41 @@ const TAXONOMY: Record<string, {
   },
 
   "7-8": {
-    propertyType:  "physical state",
-    wordPool: [
-      "transparent", "opaque", "flexible", "rigid", "magnetic", "hollow",
-      "solid", "absorbent", "porous", "waterproof", "fragile", "durable",
-      "elastic", "dense", "lightweight", "reflective", "insulating",
+    propertyType: "physical state + color, shape, size",
+    axes: [
+      { name: "physical-state", escalates: true, words: [
+        "transparent", "opaque", "flexible", "rigid", "hollow",
+        "solid", "fragile", "durable", "elastic", "reflective",
+      ] },
+      { name: "sensory", escalates: true, words: [
+        "smooth", "rough", "shiny", "dull", "bumpy", "fuzzy",
+      ] },
+      { name: "color", escalates: false, words: [
+        "red", "blue", "green", "yellow", "orange", "purple",
+        "pink", "brown", "black", "white", "grey", "gold", "silver",
+      ] },
+      { name: "shape", escalates: false, words: [
+        "round", "square", "rectangular", "oval", "pointed", "curved", "flat", "narrow",
+      ] },
+      { name: "size", escalates: false, words: [
+        "large", "small", "thin", "thick", "wide", "narrow",
+      ] },
+      { name: "pattern", escalates: false, words: [
+        "striped", "spotted", "plain",
+      ] },
     ],
+    // RETIRED from 7-8: magnetic, absorbent, porous, waterproof, dense,
+    // lightweight, insulating — none determinable from a still image.
     hardModePool: `
       transparent → see-through → clear → translucent (pick one step up)
       flexible → bendable → pliable
       rigid → stiff → inflexible
-      magnetic → attracted-to-magnets → ferromagnetic (use only for age 11-12)
-      absorbent → sponge-like → porous
-      reflective → mirror-like → glossy`,
-    maxSyllables:     3,
+      reflective → mirror-like → glossy
+      smooth → polished → sleek
+      (color / shape / size / pattern words do NOT escalate)`,
+    maxSyllables: 3,
     defaultPropCount: { apprentice: 1, scholar: 2, sage: 2, archmage: 2 },
-    objectExamples:   "mirror, sponge, ruler, candle, coin, balloon, rubber band, plastic bottle, glass",
+    objectExamples: "mirror, sponge, ruler, candle, coin, balloon, rubber band, plastic bottle, glass, cup, leaf",
     feedbackCeiling: `
       - Use simple sentences. Some compound sentences are fine.
       - Vocabulary of a confident 7-year-old reader.
@@ -119,24 +192,39 @@ const TAXONOMY: Record<string, {
   },
 
   "9-10": {
-    propertyType:  "material science",
-    wordPool: [
-      "conductive", "elastic", "reflective", "dense", "crystalline", "fibrous",
-      "grainy", "brittle", "buoyant", "permeable", "insulating", "translucent",
-      "malleable", "adhesive", "coarse", "granular", "layered", "porous",
+    propertyType: "material science + color, shape, texture",
+    axes: [
+      { name: "material", escalates: true, words: [
+        "elastic", "reflective", "crystalline", "fibrous", "grainy",
+        "brittle", "translucent", "coarse", "granular", "layered",
+      ] },
+      { name: "physical-state", escalates: true, words: [
+        "transparent", "opaque", "flexible", "rigid", "fragile", "durable",
+      ] },
+      { name: "color", escalates: false, words: [
+        "crimson", "scarlet", "turquoise", "navy", "amber", "violet",
+        "maroon", "beige", "metallic", "transparent",
+      ] },
+      { name: "shape", escalates: false, words: [
+        "cylindrical", "spherical", "rectangular", "triangular", "tapered", "angular", "rounded",
+      ] },
+      { name: "texture-visual", escalates: false, words: [
+        "ridged", "speckled", "woven", "smooth", "mottled",
+      ] },
     ],
+    // RETIRED from 9-10: conductive, dense, buoyant, permeable, insulating,
+    // malleable, adhesive, porous — behaviour/material identity, not visible.
     hardModePool: `
       elastic → resilient → springy
-      conductive → transmissive
       brittle → fragile → friable
-      dense → compact
       translucent → semi-transparent → pellucid (save pellucid for age 11-12)
       fibrous → filamentous
-      malleable → workable → ductile (save ductile for age 11-12)
-      buoyant → floatable → hydrophobic`,
-    maxSyllables:     4,
+      reflective → specular
+      crystalline → faceted
+      (color / shape / visual-texture words do NOT escalate)`,
+    maxSyllables: 4,
     defaultPropCount: { apprentice: 1, scholar: 2, sage: 3, archmage: 3 },
-    objectExamples:   "cork, aluminium foil, rubber eraser, copper wire, clay, gravel, felt, mesh, wax candle",
+    objectExamples: "cork, aluminium foil, rubber eraser, clay, gravel, felt, mesh, wax candle, glass marble, pinecone",
     feedbackCeiling: `
       - Standard vocabulary for age 9-10.
       - Words up to 4 syllables are fine.
@@ -145,24 +233,36 @@ const TAXONOMY: Record<string, {
   },
 
   "11-12": {
-    propertyType:  "advanced physical science",
-    wordPool: [
-      "translucent", "malleable", "ductile", "viscous", "lustrous",
-      "hygroscopic", "thermoplastic", "ferromagnetic", "pellucid",
-      "iridescent", "crystalline", "refractive", "permeable", "cohesive",
-      "tensile", "laminated", "amorphous", "porosity",
+    propertyType: "advanced physical science + precise color & form",
+    axes: [
+      { name: "advanced-material", escalates: true, words: [
+        "translucent", "viscous", "lustrous", "pellucid",
+        "iridescent", "crystalline", "refractive", "cohesive",
+        "tensile", "laminated", "amorphous",
+      ] },
+      { name: "material", escalates: true, words: [
+        "elastic", "brittle", "fibrous", "grainy", "coarse", "reflective",
+      ] },
+      { name: "color-precise", escalates: false, words: [
+        "iridescent", "metallic", "translucent", "opalescent", "monochrome", "muted",
+      ] },
+      { name: "form", escalates: false, words: [
+        "cylindrical", "spherical", "conical", "polygonal", "tapered", "symmetrical", "elongated",
+      ] },
     ],
+    // RETIRED from 11-12: malleable, ductile, hygroscopic, thermoplastic,
+    // ferromagnetic, permeable, porosity — invisible material behaviours.
+    // (Kept lustrous/refractive/iridescent: these ARE visible optical effects.)
     hardModePool: `
       translucent → pellucid (Latin-origin, same meaning, higher register)
-      malleable → ductile (more specific: ductile = drawn into wire)
       lustrous → specular → iridescent
       viscous → viscid → tenacious
-      ferromagnetic → paramagnetic (different but related — explain distinction)
-      hygroscopic → deliquescent (extreme case of hygroscopic)
-      refractive → diffractive (introduce optical nuance)`,
-    maxSyllables:     5,
+      crystalline → faceted → vitreous
+      reflective → specular → refractive
+      (precise-color / form words do NOT escalate)`,
+    maxSyllables: 5,
     defaultPropCount: { apprentice: 2, scholar: 3, sage: 3, archmage: 3 },
-    objectExamples:   "copper pipe, glass rod, wax block, felt sheet, resin block, polished metal, mica flake, salt crystal",
+    objectExamples: "glass rod, wax block, felt sheet, resin block, polished metal, mica flake, salt crystal, soap bubble, prism",
     feedbackCeiling: `
       - Rich vocabulary. Age 11-12 level.
       - Can introduce etymology: "Pellucid comes from Latin pellucēre — to shine through."
@@ -170,6 +270,12 @@ const TAXONOMY: Record<string, {
       - Archmage feedback should always introduce one word from the NEXT level up.`,
   },
 };
+
+// Build the flat `wordPool` view from axes once at module load (preserves the
+// old contract: anything reading tax.wordPool still works, deduped).
+for (const band of Object.values(TAXONOMY)) {
+  band.wordPool = [...new Set(band.axes.flatMap((a) => a.words))];
+}
 
 // ─── System prompt builder ────────────────────────────────────────────────────
 
@@ -209,7 +315,9 @@ DIFFICULTY TIER: ${tier}
 
 VOCABULARY TAXONOMY FOR THIS AGE BAND (${ageBand}):
   Property type: ${tax.propertyType}
-  Word pool (choose FROM these or close synonyms): ${tax.wordPool.join(", ")}
+  Word pool — organised by PERCEPTUAL AXIS (choose FROM these or close synonyms):
+${tax.axes.map((a) => `    - ${a.name}: ${a.words.join(", ")}`).join("\n")}
+  AXIS RULE: prefer drawing the ${propCount > 1 ? `${propCount} properties from DIFFERENT axes` : "property from whichever axis best fits the object"} (e.g. one color + one shape, not two colors). Mixing axes makes quests feel varied and teaches broader vocabulary.
   Max syllables per vocabulary word: ${tax.maxSyllables}
   Number of required_properties: EXACTLY ${propCount}
   Target object concreteness: ${tax.objectExamples}
@@ -223,12 +331,25 @@ TIER BEHAVIOUR:
 
 HARD MODE PROPERTIES (hard_mode_properties array):
   Generate exactly ${propCount} hard-mode properties — one for each required property.
-  Each hard-mode word MUST be an UPWARD SYNONYM of its base word:
-    • Same physical property as the base word
-    • Higher vocabulary register (more technical, more specific, or Latin/Greek origin)
-    • Never a different property — "hard → dense" is WRONG. "hard → rigid → inflexible" is CORRECT.
-  Hard-mode synonym guide:
+
+  Two kinds of base word, handled DIFFERENTLY:
+
+  (a) ESCALATING axes (sensory, physical-state, material, advanced-material):
+      the hard-mode word MUST be an UPWARD SYNONYM of its base word:
+        • Same physical property as the base word
+        • Higher vocabulary register (more technical, more specific, or Latin/Greek origin)
+        • Never a different property — "hard → dense" is WRONG. "hard → rigid → inflexible" is CORRECT.
+      Hard-mode synonym guide:
 ${tax.hardModePool}
+
+  (b) NON-ESCALATING axes (color, shape, size, count, pattern):
+      these words have NO higher register — do NOT invent fancy synonyms
+      (e.g. NEVER "red → crimson → vermillion" for a 5-6 child, NEVER
+      "flat → planar → laminated"). Instead, make hard mode HARDER by:
+        • specifying a more PRECISE value ("red" → "dark red", "round" → "perfectly round")
+        • OR pairing it with a second observable attribute ("red" → "small and red")
+      Keep the hard-mode word inside the same age band's max syllables (${tax.maxSyllables}).
+      The hard-mode property must still be findable by the same child — just less obvious.
 
 FEEDBACK CEILING (used in childFeedback field):
 ${tax.feedbackCeiling}
