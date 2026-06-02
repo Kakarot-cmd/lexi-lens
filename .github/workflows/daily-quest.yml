@@ -20,9 +20,9 @@
 #
 # Required secrets (set in GitHub → Settings → Secrets and variables → Actions):
 #   PROD_SUPABASE_FUNCTIONS_URL      e.g. https://vwlfzvabvlcozqpepsoi.supabase.co/functions/v1
-#   PROD_SUPABASE_SERVICE_ROLE_KEY   PROD service-role key (NOT the anon key)
+#   PROD_SUPABASE_ANON_KEY   PROD anon (public) key — NOT the service-role key
 #   STAGING_SUPABASE_FUNCTIONS_URL   e.g. https://zhnaxafmacygbhpvtwvf.supabase.co/functions/v1
-#   STAGING_SUPABASE_SERVICE_ROLE_KEY
+#   STAGING_SUPABASE_ANON_KEY
 #
 #   The function gates DB access with its OWN service-role key internally; the
 #   key sent here only satisfies the platform's verify_jwt on the endpoint.
@@ -67,9 +67,9 @@ jobs:
           # Both envs' secrets are exposed to the step; the script picks one by
           # ENV_NAME. Secrets are masked in logs and never written to outputs.
           PROD_BASE_URL:    ${{ secrets.PROD_SUPABASE_FUNCTIONS_URL }}
-          PROD_KEY:         ${{ secrets.PROD_SUPABASE_SERVICE_ROLE_KEY }}
+          PROD_KEY:         ${{ secrets.PROD_SUPABASE_ANON_KEY }}
           STAGING_BASE_URL: ${{ secrets.STAGING_SUPABASE_FUNCTIONS_URL }}
-          STAGING_KEY:      ${{ secrets.STAGING_SUPABASE_SERVICE_ROLE_KEY }}
+          STAGING_KEY:      ${{ secrets.STAGING_SUPABASE_ANON_KEY }}
         run: |
           set -euo pipefail
 
@@ -80,7 +80,7 @@ jobs:
           fi
 
           if [ -z "${BASE_URL:-}" ] || [ -z "${SERVICE_KEY:-}" ]; then
-            echo "::error::Missing secrets for environment '$ENV_NAME'. Set the *_SUPABASE_FUNCTIONS_URL and *_SUPABASE_SERVICE_ROLE_KEY secrets."
+            echo "::error::Missing secrets for environment '$ENV_NAME'. Set the *_SUPABASE_FUNCTIONS_URL and *_SUPABASE_ANON_KEY secrets."
             exit 1
           fi
 
@@ -92,6 +92,7 @@ jobs:
             --output /tmp/resp.json \
             --write-out "%{http_code}" \
             --request POST "${BASE_URL}/ensure-daily-quest" \
+            --header "apikey: ${SERVICE_KEY}" \
             --header "Authorization: Bearer ${SERVICE_KEY}" \
             --header "Content-Type: application/json" \
             --data '{}')
