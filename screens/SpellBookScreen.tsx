@@ -429,9 +429,9 @@ export default function SpellBookScreen({ navigation }: Props) {
     return {
       questId:          q.id,
       questName:        q.name,
-      spellName:        (q as any).spell_name       ?? q.name,
-      weaponEmoji:      (q as any).weapon_emoji      ?? "⚔️",
-      spellDescription: (q as any).spell_description ?? "",
+      spellName:        q.spell_name        ?? q.name,
+      weaponEmoji:      q.weapon_emoji      ?? "⚔️",
+      spellDescription: q.spell_description ?? "",
       enemyName:        q.enemy_name,
       enemyEmoji:       q.enemy_emoji,
       tier:             q.tier,
