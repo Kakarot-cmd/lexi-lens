@@ -315,6 +315,12 @@ function App() {
   // or PASSWORD_RECOVERY auth event, cleared by AuthScreen after updateUser.
   const recoveryActive = useAuthFlow((s) => s.recoveryActive);
 
+  // v4.6 — pending-deletion gate. Non-null ISO timestamp when the signed-in
+  // parent has a scheduled account deletion. Keeps AuthScreen mounted (with a
+  // live session) so the deletion-recovery banner can render at sign-in. See
+  // lib/authFlow.ts for the full rationale.
+  const deletionScheduledAt = useAuthFlow((s) => s.deletionScheduledAt);
+
   // ── Backstory gate (v6.6) ─────────────────────────────────────────────────
   //
   // null   = AsyncStorage read in flight (don't decide yet)
@@ -378,6 +384,12 @@ function App() {
       .then(({ data: { session: s } }) => {
         if (cancelled) return;
         setSession(s);
+        // v4.6 — cold-start path: a persisted session may belong to an account
+        // that's mid-deletion. Gate in the same tick as setSession so the first
+        // render that sees the session also sees the gate.
+        const at = s?.user?.app_metadata?.deletion_scheduled_at;
+        if (at) getAuthFlow().beginDeletionGate(at);
+        else    getAuthFlow().clearDeletionGate();
         setInitialising(false);
       })
       .catch(() => {
@@ -402,8 +414,14 @@ function App() {
 
         if (!s) {
           clearUserContext();
+          getAuthFlow().clearDeletionGate();
           addGameBreadcrumb({ category: "auth", message: "User signed out" });
         } else {
+          // v4.6 — warm path (e.g. sign-in, token refresh). If this account is
+          // scheduled for deletion, raise the gate in the same callback as the
+          // session update so AuthScreen stays mounted to show the banner.
+          const at = s.user?.app_metadata?.deletion_scheduled_at;
+          if (at) getAuthFlow().beginDeletionGate(at);
           addGameBreadcrumb({
             category: "auth",
             message:  "Session established",
@@ -725,7 +743,9 @@ function App() {
   // v4.5 — show AuthNavigator if there's no session OR if we're in
   // password-recovery mode (session exists but parent must reset password
   // before reaching the game).
-  const showAuth = !session || recoveryActive;
+  // v4.6 — also stay on AuthNavigator while a deletion gate is up: the parent
+  // has a live session but must first decide Restore vs Sign out.
+  const showAuth = !session || recoveryActive || !!deletionScheduledAt;
 
   // v6.6 — backstory gate sits BETWEEN auth-resolved and AppNavigator.
   //   • showAuth      → AuthNavigator (no story; user isn't in the game yet)

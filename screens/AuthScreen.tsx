@@ -131,6 +131,13 @@ export function AuthScreen() {
   const recoveryActive = useAuthFlow((s) => s.recoveryActive);
   const clearRecovery  = useAuthFlow((s) => s.clearRecovery);
 
+  // v4.6 — deletion-recovery is now gated centrally in App.tsx (see
+  // lib/authFlow.ts). AuthScreen reads the shared flag and renders the banner;
+  // the parent's session stays live throughout, so the authenticated
+  // cancel-deletion call in handleRestoreAccount still works.
+  const deletionScheduledAt = useAuthFlow((s) => s.deletionScheduledAt);
+  const clearDeletionGate   = useAuthFlow((s) => s.clearDeletionGate);
+
   // Detect cold-start via auth-confirm or auth-reset deep links.
   // Warm-start is handled in App.tsx, but we also re-listen here for the
   // narrow purpose of UI state (confirmation banner, mode switch).
@@ -164,11 +171,20 @@ export function AuthScreen() {
   const [showConsentGate,  setShowConsentGate]  = useState(false);
   const [showPrivacyPolicy, setShowPrivacyPolicy] = useState(false);
 
-  // Phase 4.1: Deletion-recovery state
-  const [pendingDeletion, setPendingDeletion] = useState<{
-    daysLeft: number;
-    restoringAccount: boolean;
-  } | null>(null);
+  // Phase 4.1 / v4.6: Deletion-recovery is derived from the shared gate flag,
+  // not local state — the old local-state version was set inside performSignIn
+  // but never rendered, because the moment sign-in succeeded App.tsx swapped to
+  // AppNavigator and unmounted this screen. `restoring` is the only local bit.
+  const [restoring, setRestoring] = useState(false);
+  const pendingDeletion = deletionScheduledAt
+    ? {
+        daysLeft: Math.max(
+          0,
+          Math.ceil((new Date(deletionScheduledAt).getTime() - Date.now()) / 86_400_000),
+        ),
+        restoringAccount: restoring,
+      }
+    : null;
 
   // Fields
   const [displayName, setDisplayName, touchDisplayName] = useField();
@@ -178,6 +194,8 @@ export function AuthScreen() {
 
   // Mode-switch animation
   const fadeAnim = useRef(new Animated.Value(1)).current;
+  const switchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (switchTimer.current) clearTimeout(switchTimer.current); }, []);
 
   const switchMode = (next: AuthMode) => {
     setApiError(null);
@@ -185,7 +203,8 @@ export function AuthScreen() {
       Animated.timing(fadeAnim, { toValue: 0, duration: 120, useNativeDriver: true }),
       Animated.timing(fadeAnim, { toValue: 1, duration: 180, useNativeDriver: true }),
     ]).start();
-    setTimeout(() => setMode(next), 120);
+    if (switchTimer.current) clearTimeout(switchTimer.current);
+    switchTimer.current = setTimeout(() => setMode(next), 120);
   };
 
   // ── Validation ──────────────────────────────────────────────────────────────
@@ -227,22 +246,17 @@ export function AuthScreen() {
   const performSignIn = useCallback(async () => {
     setLoading(true);
     setApiError(null);
-    setPendingDeletion(null);
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({
+      const { error } = await supabase.auth.signInWithPassword({
         email:    email.value.trim(),
         password: password.value,
       });
       if (error) throw error;
-
-      const scheduledAt = data.session?.user?.app_metadata?.deletion_scheduled_at;
-      if (scheduledAt) {
-        const daysLeft = Math.ceil(
-          (new Date(scheduledAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24),
-        );
-        setPendingDeletion({ daysLeft, restoringAccount: false });
-        return;
-      }
+      // v4.6 — no deletion check here. App.tsx's auth listener inspects the
+      // established session for a deletion_scheduled_at stamp and raises the
+      // deletion gate in the same tick, which keeps this screen mounted and
+      // renders the banner. Doing it here never worked: the session that lets
+      // App.tsx route to the game lands before any local state could show.
     } catch (err: any) {
       const msg: string = err?.message ?? "Something went wrong";
       if (msg.includes("Invalid login credentials")) {
@@ -259,23 +273,30 @@ export function AuthScreen() {
   // ── Restore account (cancel pending deletion) ─────────────────────────────
   const handleRestoreAccount = useCallback(async () => {
     if (!pendingDeletion) return;
-    setPendingDeletion((p) => p ? { ...p, restoringAccount: true } : null);
+    setRestoring(true);
     try {
       const { error } = await supabase.functions.invoke("cancel-deletion", {});
       if (error) throw error;
-      setPendingDeletion(null);
+      // The function cleared the server-side stamp, but our locally cached JWT
+      // still carries the old app_metadata until it refreshes (~1h). Force a
+      // refresh now so a force-restart can't re-raise the gate from a stale token.
+      await supabase.auth.refreshSession();
+      // Lower the gate → App.tsx sees a live session with no deletion stamp
+      // and routes the parent into the game.
+      clearDeletionGate();
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch (err: any) {
-      setPendingDeletion((p) => p ? { ...p, restoringAccount: false } : null);
       setApiError("Could not restore account: " + (err?.message ?? "Unknown error"));
+    } finally {
+      setRestoring(false);
     }
-  }, [pendingDeletion]);
+  }, [pendingDeletion, clearDeletionGate]);
 
-  // ── Dismiss pending-deletion state and sign out ───────────────────────────
+  // ── Sign out instead of restoring (account stays scheduled) ───────────────
   const handleKeepDeletion = useCallback(async () => {
-    setPendingDeletion(null);
+    clearDeletionGate();
     await supabase.auth.signOut();
-  }, []);
+  }, [clearDeletionGate]);
 
   // ── Sign-up (called after consent gate passes) ────────────────────────────
   const performSignUp = useCallback(async (meta: ConsentMetadata) => {
