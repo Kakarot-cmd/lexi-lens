@@ -672,7 +672,25 @@ export const useGameStore = create<GameState>()(
             raw === "tier1" ||
             raw === "tier2" ||
             raw === "family";
-          set({ parentSubscriptionTier: isPaidEquivalent ? "paid" : "free" });
+
+          // Phase 4.4 — webhook-lag guard. The RC purchase flow flips the store
+          // to paid immediately (setSubscriptionFromRC), but the authoritative
+          // parents.subscription_tier is written by the revenuecat-webhook,
+          // which can lag the purchase by seconds-to-minutes. Without this
+          // guard, any loadParentProfile() in that window (app restart, child
+          // switch) would read the not-yet-updated server row as 'free' and
+          // CLOBBER the just-purchased paid state — locking a paying customer
+          // out of content they paid for. So: if the server says free but the
+          // RC freshness layer reports an active entitlement, treat it as lag
+          // and keep paid. A genuine cancel/expiry is NOT lag — it arrives via
+          // RC's own customer-info listener calling setSubscriptionFromRC with
+          // isActive:false (App.tsx wires the listener + a getCustomerInfo()
+          // snapshot on every session start, refreshing the RC layer against
+          // Apple/Google truth), so real downgrades still flip to free.
+          const rcSaysActive = get().parentSubscriptionDetails.isActive;
+          const effectivePaid = isPaidEquivalent || rcSaysActive;
+
+          set({ parentSubscriptionTier: effectivePaid ? "paid" : "free" });
         } catch {
           set({ parentSubscriptionTier: "free" });
         }
