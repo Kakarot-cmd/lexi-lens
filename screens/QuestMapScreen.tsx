@@ -26,7 +26,7 @@
  *   • LumiHUD overlays the screen — ambient brand presence, bottom-right
  */
 
-import React, { useEffect, useCallback, useMemo } from "react";
+import React, { useEffect, useCallback, useMemo, useState } from "react";
 import {
   View,
   Text,
@@ -122,11 +122,41 @@ function LevelBar() {
 
 // ─── Tier header ──────────────────────────────────────────────────────────────
 
-function TierHeader({ tier, unlocked, cleared }: { tier: QuestTier; unlocked: boolean; cleared: boolean }) {
+function TierHeader({
+  tier,
+  unlocked,
+  cleared,
+  fullyConquered = false,
+  collapsed = false,
+  onToggle,
+}: {
+  tier:           QuestTier;
+  unlocked:       boolean;
+  cleared:        boolean;
+  /** v4.6 — every quest in this tier is done AND (no hard mode OR hard beaten). */
+  fullyConquered?: boolean;
+  /** v4.6 — true when a fullyConquered tier is currently collapsed. */
+  collapsed?:      boolean;
+  /** v4.6 — tap handler; only wired for fullyConquered tiers. */
+  onToggle?:       () => void;
+}) {
   const meta = TIER_META[tier];
 
+  // v4.6 — a fully-conquered tier collapses to a single tappable line so the
+  // child doesn't scroll a wall of green to reach playable content. Only
+  // fully-conquered tiers are tappable; everything else is a static header.
+  const Wrapper: any = fullyConquered ? TouchableOpacity : View;
+  const wrapperProps = fullyConquered
+    ? {
+        onPress: onToggle,
+        activeOpacity: 0.7,
+        accessibilityRole: "button" as const,
+        accessibilityLabel: `${meta.label} tier, all conquered. ${collapsed ? "Tap to show quests." : "Tap to hide quests."}`,
+      }
+    : {};
+
   return (
-    <View style={[styles.tierHeader, !unlocked && styles.tierHeaderLocked]}>
+    <Wrapper style={[styles.tierHeader, !unlocked && styles.tierHeaderLocked]} {...wrapperProps}>
       <Text style={styles.tierEmoji}>{unlocked ? meta.emoji : "🔒"}</Text>
       <View style={{ flex: 1 }}>
         <Text style={[styles.tierLabel, !unlocked && styles.tierLabelLocked]}>
@@ -146,7 +176,11 @@ function TierHeader({ tier, unlocked, cleared }: { tier: QuestTier; unlocked: bo
           <Text style={styles.tierBadgeOpenText}>Active</Text>
         </View>
       )}
-    </View>
+      {/* v4.6 — chevron only on collapsible (fully-conquered) tiers */}
+      {fullyConquered && (
+        <Text style={styles.tierChevron}>{collapsed ? "▸" : "▾"}</Text>
+      )}
+    </Wrapper>
   );
 }
 
@@ -416,6 +450,8 @@ export function QuestMapScreen({ navigation }: Props) {
   const loadCompleted     = useGameStore((s) => s.loadCompletedQuests);
   const questLibrary      = useGameStore((s) => s.questLibrary);
   const completedQuestIds = useGameStore((s) => s.completedQuestIds);
+  // v4.6 — hard-mode completions, used by the in-tier sort + collapse logic
+  const hardCompletedQuestIds = useGameStore((s) => s.hardCompletedQuestIds);
 
   // v6.0 — parent subscription tier (drives quest lock state)
   const parentTier        = useGameStore((s) => s.parentSubscriptionTier);
@@ -431,6 +467,46 @@ export function QuestMapScreen({ navigation }: Props) {
     () => selectQuestsGroupedByTier({ questLibrary, completedQuestIds } as any),
     [questLibrary, completedQuestIds]
   );
+
+  // v4.6 — in-tier sort + collapse support.
+  //
+  // Goal: stop the child from scrolling past finished quests to reach
+  // playable ones. Within each tier we sort quests into three buckets and
+  // collapse a tier only once it's FULLY conquered.
+  //
+  //   bucket 0 — available / never played        (top — what to play next)
+  //   bucket 1 — done in normal, Hard NOT beaten  (still fresh challenge)
+  //   bucket 2 — fully conquered (no hard, or hard beaten)  (bottom)
+  //
+  // NOTE the collapse condition is "fully conquered", NOT the existing
+  // `cleared` flag (which only checks normal completion). Collapsing on
+  // `cleared` would hide tiers that still have unbeaten Hard Mode — i.e.
+  // hide bucket-1 challenge content. fullyConquered avoids that.
+  const completedSet = useMemo(() => new Set(completedQuestIds), [completedQuestIds]);
+  const hardSet      = useMemo(() => new Set(hardCompletedQuestIds), [hardCompletedQuestIds]);
+
+  const questBucket = useCallback(
+    (q: Quest): 0 | 1 | 2 => {
+      const done = completedSet.has(q.id) || hardSet.has(q.id);
+      if (!done) return 0;
+      const hasHard = selectHasHardMode(q);
+      if (hasHard && !hardSet.has(q.id)) return 1;
+      return 2;
+    },
+    [completedSet, hardSet]
+  );
+
+  // Which fully-conquered tiers the user has manually expanded this session.
+  // Default: fully-conquered tiers render collapsed.
+  const [expandedTiers, setExpandedTiers] = useState<Set<QuestTier>>(() => new Set());
+  const toggleTier = useCallback((tier: QuestTier) => {
+    setExpandedTiers((prev) => {
+      const next = new Set(prev);
+      if (next.has(tier)) next.delete(tier);
+      else next.add(tier);
+      return next;
+    });
+  }, []);
 
   // Load everything on mount / child change
   useEffect(() => {
@@ -485,24 +561,53 @@ export function QuestMapScreen({ navigation }: Props) {
   // Build SectionList sections from tier groups
   const sections = useMemo(() => {
     return tierGroups.map((group: TierGroup) => {
-      const data: SectionItem[] = group.unlocked
-        ? group.quests.map((q) => ({ kind: "quest", quest: q }))
-        : [
+      // Locked tier — unchanged: single placeholder card, never collapsible.
+      if (!group.unlocked) {
+        return {
+          tier:           group.tier,
+          unlocked:       false,
+          cleared:        group.cleared,
+          fullyConquered: false,
+          collapsed:      false,
+          data: [
             {
               kind:        "locked",
               questCount:  group.quests.length,
               lockMessage: TIER_META[group.tier].lockMessage,
             } as SectionItem,
-          ];
+          ],
+        };
+      }
+
+      // v4.6 — sort by bucket, then sort_order within bucket (stable feel).
+      const sorted = [...group.quests].sort((a, b) => {
+        const ba = questBucket(a);
+        const bb = questBucket(b);
+        if (ba !== bb) return ba - bb;
+        return (a.sort_order ?? 8) - (b.sort_order ?? 8);
+      });
+
+      // Fully conquered = every quest is bucket 2 (done, and no hard / hard beaten).
+      const fullyConquered =
+        group.quests.length > 0 && group.quests.every((q) => questBucket(q) === 2);
+
+      // Collapse a fully-conquered tier unless the user expanded it this session.
+      const collapsed = fullyConquered && !expandedTiers.has(group.tier);
+
+      const data: SectionItem[] = collapsed
+        ? []
+        : sorted.map((q) => ({ kind: "quest", quest: q }));
 
       return {
         tier:     group.tier,
-        unlocked: group.unlocked,
+        unlocked: true,
         cleared:  group.cleared,
+        fullyConquered,
+        collapsed,
         data,
       };
     });
-  }, [tierGroups]);
+  }, [tierGroups, questBucket, expandedTiers]);
 
   const renderSectionHeader = useCallback(
     ({ section }: { section: (typeof sections)[number] }) => (
@@ -510,9 +615,12 @@ export function QuestMapScreen({ navigation }: Props) {
         tier={section.tier}
         unlocked={section.unlocked}
         cleared={section.cleared}
+        fullyConquered={section.fullyConquered}
+        collapsed={section.collapsed}
+        onToggle={() => toggleTier(section.tier)}
       />
     ),
-    []
+    [toggleTier]
   );
 
   const renderItem = useCallback(
@@ -724,6 +832,7 @@ const styles = StyleSheet.create({
     paddingVertical:   4,
   },
   tierBadgeOpenText: { fontSize: 11, color: P.textMuted, fontWeight: "600" },
+  tierChevron:       { fontSize: 14, color: P.textMuted, marginLeft: 10, fontWeight: "700" },
 
   // ── Locked tier ────────────────────────────────────────
   lockedCard: {
