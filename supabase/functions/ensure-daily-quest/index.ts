@@ -72,6 +72,7 @@
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 import { getModelAdapter } from "../_shared/models/index.ts";
+import { TAXONOMY } from "../_shared/vocabularyTaxonomy.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -111,6 +112,14 @@ function todayUtc(): string {
 
 // ─── Prompt ──────────────────────────────────────────────────────────────────
 
+// Build the axis-grouped word pool for the daily's age band from the shared
+// taxonomy. This is the breadth the daily prompt previously LACKED — without a
+// word pool the model kept regenerating the same sensory trio and colliding.
+const DAILY_TAX = TAXONOMY[DAILY_AGE_BAND] ?? TAXONOMY["7-8"];
+const DAILY_AXIS_POOL = DAILY_TAX.axes
+  .map((a) => `    - ${a.name}: ${a.words.join(", ")}`)
+  .join("\n");
+
 const SYSTEM_PROMPT = `${CHILD_SAFETY_PREFIX}
 
 You are Lexi-Lens's quest designer. Generate ONE vocabulary-learning quest for
@@ -123,10 +132,32 @@ Target audience:
 
 Constraints:
   • EXACTLY ${DAILY_PROP_COUNT} required_properties
-  • EXACTLY ${DAILY_PROP_COUNT} hard_mode_properties (parallel array; harder word per slot)
-  • Vocabulary words must be tactile, sensory, or visual — easy to verify from
-    a photo of a real object (e.g., "smooth", "transparent", "ribbed").
-  • AVOID abstract or invisible properties (e.g., "expensive", "old", "useful").
+  • EXACTLY ${DAILY_PROP_COUNT} hard_mode_properties (parallel array, one per
+    required property, SAME index = SAME object must satisfy both).
+    Each hard_mode word must be GENUINELY HARDER than its required-property
+    counterpart, describing the SAME physical attribute of the SAME object —
+    NOT a lateral swap to a different easy word.
+      ✓ CORRECT (harder word, same property):
+          required "shiny"   → hard "reflective"   (same surface quality, richer word)
+          required "round"   → hard "spherical"    (same shape, more precise word)
+          required "see-through"/"transparent" → hard "translucent"
+          required "smooth"  → hard "polished"
+      ✗ WRONG (lateral — a different easy property, NOT harder):
+          required "shiny"   → hard "blue"   ← different attribute, no harder
+          required "round"   → hard "small"  ← different attribute
+      The hard word should stretch the child's vocabulary for the property they
+      already found — a word they likely don't know yet but can learn from the
+      same object. Stay within an 8-12-year-old reading level; never invent
+      pseudo-technical words for a young child.
+  • Choose vocabulary words FROM these perceptual axes (or close synonyms):
+${DAILY_AXIS_POOL}
+  • VARIETY RULE: draw the ${DAILY_PROP_COUNT} properties from DIFFERENT axes
+    (e.g. one color + one shape + one texture), NOT three words from the same
+    axis. Mixing axes keeps daily quests feeling fresh and teaches broader
+    vocabulary. Pick a different combination than an obvious one.
+  • All words must be easy to verify from a photo of a real object.
+  • AVOID abstract or invisible properties (e.g., "expensive", "old", "useful",
+    "magnetic", "warm" — anything a camera cannot see).
   • Each property's evaluationHints must be 1-2 short sentences guiding a
     vision model to score the property objectively from an image.
   • Enemy name should be 2-3 words, fantasy-themed, kid-friendly.
@@ -266,6 +297,12 @@ async function nameCollides(
   return (count ?? 0) > 0;
 }
 
+// How many recent daily quests to de-duplicate against. A property set that
+// last appeared > RECENT_DAILY_WINDOW days ago is allowed to recur — spaced
+// repetition is GOOD for vocabulary retention, and the fresh enemy/room/spell
+// skin makes a repeated property set feel like a new quest to a child.
+const RECENT_DAILY_WINDOW = 14;
+
 async function propertySetCollides(
   supabase: SupabaseClient,
   candidateProps: QuestProperty[],
@@ -277,16 +314,26 @@ async function propertySetCollides(
 
   if (candidateWords.length === 0) return false;
 
-  const { data } = await supabase
-    .from("quests")
-    .select("required_properties")
-    .eq("is_active", true);
+  // Plan A: scope the uniqueness check to the LAST RECENT_DAILY_WINDOW daily
+  // quests only — NOT the entire active-quest library. The daily does not need
+  // a globally-unique property set; it only needs to differ from quests the
+  // child has seen as a daily recently. Reusing a set that some parent-created
+  // library quest happens to use is fine — the child never sees that quest.
+  const { data: recentDailies } = await supabase
+    .from("daily_quests")
+    .select("quest_id, quests:quest_id ( required_properties )")
+    .order("quest_date", { ascending: false })
+    .limit(RECENT_DAILY_WINDOW);
 
-  if (!data) return false;
+  if (!recentDailies) return false;
 
-  for (const q of data) {
-    const existing = Array.isArray((q as { required_properties?: unknown }).required_properties)
-      ? (q as { required_properties: Array<{ word?: unknown }> }).required_properties
+  for (const row of recentDailies) {
+    // quests join may come back as an object or a single-element array
+    // depending on the relationship shape — normalise both.
+    const joined = (row as { quests?: unknown }).quests;
+    const questObj = Array.isArray(joined) ? joined[0] : joined;
+    const existing = Array.isArray((questObj as { required_properties?: unknown })?.required_properties)
+      ? (questObj as { required_properties: Array<{ word?: unknown }> }).required_properties
       : [];
 
     const existingWords = existing
@@ -296,7 +343,7 @@ async function propertySetCollides(
 
     if (existingWords.length !== candidateWords.length) continue;
     if (existingWords.every((w, i) => w === candidateWords[i])) {
-      return true; // exact full-set match — reject
+      return true; // exact set repeats a RECENT daily — reject, regenerate
     }
   }
   return false;
