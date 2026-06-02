@@ -48,15 +48,14 @@ import type { RootStackParamList, AuthStackParamList } from "./types/navigation"
 
 // ─── Backstory gate helpers (v6.6) ────────────────────────────────────────────
 //
-// `hasSeenBackstory()` and `markBackstorySeen()` are tiny AsyncStorage
-// readers/writers — safe to import eagerly. The actual <OnboardingBackstoryScreen/>
-// component (which transitively imports LumiMascot → Reanimated → SVG) is
-// lazy-loaded below, same pattern as the other Lumi-touching screens. This
-// preserves the iOS-safe boot path established in v4.5.8.
+// v4.6 — gate helpers now come from lib/backstoryGate (Lumi-free), so this
+// eager import no longer drags the LumiMascot → Reanimated → SVG tree into
+// the boot bundle. The <OnboardingBackstoryScreen/> component itself stays
+// lazy-loaded below, preserving the iOS-safe boot path from v4.5.8.
 import {
   hasSeenBackstory,
   markBackstorySeen,
-} from "./screens/OnboardingBackstoryScreen";
+} from "./lib/backstoryGate";
 
 // ─── Screens ──────────────────────────────────────────────────────────────────
 //
@@ -206,7 +205,13 @@ function AuthNavigator() {
   );
 }
 
-function AppNavigator() {
+function AppNavigator({
+  onBackstoryComplete,
+  backstoryChildName,
+}: {
+  onBackstoryComplete: () => void | Promise<void>;
+  backstoryChildName:  string | null;
+}) {
   // v4.5.8 — Shared fallback used by every <Suspense> boundary around a
   // lazy-loaded screen. Minimal, brand-aligned, never visible for more than
   // a few frames in practice (the screen module resolves on the next tick).
@@ -281,6 +286,33 @@ function AppNavigator() {
           <ErrorBoundary screen="OnboardingScreen">
             <Suspense fallback={<LazyScreenFallback />}>
               <OnboardingScreen {...props} />
+            </Suspense>
+          </ErrorBoundary>
+        )}
+      </AppNav.Screen>
+
+      {/* v4.6 — Backstory is now a stack screen reached AFTER first child
+          selection (was a device-first-launch standalone branch). Moving it
+          here means activeChild is set by the time it renders, so panel 3's
+          personalised greeting ("And you must be {name}.") actually fires —
+          previously it was always null at backstory time and silently fell
+          back to generic copy. On complete it persists the flag (via
+          onBackstoryComplete, which also flips App-state backstorySeen so the
+          daily-greeting gate releases) then replaces itself with Onboarding
+          (first run) or QuestMap. */}
+      <AppNav.Screen name="OnboardingBackstory">
+        {({ navigation }) => (
+          <ErrorBoundary screen="OnboardingBackstoryScreen">
+            <Suspense fallback={<LazyScreenFallback />}>
+              <OnboardingBackstoryScreen
+                childName={backstoryChildName}
+                onComplete={async () => {
+                  await onBackstoryComplete();
+                  const seenOnboarding =
+                    useGameStore.getState().hasSeenOnboarding;
+                  navigation.replace(seenOnboarding ? "QuestMap" : "Onboarding");
+                }}
+              />
             </Suspense>
           </ErrorBoundary>
         )}
@@ -747,50 +779,31 @@ function App() {
   // has a live session but must first decide Restore vs Sign out.
   const showAuth = !session || recoveryActive || !!deletionScheduledAt;
 
-  // v6.6 — backstory gate sits BETWEEN auth-resolved and AppNavigator.
-  //   • showAuth      → AuthNavigator (no story; user isn't in the game yet)
-  //   • !backstorySeen → OnboardingBackstoryScreen (first launch, signed in)
-  //   • else          → AppNavigator (normal app)
-  //
-  // Note: recoveryActive users skip the story entirely on this device-pass.
-  // They're mid-password-reset; we don't want to ambush them with lore.
-  // They'll see it on their next clean app open if the flag is still false.
-  const showBackstory = !showAuth && backstorySeen === false;
+  // v4.6 — the backstory is NO LONGER a standalone pre-app branch. It moved
+  // into AppNavigator as a stack screen reached after the first child
+  // selection (see ChildSwitcher.handleSelect + the OnboardingBackstory
+  // screen in AppNavigator). This lets it personalise on the child's name,
+  // which was impossible when it ran before any child existed. App-state
+  // `backstorySeen` is still tracked (mount read + onBackstoryComplete flip)
+  // purely to gate the daily-greeting audio so it can't collide with the
+  // story.
 
   return (
     <ErrorBoundary screen="App">
       <SafeAreaProvider>
-        {showBackstory ? (
-          // Standalone branch — backstory replaces NavigationContainer entirely
-          // for its lifetime. We don't push it as a screen inside AppNavigator
-          // because it owns the whole viewport and has its own back/skip flow.
-          // On completion it sets backstorySeen=true and we re-render into
-          // the AppNavigator branch below.
-          <ErrorBoundary screen="OnboardingBackstoryScreen">
-            <Suspense
-              fallback={
-                <View style={{ flex: 1, backgroundColor: "#0f0620", alignItems: "center", justifyContent: "center" }}>
-                  <ActivityIndicator color="#f5c842" size="large" />
-                </View>
-              }
-            >
-              <OnboardingBackstoryScreen
-                onComplete={onBackstoryComplete}
-                // v3.1 — personalised greeting in panel 3. activeChild
-                // may briefly be null at first session if the child profile
-                // hasn't loaded yet; the screen falls back gracefully.
-                childName={activeChild?.display_name ?? null}
-              />
-            </Suspense>
-          </ErrorBoundary>
-        ) : (
-          <NavigationContainer
-            ref={navigationRef}
-            onStateChange={handleNavigationStateChange}
-          >
-            {showAuth ? <AuthNavigator /> : <AppNavigator />}
-          </NavigationContainer>
-        )}
+        <NavigationContainer
+          ref={navigationRef}
+          onStateChange={handleNavigationStateChange}
+        >
+          {showAuth ? (
+            <AuthNavigator />
+          ) : (
+            <AppNavigator
+              onBackstoryComplete={onBackstoryComplete}
+              backstoryChildName={activeChild?.display_name ?? null}
+            />
+          )}
+        </NavigationContainer>
 
         {/* N4 — Badge toast overlay */}
         <AchievementToastOverlay />

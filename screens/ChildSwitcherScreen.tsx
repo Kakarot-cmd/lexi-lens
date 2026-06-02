@@ -43,6 +43,7 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { supabase, signOut }  from "../lib/supabase";
 import { ParentPinGateModal } from "../components/ParentPinGateModal";
 import { useGameStore }       from "../store/gameStore";
+import { hasSeenBackstory }   from "../lib/backstoryGate";
 
 // ─── Navigation types ─────────────────────────────────────────────────────────
 
@@ -412,11 +413,24 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     });
     await Promise.all([loadQuests(), loadCompletedQuests()]);
 
-    // v4.6 — read the onboarding flag at tap-time, NOT from a render-closure.
-    // The store rehydrates from AsyncStorage asynchronously after mount; a tap
-    // in the window before rehydration completes could route on the default
-    // (false) and replay onboarding for a returning child — or, post-flip,
-    // skip it. getState() always reflects the live, rehydrated value.
+    // v4.6 — routing precedence: Backstory (once per device) → Onboarding
+    // (once per device) → QuestMap. The backstory MOVED here from a device-
+    // first-launch standalone branch so activeChild (just set above) is
+    // available for its panel-3 name personalisation.
+    //
+    // Both flags are read at tap-time, NOT from a render-closure: the store
+    // rehydrates from AsyncStorage asynchronously after mount, and the
+    // backstory flag is a direct AsyncStorage read. A stale closure could
+    // replay the story/tutorial for a returning child, or skip it for a
+    // first-timer. hasSeenBackstory() and getState() both reflect live state.
+    const [seenBackstory] = await Promise.all([hasSeenBackstory()]);
+    if (!seenBackstory) {
+      // OnboardingBackstory persists the flag on complete, then replaces
+      // itself with Onboarding (first run) or QuestMap.
+      navigation.navigate("OnboardingBackstory");
+      return;
+    }
+
     const seenOnboarding = useGameStore.getState().hasSeenOnboarding;
     if (!seenOnboarding) {
       navigation.navigate("Onboarding");

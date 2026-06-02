@@ -637,40 +637,13 @@ const styles = StyleSheet.create({
 
 // ─── First-launch gating helper ───────────────────────────────────────────────
 //
-// PRESERVED unchanged from v2 — App.tsx imports these and the public
-// contract must stay stable. Storage key is the same so existing users
-// who already saw v2's story don't see v3 again.
-
-import AsyncStorage from '@react-native-async-storage/async-storage';
-
-const KEY_SEEN = 'lexilens.backstory.seen';
-
-export async function hasSeenBackstory(): Promise<boolean> {
-  try {
-    const v = await AsyncStorage.getItem(KEY_SEEN);
-    return v === '1';
-  } catch {
-    // Fail safe: if storage broken, don't trap the user in the story screen
-    return true;
-  }
-}
-
-export async function markBackstorySeen(): Promise<void> {
-  try {
-    await AsyncStorage.setItem(KEY_SEEN, '1');
-  } catch {
-    /* no-op */
-  }
-}
-
-/**
- * Dev-only — reset the flag so the story shows again on next launch.
- * Wire to a ParentDashboard debug button if useful.
- */
-export async function resetBackstorySeen(): Promise<void> {
-  try {
-    await AsyncStorage.removeItem(KEY_SEEN);
-  } catch {
-    /* no-op */
-  }
-}
+// v4.6 — the gate read/write helpers now live in lib/backstoryGate.ts (a
+// Lumi-free module) so they can be imported eagerly WITHOUT dragging this
+// screen's LumiMascot → Reanimated → SVG import tree into the boot bundle.
+// Re-exported here only for backward compatibility; new importers should
+// pull from "../lib/backstoryGate" directly. Storage key is unchanged.
+export {
+  hasSeenBackstory,
+  markBackstorySeen,
+  resetBackstorySeen,
+} from '../lib/backstoryGate';

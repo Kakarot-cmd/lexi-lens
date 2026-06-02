@@ -17,12 +17,13 @@ export type AuthStackParamList = {
 };
 
 export type RootStackParamList = {
-  ChildSwitcher:   undefined;
-  QuestMap:        undefined;
-  Scan:            { questId: string; hardMode?: boolean };
-  ParentDashboard: undefined;
-  SpellBook:       undefined;
-  QuestGenerator:  undefined;
-  Onboarding:      undefined;
-  Paywall:         { reason?: string } | undefined;
+  ChildSwitcher:       undefined;
+  QuestMap:            undefined;
+  Scan:                { questId: string; hardMode?: boolean };
+  ParentDashboard:     undefined;
+  SpellBook:           undefined;
+  QuestGenerator:      undefined;
+  Onboarding:          undefined;
+  OnboardingBackstory: undefined;
+  Paywall:             { reason?: string } | undefined;
 };
