@@ -170,7 +170,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.35',
+    version: '1.0.36',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
