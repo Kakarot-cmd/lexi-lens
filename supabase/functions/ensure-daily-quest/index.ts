@@ -286,22 +286,55 @@ async function generateQuestViaModel(supabase: SupabaseClient): Promise<Generate
 
 // ─── Uniqueness checks (C3) ──────────────────────────────────────────────────
 
+// How many recent daily quests to de-duplicate against. A property set OR enemy
+// name that last appeared > RECENT_DAILY_WINDOW days ago is allowed to recur —
+// spaced repetition is GOOD for vocabulary retention, and a kid won't recall an
+// enemy from weeks ago. Scoping to recent dailies (not the whole quest library)
+// keeps generation robust as the library grows: a daily sharing a name/property
+// set with some parent-created quest the child never sees is harmless.
+const RECENT_DAILY_WINDOW = 14;
+
+// Fetch the last N daily quests with their linked quest's enemy_name +
+// required_properties in one query. Shared by both uniqueness checks so the
+// daily de-dupes against the same recent window for names and property sets.
+async function fetchRecentDailyQuests(
+  supabase: SupabaseClient,
+): Promise<Array<{ enemy_name: string; required_properties: Array<{ word?: unknown }> }>> {
+  const { data } = await supabase
+    .from("daily_quests")
+    .select("quest_id, quests:quest_id ( enemy_name, required_properties )")
+    .order("quest_date", { ascending: false })
+    .limit(RECENT_DAILY_WINDOW);
+
+  if (!data) return [];
+
+  return data.map((row) => {
+    const joined = (row as { quests?: unknown }).quests;
+    const q = (Array.isArray(joined) ? joined[0] : joined) as
+      { enemy_name?: unknown; required_properties?: unknown } | undefined;
+    return {
+      enemy_name: typeof q?.enemy_name === "string" ? q.enemy_name : "",
+      required_properties: Array.isArray(q?.required_properties)
+        ? (q!.required_properties as Array<{ word?: unknown }>)
+        : [],
+    };
+  });
+}
+
 async function nameCollides(
   supabase: SupabaseClient,
   enemyName: string,
 ): Promise<boolean> {
-  const { count } = await supabase
-    .from("quests")
-    .select("id", { count: "exact", head: true })
-    .ilike("enemy_name", enemyName.trim());
-  return (count ?? 0) > 0;
-}
+  const candidate = enemyName.trim().toLowerCase();
+  if (!candidate) return false;
 
-// How many recent daily quests to de-duplicate against. A property set that
-// last appeared > RECENT_DAILY_WINDOW days ago is allowed to recur — spaced
-// repetition is GOOD for vocabulary retention, and the fresh enemy/room/spell
-// skin makes a repeated property set feel like a new quest to a child.
-const RECENT_DAILY_WINDOW = 14;
+  // Scope to recent dailies only (not the whole quests library). Prevents the
+  // daily from repeating an enemy name seen in the last RECENT_DAILY_WINDOW
+  // dailies, while allowing reuse of names that only exist on parent-created
+  // quests (never shown as a daily) or on dailies older than the window.
+  const recent = await fetchRecentDailyQuests(supabase);
+  return recent.some((q) => q.enemy_name.trim().toLowerCase() === candidate);
+}
 
 async function propertySetCollides(
   supabase: SupabaseClient,
@@ -319,24 +352,10 @@ async function propertySetCollides(
   // a globally-unique property set; it only needs to differ from quests the
   // child has seen as a daily recently. Reusing a set that some parent-created
   // library quest happens to use is fine — the child never sees that quest.
-  const { data: recentDailies } = await supabase
-    .from("daily_quests")
-    .select("quest_id, quests:quest_id ( required_properties )")
-    .order("quest_date", { ascending: false })
-    .limit(RECENT_DAILY_WINDOW);
+  const recent = await fetchRecentDailyQuests(supabase);
 
-  if (!recentDailies) return false;
-
-  for (const row of recentDailies) {
-    // quests join may come back as an object or a single-element array
-    // depending on the relationship shape — normalise both.
-    const joined = (row as { quests?: unknown }).quests;
-    const questObj = Array.isArray(joined) ? joined[0] : joined;
-    const existing = Array.isArray((questObj as { required_properties?: unknown })?.required_properties)
-      ? (questObj as { required_properties: Array<{ word?: unknown }> }).required_properties
-      : [];
-
-    const existingWords = existing
+  for (const q of recent) {
+    const existingWords = q.required_properties
       .map(p => typeof p?.word === "string" ? p.word.toLowerCase().trim() : "")
       .filter(w => w.length > 0)
       .sort();
