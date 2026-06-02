@@ -358,12 +358,14 @@ export function ChildSwitcherScreen({ navigation }: Props) {
   const [parentEmail, setParentEmail] = useState("");
   const [pinVisible, setPinVisible] = useState(false);
 
-  const {
-    startChildSession,
-    loadQuests,
-    loadCompletedQuests,
-    hasSeenOnboarding,
-  } = useGameStore();
+  // v4.6 — select individual slices instead of destructuring the whole store.
+  // `const { ... } = useGameStore()` subscribes this component to EVERY state
+  // change (scans, XP, streak, spellbook…), re-rendering the root-stack screen
+  // needlessly. Per-field selectors only re-render when that field changes.
+  const startChildSession   = useGameStore((s) => s.startChildSession);
+  const loadQuests          = useGameStore((s) => s.loadQuests);
+  const loadCompletedQuests = useGameStore((s) => s.loadCompletedQuests);
+  const endChildSession     = useGameStore((s) => s.endChildSession);
 
   // ── Fetch children ─────────────────────────────────────────────────────────
 
@@ -410,13 +412,18 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     });
     await Promise.all([loadQuests(), loadCompletedQuests()]);
 
-    // N1: route to onboarding on first launch, QuestMap thereafter
-    if (!hasSeenOnboarding) {
+    // v4.6 — read the onboarding flag at tap-time, NOT from a render-closure.
+    // The store rehydrates from AsyncStorage asynchronously after mount; a tap
+    // in the window before rehydration completes could route on the default
+    // (false) and replay onboarding for a returning child — or, post-flip,
+    // skip it. getState() always reflects the live, rehydrated value.
+    const seenOnboarding = useGameStore.getState().hasSeenOnboarding;
+    if (!seenOnboarding) {
       navigation.navigate("Onboarding");
     } else {
       navigation.navigate("QuestMap");
     }
-  }, [startChildSession, loadQuests, loadCompletedQuests, navigation, hasSeenOnboarding]);
+  }, [startChildSession, loadQuests, loadCompletedQuests, navigation]);
 
   const handleDelete = useCallback((id: string) => {
     Alert.alert(
@@ -428,13 +435,31 @@ export function ChildSwitcherScreen({ navigation }: Props) {
           text:    "Remove",
           style:   "destructive",
           onPress: async () => {
-            await supabase.from("child_profiles").delete().eq("id", id);
+            const { error } = await supabase
+              .from("child_profiles")
+              .delete()
+              .eq("id", id);
+
+            if (error) {
+              Alert.alert("Couldn't remove profile", error.message);
+              return;
+            }
+
+            // v4.6 — activeChild is persisted (AsyncStorage). If the parent
+            // just deleted the child whose session is active, the store would
+            // keep pointing at a now-deleted DB row — any later read (deep
+            // link, cold-start QuestMap) operates on a ghost. Clear it.
+            if (useGameStore.getState().activeChild?.id === id) {
+              endChildSession();
+            }
+
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
             fetchChildren();
           },
         },
       ]
     );
-  }, [fetchChildren]);
+  }, [fetchChildren, endChildSession]);
 
   const handleSignOut = useCallback(async () => {
     setSigningOut(true);
