@@ -842,6 +842,16 @@ export default function QuestGeneratorScreen({
         sort_order:           8,
         xp_reward_first_try:  40,
         xp_reward_retry:      20,
+        // v4.6 — MUST set explicitly. The DB column defaults to 'paid'
+        // (NOT NULL DEFAULT 'paid'), so omitting it silently paywalls the
+        // quest. A custom quest is a parent's PRIVATE creation for their own
+        // child (visibility:'private', created_by, target_child_id). Custom
+        // generation is itself the Premium gate (server-side, 402→Paywall),
+        // so the saved artifact must be 'free': otherwise if the parent's
+        // subscription ever lapses, their OWN quests would lock behind the
+        // paywall — punitive and confusing. The creation was gated; the
+        // result should not be re-gated.
+        min_subscription_tier: "free",
         required_properties:  quest.required_properties,
         hard_mode_properties: quest.hard_mode_properties ?? [],
         age_band_properties:  {},

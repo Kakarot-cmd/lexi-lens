@@ -1,0 +1,113 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Lexi-Lens  ·  Daily Quest Provisioner
+#
+# Why this exists
+#   ensure-daily-quest is idempotent but has NO trigger of its own — it only
+#   ran when a client opened QuestMap (loadDailyQuest). Pre-launch, no build
+#   points at PROD Supabase, so daily_quests stayed empty (confirmed: 0 rows).
+#   Post-launch, the lazy trigger still has two flaws: the first user each UTC
+#   day eats a synchronous generation, and a zero-traffic day gets no quest.
+#
+#   This job calls the function at 00:00 UTC so the quest is pre-provisioned
+#   before any user opens the app, independent of traffic. The function is
+#   idempotent on quest_date (UNIQUE), so a coincidental client call the same
+#   day converges harmlessly — no double-generation.
+#
+# Triggers
+#   • schedule  — 00:00 UTC daily (GitHub cron is best-effort; may drift a few
+#                 minutes under load, which is fine for a daily rotation).
+#   • workflow_dispatch — manual run, with an env picker, for testing/backfill.
+#
+# Required secrets (set in GitHub → Settings → Secrets and variables → Actions):
+#   PROD_SUPABASE_FUNCTIONS_URL      e.g. https://vwlfzvabvlcozqpepsoi.supabase.co/functions/v1
+#   PROD_SUPABASE_SERVICE_ROLE_KEY   PROD service-role key (NOT the anon key)
+#   STAGING_SUPABASE_FUNCTIONS_URL   e.g. https://zhnaxafmacygbhpvtwvf.supabase.co/functions/v1
+#   STAGING_SUPABASE_SERVICE_ROLE_KEY
+#
+#   The function gates DB access with its OWN service-role key internally; the
+#   key sent here only satisfies the platform's verify_jwt on the endpoint.
+#   The service-role key is used because it is a non-expiring server credential;
+#   keep it in GitHub Secrets only — never commit it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Daily Quest Provisioner
+
+"on":
+  schedule:
+    # 00:00 UTC every day. Cron is in UTC; matches the function's UTC-anchored
+    # quest_date so the run provisions the correct day.
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Which environment to provision'
+        required: true
+        default: production
+        type: choice
+        options:
+          - production
+          - staging
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target environment
+        id: target
+        run: |
+          # Scheduled runs always target production. Manual runs honour the
+          # picker (defaults to production). We only emit the ENV NAME here —
+          # never the secret values — so no credential touches step outputs.
+          ENV_NAME="${{ github.event.inputs.environment || 'production' }}"
+          echo "env_name=$ENV_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Invoke ensure-daily-quest
+        env:
+          ENV_NAME: ${{ steps.target.outputs.env_name }}
+          # Both envs' secrets are exposed to the step; the script picks one by
+          # ENV_NAME. Secrets are masked in logs and never written to outputs.
+          PROD_BASE_URL:    ${{ secrets.PROD_SUPABASE_FUNCTIONS_URL }}
+          PROD_KEY:         ${{ secrets.PROD_SUPABASE_SERVICE_ROLE_KEY }}
+          STAGING_BASE_URL: ${{ secrets.STAGING_SUPABASE_FUNCTIONS_URL }}
+          STAGING_KEY:      ${{ secrets.STAGING_SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ "$ENV_NAME" = "staging" ]; then
+            BASE_URL="$STAGING_BASE_URL"; SERVICE_KEY="$STAGING_KEY"
+          else
+            BASE_URL="$PROD_BASE_URL";    SERVICE_KEY="$PROD_KEY"
+          fi
+
+          if [ -z "${BASE_URL:-}" ] || [ -z "${SERVICE_KEY:-}" ]; then
+            echo "::error::Missing secrets for environment '$ENV_NAME'. Set the *_SUPABASE_FUNCTIONS_URL and *_SUPABASE_SERVICE_ROLE_KEY secrets."
+            exit 1
+          fi
+
+          echo "Provisioning daily quest for: $ENV_NAME"
+
+          # Capture body + HTTP status separately so we can fail the job on a
+          # non-2xx (otherwise a silent 4xx/5xx would look like success).
+          HTTP_CODE=$(curl --silent --show-error \
+            --output /tmp/resp.json \
+            --write-out "%{http_code}" \
+            --request POST "${BASE_URL}/ensure-daily-quest" \
+            --header "Authorization: Bearer ${SERVICE_KEY}" \
+            --header "Content-Type: application/json" \
+            --data '{}')
+
+          echo "HTTP $HTTP_CODE"
+          echo "Response:"
+          cat /tmp/resp.json || true
+          echo ""
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::ensure-daily-quest returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          # Surface whether a fresh quest was generated vs a fallback was used,
+          # so the Action log doubles as observability for the gemini gen path.
+          if grep -q '"fallback":true' /tmp/resp.json; then
+            echo "::warning::Daily quest used the round-robin FALLBACK (generation did not produce a fresh quest). Check the function logs."
+          fi
