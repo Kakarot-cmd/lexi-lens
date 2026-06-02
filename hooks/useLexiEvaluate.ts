@@ -648,7 +648,13 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
       // ── v3.5: Rate limit error — friendly handling ───────────────────────
       if (err instanceof RateLimitResponseError) {
         const { code, scansToday: s, limit, resetsAt: ra } = err.payload;
-        setRateLimitCode(code);
+        // Guard: ScanScreen only renders the RateLimitWall when BOTH status is
+        // "rate_limited" AND rateLimitCode is truthy. If a 429 ever arrives with
+        // a missing/null code, a null here would set status without a code and
+        // leave the verdict phase rendering nothing (soft-lock). Default to the
+        // less-severe IP_LIMIT (a 60s cooldown that self-resolves) rather than
+        // implying the child burned their whole daily quota.
+        setRateLimitCode(code ?? "IP_LIMIT");
         if (s !== undefined)     setScansToday(s);
         if (limit !== undefined) setDailyLimit(limit);
         if (ra)                  setResetsAt(ra);

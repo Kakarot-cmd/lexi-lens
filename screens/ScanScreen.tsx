@@ -562,8 +562,33 @@ export function ScanScreen({ route, navigation }: Props) {
 
       if (newlyPassing.length > 0) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        const totalXpThisScan = Math.round((result.xpAwarded || 20) * streakMultiplier);
-        const xpEach = Math.max(10, Math.floor(totalXpThisScan / newlyPassing.length));
+
+        // XP authority is the server. computeXp() already factors base rate ×
+        // passingCount × multiBonus; we layer only the client-only streak
+        // multiplier on top. We do NOT re-derive XP client-side (that would
+        // duplicate the server formula and drift). Staging data (286 scans)
+        // showed xpAwarded is never 0/null while a property passes, so the
+        // branch below should never fire — but if it ever does (e.g. a future
+        // partial-cache-hit path that scopes xpAwarded to a subset), we award
+        // 0 and breadcrumb the anomaly rather than minting a phantom default.
+        const serverXp = result.xpAwarded;
+        if (typeof serverXp !== "number" || !Number.isFinite(serverXp) || serverXp <= 0) {
+          addGameBreadcrumb({
+            category: "verdict",
+            message:  "xp_missing_while_passing",
+            level:    "warning",
+            data: {
+              questId:        aq.quest.id,
+              xpAwarded:      serverXp ?? null,
+              newlyPassing:   newlyPassing.map((p) => p.word),
+              failedAttempts: currentAttempts,
+            },
+          });
+        }
+        const totalXpThisScan = Math.round((serverXp ?? 0) * streakMultiplier);
+        const xpEach = totalXpThisScan > 0
+          ? Math.max(10, Math.floor(totalXpThisScan / newlyPassing.length))
+          : 0;
 
         recordComponentsFound(
           newlyPassing.map((p) => ({
@@ -939,10 +964,10 @@ export function ScanScreen({ route, navigation }: Props) {
         </View>
       )}
 
-      {phase === "verdict" && status === "rate_limited" && rateLimitCode && (
+      {phase === "verdict" && status === "rate_limited" && (
         <View style={StyleSheet.absoluteFillObject}>
           <RateLimitWall
-            code={rateLimitCode}
+            code={rateLimitCode ?? "IP_LIMIT"}
             scansToday={scansToday}
             dailyLimit={dailyLimit}
             resetsAt={resetsAt}
