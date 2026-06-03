@@ -67,8 +67,8 @@ const SECTIONS: PolicySection[] = [
 
 We take children's privacy very seriously. We comply fully with the Children's Online Privacy Protection Act (COPPA), the provisions of the EU General Data Protection Regulation that apply to children (GDPR-K), and the requirements of the Google Play "Designed for Families" programme and Apple App Store Kids category.
 
-Contact for privacy matters: privacy@lexi-lens.app
-Last updated: April 2025  |  Policy version: 1.0`,
+Contact for privacy matters: beautifulhearts.n@gmail.com
+Last updated: June 2026  |  Policy version: 1.1`,
   },
   {
     id:    "collect",
@@ -89,7 +89,7 @@ GAMEPLAY DATA:
 • Words scanned (the object label detected by the camera, e.g. "apple").
 • XP points awarded per scan.
 • Quest completion status.
-• Scan attempt logs: the detected object label, camera confidence score, Claude AI verdict, and timestamp. Camera frames are never stored — they are processed on-device and immediately discarded.
+• Scan attempt logs: the detected object label, camera confidence score, Claude AI verdict, and timestamp. The camera frame is sent to our AI provider for real-time processing and is never stored on our servers or written to your photo library — it is discarded immediately after the verdict is returned.
 
 WHAT WE ABSOLUTELY DO NOT COLLECT FOR CHILDREN:
 • Email address or username
@@ -133,20 +133,19 @@ WE DO NOT USE DATA FOR:
     id:    "ai",
     emoji: "🤖",
     title: "How Claude AI is used",
-    body: `When a child scans an object with the camera, our app uses Google ML Kit Vision to detect an object label entirely on-device (e.g. "apple"). This label — and only this label — is then sent to Anthropic's Claude AI API to check whether it matches the vocabulary quest target.
+    body: `When a child scans an object with the camera, the camera frame is sent to our evaluation service, which forwards it to Anthropic's Claude AI to identify the object and check whether it matches the vocabulary quest target.
 
 WHAT IS SENT TO CLAUDE AI:
-• The detected object label (a single word or short phrase, e.g. "apple")
+• The camera frame (image) captured for the scan
 • The quest target word and its vocabulary properties (e.g. "fruit, red, round")
 • The child's age band — used to calibrate the difficulty of feedback language (e.g. "7–8 years")
 
 WHAT IS NEVER SENT TO CLAUDE AI:
-• Any image or photo
 • The child's name, exact age, or any personal identifier
 • The parent's email address or any account information
 • Device identifiers or location
 
-Claude's response (a structured JSON verdict) is returned immediately and displayed to the child. Anthropic processes API requests under their own privacy policy (anthropic.com/privacy). Object labels submitted via the API are not used by Anthropic to train future models under the terms of the API agreement.`,
+The camera frame is processed in real time and is not stored on our servers or written to your photo library. Claude's response (a structured JSON verdict) is returned immediately and displayed to the child. Anthropic processes API requests under their own privacy policy (anthropic.com/privacy). Data submitted via the API is not used by Anthropic to train future models under the terms of the API agreement.`,
   },
   {
     id:    "sharing",
@@ -181,7 +180,7 @@ WE DO NOT SHARE DATA WITH:
     id:    "retention",
     emoji: "📅",
     title: "How long we keep data",
-    body: `PARENT ACCOUNT DATA: Retained for the lifetime of the account. Permanently deleted within 30 days of an account deletion request via the in-app Delete Account flow or by emailing privacy@lexi-lens.app.
+    body: `PARENT ACCOUNT DATA: Retained for the lifetime of the account. Permanently deleted within 30 days of an account deletion request via the in-app Delete Account flow or by emailing beautifulhearts.n@gmail.com.
 
 CHILD PROFILE DATA (name, age band, avatar): Deleted immediately when a parent removes the child profile. Deleted within 24 hours of an account deletion request.
 
@@ -213,7 +212,7 @@ UNDER GDPR (EU/UK PARENTS), you also have the right to:
 
 HOW TO EXERCISE YOUR RIGHTS:
 • In-app: Parent Dashboard → Settings → Delete Account (for full deletion)
-• By email: privacy@lexi-lens.app (for access, portability, or other requests)
+• By email: beautifulhearts.n@gmail.com (for access, portability, or other requests)
 • We will respond within 30 days. For children's data, we will prioritise and aim to respond within 5 business days.`,
   },
   {
@@ -226,13 +225,13 @@ DATA AT REST: Supabase stores all data encrypted at rest using AES-256 with keys
 
 PASSWORDS: Bcrypt-hashed with a cost factor of 10. We can never read your password.
 
-CAMERA: The camera is used exclusively for real-time object detection via Google ML Kit Vision running entirely on-device. No camera frames, images, or video are transmitted over the network, stored on our servers, or seen by any human.
+CAMERA: The camera is used exclusively for real-time object recognition during scans. The camera frame is transmitted to our AI provider (Anthropic) for processing and discarded immediately after the verdict; it is never stored on our servers, never written to your photo library, never seen by any human, and never shared with advertisers.
 
 ROW LEVEL SECURITY: PostgreSQL Row Level Security (RLS) policies ensure that each parent can only read and write their own account and their children's data. There is no way for one parent to access another parent's data via the Supabase client.
 
 EDGE FUNCTION SECURITY: All write operations and AI calls go through authenticated Edge Functions. The mobile app uses an anonymous key that can only read/write data belonging to the authenticated user.
 
-VULNERABILITY DISCLOSURE: If you discover a security issue, please email security@lexi-lens.app. Do not open a public GitHub issue. We will acknowledge within 48 hours and aim to release a fix within 7 days.`,
+VULNERABILITY DISCLOSURE: If you discover a security issue, please email beautifulhearts.n@gmail.com. Do not open a public GitHub issue. We will acknowledge within 48 hours and aim to release a fix within 7 days.`,
   },
   {
     id:    "children",
@@ -250,7 +249,7 @@ VULNERABILITY DISCLOSURE: If you discover a security issue, please email securit
 
 • We do not knowingly collect any information from children beyond what is strictly necessary for the educational vocabulary game to function (name, age band, words scanned, XP).
 
-• If we discover we have accidentally collected data from a child under 5 (below our target age), we will delete it immediately. Please contact privacy@lexi-lens.app if you believe this has occurred.`,
+• If we discover we have accidentally collected data from a child under 5 (below our target age), we will delete it immediately. Please contact beautifulhearts.n@gmail.com if you believe this has occurred.`,
   },
   {
     id:    "changes",
@@ -263,7 +262,7 @@ VULNERABILITY DISCLOSURE: If you discover a security issue, please email securit
 
 Minor changes (correcting typos, clarifying existing practices, updating contact details) may be made without notice, but the version number and "Last updated" date at the top of this page will always change.
 
-You can view the history of all policy versions at lexi-lens.app/privacy/history.
+Each published version of this policy carries a version number and "Last updated" date at the top of this page.
 
 If you do not agree with a material change, you may delete your account at any time via Parent Dashboard → Settings → Delete Account, and all your data will be deleted within 30 days.`,
   },
@@ -273,11 +272,11 @@ If you do not agree with a material change, you may delete your account at any t
     title: "Contact us",
     body: `For any privacy-related question, data access request, or concern about your child's data:
 
-Email: privacy@lexi-lens.app
+Email: beautifulhearts.n@gmail.com
 Response time: Within 30 days (we aim for within 5 business days for children's data requests)
 
 For security vulnerabilities:
-Email: security@lexi-lens.app
+Email: beautifulhearts.n@gmail.com
 
 For urgent child safety concerns, please contact your local child protection authority directly. We cooperate fully with legitimate law enforcement requests.
 
@@ -352,11 +351,11 @@ export function PrivacyPolicyScreen({ onClose }: Props) {
         {/* Email contact CTA */}
         <TouchableOpacity
           style={styles.emailBtn}
-          onPress={() => Linking.openURL("mailto:privacy@lexi-lens.app").catch(() => null)}
+          onPress={() => Linking.openURL("mailto:beautifulhearts.n@gmail.com").catch(() => null)}
           accessibilityRole="link"
-          accessibilityLabel="Email privacy@lexi-lens.app"
+          accessibilityLabel="Email beautifulhearts.n@gmail.com"
         >
-          <Text style={styles.emailBtnText}>📬  Email  privacy@lexi-lens.app</Text>
+          <Text style={styles.emailBtnText}>📬  Email  beautifulhearts.n@gmail.com</Text>
         </TouchableOpacity>
 
         <Text style={styles.footer}>
