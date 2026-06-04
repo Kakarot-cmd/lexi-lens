@@ -314,12 +314,18 @@ export default function PaywallScreen({ navigation, route }: Props) {
             to test purchases.
           </Text>
           <View style={styles.bullets}>
-            {/* HONEST COPY (audit 2026-05-17): only claim what is actually
-                enforced in code today. tier1 cap = 20/day, free = 5/day
-                (tier_config). Do NOT re-add quest-count / AI-quest /
-                hard-mode / sibling bullets until each is genuinely
-                premium-gated. */}
-            <Bullet>20 scans per day — 4x the free daily limit of 5</Bullet>
+            {/* HONEST COPY (verified 2026-06-04 against live tier_config +
+                Edge Function gates): tier1 cap = 100/day, free = 10/day.
+                Quest library is RLS-gated (quests.min_subscription_tier);
+                custom AI quests (generate-quest) are premium-gated via
+                _shared/featureAccess.ts. hard-mode / sibling remain free —
+                do NOT add those bullets. TODO: source the scan numbers from
+                tier_config / the rate-limit payload instead of hardcoding,
+                so they don't go stale again. */}
+            <Bullet>Up to 100 word-scans a day — 10x the free limit of 10</Bullet>
+            <Bullet>Every quest unlocked (the free plan includes a starter set)</Bullet>
+            <Bullet>New quests created by AI for your child's level</Bullet>
+            <Bullet>Download a report of every word your child has learnt</Bullet>
           </View>
         </ScrollView>
       </View>
@@ -371,12 +377,14 @@ export default function PaywallScreen({ navigation, route }: Props) {
         </Text>
 
         <View style={styles.bullets}>
-          {/* HONEST COPY (audit 2026-05-17): the four removed bullets
-              describe features that are NOT premium-gated in this build
-              (AI quests, hard mode, sibling profiles are free for everyone;
-              zero paid-tier quests are seeded). Restore each only after it
-              is actually gated. */}
-          <Bullet>20 scans per day — 4x the free daily limit of 5</Bullet>
+          {/* HONEST COPY (verified 2026-06-04): quest library is RLS-gated,
+              custom AI quests (generate-quest) and Word Tome export are
+              premium-gated via _shared/featureAccess.ts. hard-mode / sibling
+              are still free — do NOT add those bullets. */}
+          <Bullet>Up to 100 word-scans a day — 10x the free limit of 10</Bullet>
+          <Bullet>Every quest unlocked (the free plan includes a starter set)</Bullet>
+          <Bullet>New quests created by AI for your child's level</Bullet>
+          <Bullet>Download a report of every word your child has learnt</Bullet>
         </View>
 
         <View style={styles.divider} />
@@ -449,9 +457,9 @@ function hasIntroOffer(pkgs: PurchasesPackage[], selectedId: string | null): boo
 function reasonCopy(reason: string): string {
   switch (reason) {
     case "rate-limit":
-      return "You've hit today's free scan limit. Premium gives you unlimited daily scans and the full quest library.";
+      return "You've hit today's free scan limit. Premium gives you up to 100 scans a day and the full quest library.";
     case "quest-locked":
-      return "This is a Premium quest. Unlock the full quest library, custom AI quests, and unlimited scans.";
+      return "This is a Premium quest. Unlock the full quest library, custom AI quests, and up to 100 scans a day.";
     case "parent-dashboard":
       return "Take your child's adventure further with the full Premium experience.";
     default:
