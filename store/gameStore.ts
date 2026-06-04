@@ -292,6 +292,7 @@ export interface DailyQuestState {
   questId:   string | null;
   questDate: string;
   isLoaded:  boolean;
+  recent:    Quest[];   // v6.5: today + up to 2 prior days' daily quest objects, newest first
 }
 
 export interface SpellUnlock {
@@ -463,6 +464,7 @@ const DEFAULT_DAILY_QUEST: DailyQuestState = {
   questId:   null,
   questDate: "",
   isLoaded:  false,
+  recent:    [],
 };
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -596,6 +598,7 @@ export const useGameStore = create<GameState>()(
             .from("quests")
             .select("*")
             .eq("is_active", true)
+            .eq("is_daily", false)   // v6.5: dailies live in the daily window, not the curated library
             .order("tier",       { ascending: true })
             .order("sort_order", { ascending: true });
 
@@ -1190,11 +1193,47 @@ export const useGameStore = create<GameState>()(
           }
         }
 
+        // v6.5: fetch the rolling 3-day daily window (today + 2 prior UTC
+        // days) as full quest objects. The banner + RecentDailiesRow render
+        // these directly, so they survive is_daily quests being excluded from
+        // questLibrary. Server (get_evaluate_context) grants free access to the
+        // same window, so these are playable on the free tier.
+        let recent: Quest[] = [];
+        try {
+          const windowStartUtc = new Date(Date.now() - 2 * 86_400_000)
+            .toISOString()
+            .slice(0, 10);
+          const { data: recentRows } = await supabase
+            .from("daily_quests")
+            .select("quest_date, quests:quest_id ( * )")
+            .gte("quest_date", windowStartUtc)
+            .order("quest_date", { ascending: false });
+
+          const seen = new Set<string>();
+          for (const row of recentRows ?? []) {
+            const joined = (row as { quests?: unknown }).quests;
+            const q = (Array.isArray(joined) ? joined[0] : joined) as any;
+            if (q && q.id && !seen.has(q.id)) {
+              seen.add(q.id);
+              recent.push({
+                ...q,
+                tier: (q.tier as QuestTier) ?? "apprentice",
+                hard_mode_properties: Array.isArray(q.hard_mode_properties)
+                  ? q.hard_mode_properties
+                  : [],
+              } as Quest);
+            }
+          }
+        } catch {
+          recent = [];
+        }
+
         set({
           dailyQuest: {
             questId,
             questDate: todayLocal,
             isLoaded:  true,
+            recent,
           },
         });
 
@@ -1433,7 +1472,9 @@ export const selectIsPlayingDailyQuest = (state: GameState): boolean =>
 
 export const selectDailyQuest = (state: GameState): Quest | null =>
   state.dailyQuest.questId
-    ? (state.questLibrary.find((q) => q.id === state.dailyQuest.questId) ?? null)
+    ? (state.dailyQuest.recent.find((q) => q.id === state.dailyQuest.questId)
+        ?? state.questLibrary.find((q) => q.id === state.dailyQuest.questId)
+        ?? null)
     : null;
 
 export const selectSpellsUnlockedCount = (state: GameState): number => {

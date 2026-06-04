@@ -248,17 +248,31 @@ async function readDailyQuestMinTier(supabase: SupabaseClient): Promise<DailyMin
 
 // ─── Model call (provider via factory; default anthropic = unchanged) ────────
 
-async function generateQuestViaModel(supabase: SupabaseClient): Promise<GeneratedQuest> {
+async function generateQuestViaModel(
+  supabase:   SupabaseClient,
+  avoidNames: string[] = [],
+): Promise<GeneratedQuest> {
   // Wired to the shared factory for consistency with the other model-calling
   // functions. Default stays 'anthropic' (Haiku) via the seed migration —
   // this is a ~1-call/day-globally function, so cost is irrelevant; the only
   // goal here is that no function is left on a raw hardcoded fetch (avoids
   // the next "wait, is this one dynamic?" surprise). Flip the flag if ever
   // desired, but there is no cost reason to.
+  //
+  // avoidNames: recent-daily enemy names + names already tried this run. Fed
+  // into the prompt so each (re)generation steers AWAY from collisions.
+  // Without this, a low-diversity model returns the same enemy name on every
+  // retry and all attempts collide → fallback (the 2026-06 repeating-daily bug).
+  const avoidClause = avoidNames.length
+    ? ` Do NOT use any of these enemy names — they were used recently or just ` +
+      `attempted and rejected: ${avoidNames.map((n) => `"${n}"`).join(", ")}. ` +
+      `Invent a clearly different enemy name and theme.`
+    : "";
+
   const adapter = await getModelAdapter("generate-quest", supabase);
   const result  = await adapter.call({
     systemPrompt: SYSTEM_PROMPT,
-    userText:     USER_MESSAGE,
+    userText:     USER_MESSAGE + avoidClause,
     maxTokens:    MAX_TOKENS,
     jsonMode:     true,
   });
@@ -371,26 +385,27 @@ async function propertySetCollides(
 // ─── Fallback: existing free quest, deterministic by UTC day ─────────────────
 
 async function pickFallbackQuest(
-  supabase: SupabaseClient,
-  minTier:  DailyMinTier,
+  supabase:  SupabaseClient,
+  _minTier:  DailyMinTier,
 ): Promise<string | null> {
+  // 20260604 fork decision: NEVER reuse a curated library quest as the daily.
+  // On total generation failure (rare after the avoid-list fix), reuse the most
+  // recent PREVIOUSLY-GENERATED daily (is_daily = true) so a daily is still
+  // present without polluting the curated library. If none exists yet (only on
+  // a brand-new DB whose very first generation also failed), return null — the
+  // caller 500s and the client's local round-robin covers display. _minTier is
+  // unused: a past generated daily already carries the correct tier.
   const { data } = await supabase
     .from("quests")
     .select("id")
     .eq("is_active", true)
-    .eq("min_subscription_tier", minTier)
-    // Constrain to the apprentice tier regardless of minTier. Without this,
-    // flipping the flag to 'paid' would let the fallback surface ANY paid
-    // quest (up to archmage) as the gentle "daily" — a sharp difficulty
-    // cliff. The 3 curated starters are apprentice, so the free pool is
-    // unaffected; the paid pool is correctly limited to easy quests.
+    .eq("is_daily", true)
     .eq("tier", DAILY_TIER)
-    .order("created_at", { ascending: true });
+    .order("created_at", { ascending: false })
+    .limit(1);
 
   if (!data || data.length === 0) return null;
-  // Deterministic by UTC day-count so all clients converge on the same fallback.
-  const dayIndex = Math.floor(Date.now() / 86_400_000) % data.length;
-  return (data[dayIndex] as { id: string }).id;
+  return (data[0] as { id: string }).id;
 }
 
 // ─── Insert helpers ──────────────────────────────────────────────────────────
@@ -419,6 +434,7 @@ async function insertQuest(
       visibility:            "public",
       created_by:            null,
       is_active:             true,
+      is_daily:              true,   // 20260604: keep generated dailies out of the curated library
     })
     .select("id")
     .single();
@@ -520,19 +536,30 @@ Deno.serve(async (req: Request) => {
   let attempt = 0;
   let lastFailReason = "";
 
+  // Seed the avoid-list with recent dailies' enemy names so generation steers
+  // clear of collisions from attempt #1, then grow it with every name we try.
+  // This is the fix for the repeating-daily bug: previously the model was
+  // called identically each retry and returned the same colliding name.
+  const recentDailies = await fetchRecentDailyQuests(supabase);
+  const avoidNames: string[] = recentDailies
+    .map((q) => q.enemy_name)
+    .filter((n) => n.trim().length > 0);
+
   while (attempt <= MAX_RETRIES) {
     attempt++;
     try {
-      const candidate = await generateQuestViaModel(supabase);
+      const candidate = await generateQuestViaModel(supabase, avoidNames);
 
       if (await nameCollides(supabase, candidate.enemy_name)) {
         lastFailReason = `name_collision: "${candidate.enemy_name}"`;
         console.log(`[ensure-daily-quest] attempt ${attempt} ${lastFailReason}`);
+        avoidNames.push(candidate.enemy_name); // never offer it again this run
         continue;
       }
       if (await propertySetCollides(supabase, candidate.required_properties)) {
         lastFailReason = `property_set_collision`;
         console.log(`[ensure-daily-quest] attempt ${attempt} ${lastFailReason}`);
+        avoidNames.push(candidate.enemy_name); // diversify the next attempt
         continue;
       }
 

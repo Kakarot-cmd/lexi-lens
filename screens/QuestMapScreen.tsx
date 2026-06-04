@@ -57,6 +57,7 @@ import {
 } from "../store/gameStore";
 
 import { DailyQuestBanner } from "../components/DailyQuestBanner";
+import { RecentDailiesRow } from "../components/RecentDailiesRow";
 import { StreakBar }         from "../components/StreakBar";
 import { LumiHUD }           from "../components/Lumi";
 
@@ -552,6 +553,15 @@ export function QuestMapScreen({ navigation }: Props) {
     navigation.navigate("Scan", { questId: dailyQuestObj.id, hardMode: false });
   }, [dailyQuestObj, navigation]);
 
+  // v6.5 — open a past daily from the rolling 3-day free window
+  const handleRecentDailySelect = useCallback(
+    (questId: string) => {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      navigation.navigate("Scan", { questId, hardMode: false });
+    },
+    [navigation]
+  );
+
   // Phase 4.4 — locked premium quest tap → PaywallScreen modal. Lifted here
   // (vs inside QuestCard) so navigation is in scope. Haptic fires in the card.
   const handleLockedTap = useCallback(() => {
@@ -661,10 +671,11 @@ export function QuestMapScreen({ navigation }: Props) {
     () => (
       <View>
         <DailyQuestBanner onPress={handleDailyQuestPress} />
+        <RecentDailiesRow onSelect={handleRecentDailySelect} />
         <StreakBar variant="full" />
       </View>
     ),
-    [handleDailyQuestPress]
+    [handleDailyQuestPress, handleRecentDailySelect]
   );
 
   // ── Render ─────────────────────────────────────────────────────────────────
