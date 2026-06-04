@@ -170,7 +170,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.36',
+    version: '1.0.37',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -192,7 +192,7 @@ export default {
       // archive. Must be unique + higher than any build already uploaded for
       // the current `version` string. (appVersionSource:"remote" in eas.json
       // only affects EAS cloud builds, not local archives — this wins here.)
-      buildNumber: '35',
+      buildNumber: '37',
       supportsTablet: true,
       entitlements: {
         'aps-environment': VARIANT === 'production' ? 'production' : 'development',
