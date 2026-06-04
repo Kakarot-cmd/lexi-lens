@@ -58,6 +58,7 @@ import {
 
 import { DailyQuestBanner } from "../components/DailyQuestBanner";
 import { RecentDailiesRow } from "../components/RecentDailiesRow";
+import { PremiumTeaserRow } from "../components/PremiumTeaserRow";
 import { StreakBar }         from "../components/StreakBar";
 import { LumiHUD }           from "../components/Lumi";
 
@@ -591,6 +592,11 @@ export function QuestMapScreen({ navigation }: Props) {
 
       // v4.6 — sort by bucket, then sort_order within bucket (stable feel).
       const sorted = [...group.quests].sort((a, b) => {
+        // v6.5 — playable quests first. A free child shouldn't have to scroll
+        // past locked Premium cards to find what they can actually start.
+        const la = selectIsQuestLocked(a, parentTier) ? 1 : 0;
+        const lb = selectIsQuestLocked(b, parentTier) ? 1 : 0;
+        if (la !== lb) return la - lb;
         const ba = questBucket(a);
         const bb = questBucket(b);
         if (ba !== bb) return ba - bb;
@@ -617,7 +623,7 @@ export function QuestMapScreen({ navigation }: Props) {
         data,
       };
     });
-  }, [tierGroups, questBucket, expandedTiers]);
+  }, [tierGroups, questBucket, expandedTiers, parentTier]);
 
   const renderSectionHeader = useCallback(
     ({ section }: { section: (typeof sections)[number] }) => (
@@ -672,10 +678,11 @@ export function QuestMapScreen({ navigation }: Props) {
       <View>
         <DailyQuestBanner onPress={handleDailyQuestPress} />
         <RecentDailiesRow onSelect={handleRecentDailySelect} />
+        <PremiumTeaserRow onUpgrade={handleLockedTap} />
         <StreakBar variant="full" />
       </View>
     ),
-    [handleDailyQuestPress, handleRecentDailySelect]
+    [handleDailyQuestPress, handleRecentDailySelect, handleLockedTap]
   );
 
   // ── Render ─────────────────────────────────────────────────────────────────

@@ -226,6 +226,13 @@ export interface Quest {
    * column may return null; treat null as 'free'.
    */
   min_subscription_tier?: "free" | "paid";
+  /**
+   * v6.5 — DB column `quests.is_daily`. true for auto-generated daily quests.
+   * Kept IN questLibrary so the quest stays playable (ScanScreen resolves the
+   * active quest from questLibrary), but excluded from the curated tier list
+   * and progression by the tier selectors below.
+   */
+  is_daily?: boolean | null;
 }
 
 export interface ComponentProgress {
@@ -598,7 +605,6 @@ export const useGameStore = create<GameState>()(
             .from("quests")
             .select("*")
             .eq("is_active", true)
-            .eq("is_daily", false)   // v6.5: dailies live in the daily window, not the curated library
             .order("tier",       { ascending: true })
             .order("sort_order", { ascending: true });
 
@@ -1186,7 +1192,7 @@ export const useGameStore = create<GameState>()(
         // Only fires if the DB read AND the Edge Function both failed.
         if (!questId) {
           const { questLibrary } = get();
-          const activeQuests = questLibrary.filter((q) => (q as any).is_active !== false);
+          const activeQuests = questLibrary.filter((q) => (q as any).is_active !== false && !(q as any).is_daily);
           if (activeQuests.length > 0) {
             const dayIndex = daysSinceEpoch() % activeQuests.length;
             questId = activeQuests[dayIndex].id;
@@ -1428,7 +1434,7 @@ export const selectUnlockedTiers = (state: GameState): QuestTier[] => {
 
   for (const tier of TIER_ORDER) {
     unlocked.push(tier);
-    const tierQuests = state.questLibrary.filter((q) => q.tier === tier);
+    const tierQuests = state.questLibrary.filter((q) => q.tier === tier && !q.is_daily);
     const allDone    = tierQuests.length > 0 && tierQuests.every((q) => completed.has(q.id));
     if (!allDone) break;
   }
@@ -1441,7 +1447,7 @@ export const selectQuestsGroupedByTier = (state: GameState): TierGroup[] => {
   const unlockedTiers = selectUnlockedTiers(state);
 
   return TIER_ORDER.map((tier) => {
-    const tierQuests = state.questLibrary.filter((q) => q.tier === tier);
+    const tierQuests = state.questLibrary.filter((q) => q.tier === tier && !q.is_daily);
     return {
       tier,
       quests:   tierQuests,
@@ -1457,7 +1463,7 @@ export const selectQuestsGroupedByTier = (state: GameState): TierGroup[] => {
 };
 
 export const selectTierCleared = (tier: QuestTier) => (state: GameState): boolean => {
-  const tierQuests = state.questLibrary.filter((q) => q.tier === tier);
+  const tierQuests = state.questLibrary.filter((q) => q.tier === tier && !q.is_daily);
   const completed  = new Set(state.completedQuestIds);
   return tierQuests.length > 0 && tierQuests.every((q) => completed.has(q.id));
 };

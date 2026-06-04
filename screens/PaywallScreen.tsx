@@ -322,9 +322,9 @@ export default function PaywallScreen({ navigation, route }: Props) {
                 do NOT add those bullets. TODO: source the scan numbers from
                 tier_config / the rate-limit payload instead of hardcoding,
                 so they don't go stale again. */}
-            <Bullet>Up to 100 word-scans a day — 10x the free limit of 10</Bullet>
+            <Bullet>Up to 100 scans a day — 10x the free limit of 10</Bullet>
             <Bullet>Every quest unlocked (the free plan includes a starter set)</Bullet>
-            <Bullet>New quests created by AI for your child's level</Bullet>
+            <Bullet>Create your own quests — pick the theme and the words your child practices</Bullet>
             <Bullet>Download a report of every word your child has learnt</Bullet>
           </View>
         </ScrollView>
@@ -381,9 +381,9 @@ export default function PaywallScreen({ navigation, route }: Props) {
               custom AI quests (generate-quest) and Word Tome export are
               premium-gated via _shared/featureAccess.ts. hard-mode / sibling
               are still free — do NOT add those bullets. */}
-          <Bullet>Up to 100 word-scans a day — 10x the free limit of 10</Bullet>
+          <Bullet>Up to 100 scans a day — 10x the free limit of 10</Bullet>
           <Bullet>Every quest unlocked (the free plan includes a starter set)</Bullet>
-          <Bullet>New quests created by AI for your child's level</Bullet>
+          <Bullet>Create your own quests — pick the theme and the words your child practices</Bullet>
           <Bullet>Download a report of every word your child has learnt</Bullet>
         </View>
 
