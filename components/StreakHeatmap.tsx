@@ -104,7 +104,7 @@ export function StreakHeatmap({ childId, currentStreak = 0, longestStreak = 0 }:
     <View style={styles.container}>
       {/* Header */}
       <View style={styles.header}>
-        <Text style={styles.title}>Quest Streak Calendar</Text>
+        <Text style={styles.title}>Daily Quest Streak</Text>
         <View style={styles.statPills}>
           <View style={styles.pill}>
             <Text style={styles.pillIcon}>🔥</Text>
@@ -166,7 +166,7 @@ export function StreakHeatmap({ childId, currentStreak = 0, longestStreak = 0 }:
       {/* Legend */}
       <View style={styles.legend}>
         <View style={[styles.legendSwatch, styles.dayCellDone]} />
-        <Text style={styles.legendText}>Quest completed</Text>
+        <Text style={styles.legendText}>Daily Quest done</Text>
         <View style={[styles.legendSwatch, { borderWidth: 1, borderColor: P.amber }]} />
         <Text style={styles.legendText}>Today</Text>
       </View>

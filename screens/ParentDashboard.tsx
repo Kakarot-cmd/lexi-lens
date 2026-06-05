@@ -220,6 +220,9 @@ function StatCard({
 
 // ─── WordEntry ────────────────────────────────────────────────────────────────
 
+/** How many tome words to show before the "Show all" toggle. */
+const TOME_PREVIEW_COUNT = 8;
+
 function WordEntry({ entry }: { entry: WordTomeEntry }) {
   const [expanded, setExpanded] = useState(false);
   return (
@@ -631,6 +634,9 @@ export function ParentDashboard({ navigation }: Props) {
   const [cancellingDeletion,  setCancellingDeletion]  = useState(false);
   // N5/N3 — bumped on pull-to-refresh so all panels reload in sync
   const [sessionRefreshKey,   setSessionRefreshKey]   = useState(0);
+  // Collapse controls — keep the dashboard scannable on long tomes
+  const [tomeShowAll,         setTomeShowAll]         = useState(false);
+  const [questsOpen,          setQuestsOpen]          = useState(false);
 
   const {
     exportPdf,
@@ -1029,14 +1035,39 @@ export function ParentDashboard({ navigation }: Props) {
                 </Text>
               </View>
             ) : (
-              filteredTome.map((entry) => <WordEntry key={entry.id} entry={entry} />)
+              <>
+                {/* While searching, show every match. Otherwise cap the list so a
+                    large tome doesn't run the dashboard off the bottom of the
+                    screen — the count badge above still shows the true total. */}
+                {(search || tomeShowAll ? filteredTome : filteredTome.slice(0, TOME_PREVIEW_COUNT))
+                  .map((entry) => <WordEntry key={entry.id} entry={entry} />)}
+
+                {!search && filteredTome.length > TOME_PREVIEW_COUNT && (
+                  <TouchableOpacity
+                    style={styles.tomeToggle}
+                    onPress={() => setTomeShowAll((v) => !v)}
+                    activeOpacity={0.7}
+                    accessibilityLabel={
+                      tomeShowAll
+                        ? "Show fewer words"
+                        : `Show all ${filteredTome.length} words`
+                    }
+                  >
+                    <Text style={styles.tomeToggleText}>
+                      {tomeShowAll
+                        ? "Show less ▲"
+                        : `Show all ${filteredTome.length} words ▼`}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </>
             )}
           </View>
 
           {/* ── Streak Heatmap ───────────────────────────── */}
           {selectedChild && (
             <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Quest Streak</Text>
+              <Text style={styles.sectionTitle}>Daily Quest Streak</Text>
               <StreakHeatmap
                 childId={selectedChild.id}
                 currentStreak={streakInfo.currentStreak}
@@ -1057,11 +1088,26 @@ export function ParentDashboard({ navigation }: Props) {
             </View>
           )}
 
-          {/* ── Recent quests ────────────────────────────── */}
+          {/* ── Recent quests (collapsible) ──────────────── */}
           {dashboard.questCompletions.length > 0 && (
             <View style={styles.section}>
-              <Text style={styles.sectionTitle}>Recent quests</Text>
-              {dashboard.questCompletions.map((c) => (
+              <TouchableOpacity
+                style={styles.collapsibleHeader}
+                onPress={() => setQuestsOpen((v) => !v)}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityState={{ expanded: questsOpen }}
+                accessibilityLabel={`Recent quests, ${dashboard.questCompletions.length} shown. ${questsOpen ? "Tap to collapse" : "Tap to expand"}.`}
+              >
+                <Text style={styles.sectionTitle}>Recent quests</Text>
+                <View style={styles.collapsibleMeta}>
+                  <View style={styles.wordCountBadge}>
+                    <Text style={styles.wordCountText}>{dashboard.questCompletions.length}</Text>
+                  </View>
+                  <Text style={styles.wordChevron}>{questsOpen ? "▲" : "▼"}</Text>
+                </View>
+              </TouchableOpacity>
+              {questsOpen && dashboard.questCompletions.map((c) => (
                 <QuestCard key={c.id} completion={c} />
               ))}
             </View>
@@ -1256,6 +1302,21 @@ const styles = StyleSheet.create({
 
   section: { marginHorizontal: 20, marginTop: 24 },
   sectionHeader: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 4 },
+  collapsibleHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 4,
+    paddingVertical: 2,
+  },
+  collapsibleMeta: { flexDirection: "row", alignItems: "center", gap: 8 },
+  tomeToggle: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 12,
+    marginTop: 4,
+  },
+  tomeToggleText: { fontSize: 13, fontWeight: "700", color: P.amberAccent },
   sectionTitle:  { fontSize: 16, fontWeight: "700", color: P.inkBrown },
   sectionDesc:   { fontSize: 13, color: P.inkLight, lineHeight: 19, marginBottom: 12 },
 

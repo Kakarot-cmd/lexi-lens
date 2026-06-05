@@ -153,7 +153,7 @@ function BadgeCell({ badge, earned, earnedAt, index, onPress }: BadgeCellProps) 
           <Text style={[styles.cellEmoji, { opacity: earned ? 1 : 0.5 }]}>
             {badge.emoji}
           </Text>
-          <Text style={[styles.cellName, { color: earned ? "#f3f4f6" : "#6b7280" }]} numberOfLines={2}>
+          <Text style={[styles.cellName, { color: earned ? "#3d2a0f" : "#9c7540" }]} numberOfLines={2}>
             {earned ? badge.name : "???"}
           </Text>
           {earned && (
@@ -391,7 +391,7 @@ const styles = StyleSheet.create({
   sectionTitle: {
     fontSize:         17,
     fontWeight:       "700",
-    color:            "#f3f4f6",
+    color:            "#3d2a0f",
     letterSpacing:    0.3,
   },
 
@@ -434,9 +434,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical:  6,
     borderRadius:     20,
-    backgroundColor:  "rgba(55,65,81,0.4)",
+    backgroundColor:  "rgba(232,213,176,0.5)",
     borderWidth:      1,
-    borderColor:      "rgba(107,114,128,0.3)",
+    borderColor:      "rgba(168,138,90,0.4)",
   },
   tabActive: {
     backgroundColor:  "rgba(124,58,237,0.18)",
@@ -444,7 +444,7 @@ const styles = StyleSheet.create({
   },
   tabText: {
     fontSize:         12,
-    color:            "#9ca3af",
+    color:            "#6b4c1e",
     fontWeight:       "600",
   },
   tabTextActive: {
@@ -463,7 +463,7 @@ const styles = StyleSheet.create({
     alignItems:       "center",
   },
   loadingText: {
-    color:            "#9ca3af",
+    color:            "#9c7540",
     fontSize:         13,
   },
 

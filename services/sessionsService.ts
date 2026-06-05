@@ -13,18 +13,32 @@
  *     with a Sentry breadcrumb for observability. Components never see
  *     a thrown error — they get an empty state instead.
  *
- * Schema assumed (verified against roadmap N5 + monitor SQL queries):
+ * ACTUAL schema (verified against supabase/bootstrap.sql, table public.quest_sessions):
  *   quest_sessions(
  *     id              uuid pk,
  *     child_id        uuid not null,
- *     started_at      timestamptz not null,
- *     ended_at        timestamptz null,
- *     duration_sec    integer null,
- *     quests_finished integer not null default 0,
- *     xp_earned       integer not null default 0
+ *     quest_id        uuid not null,
+ *     game_session_id uuid null,
+ *     hard_mode       boolean not null default false,
+ *     started_at      timestamptz not null default now(),
+ *     finished_at     timestamptz null,
+ *     completed       boolean not null default false,
+ *     total_scans     integer not null default 0,
+ *     xp_awarded      integer not null default 0
  *   )
  *
- * If your schema names differ, only this file changes.
+ * One row == one quest attempt (inserted on ScanScreen mount, updated on
+ * finish/abandon). The panel-facing QuestSession shape below is DERIVED from
+ * these columns so the UI need not know the raw column names:
+ *   ended_at        <- finished_at
+ *   duration_sec    <- (finished_at - started_at), null while in-progress
+ *   quests_finished <- completed ? 1 : 0   (one row is one quest)
+ *   xp_earned       <- xp_awarded
+ *
+ * NOTE: a previous version selected ended_at / duration_sec / quests_finished /
+ * xp_earned directly. Those columns do not exist, so PostgREST returned a 400,
+ * the error was swallowed, and the panel showed "hasn't played" for everyone
+ * regardless of activity. The mapping below is the fix.
  */
 
 import { supabase } from '../lib/supabase';
@@ -104,7 +118,7 @@ export async function getRecentSessions(
 
   const { data, error } = await supabase
     .from('quest_sessions')
-    .select('id, child_id, started_at, ended_at, duration_sec, quests_finished, xp_earned')
+    .select('id, child_id, started_at, finished_at, completed, xp_awarded')
     .eq('child_id', childId)
     .gte('started_at', since)
     .order('started_at', { ascending: false })
@@ -120,7 +134,37 @@ export async function getRecentSessions(
     return [];
   }
 
-  const rows = (data ?? []) as QuestSession[];
+  // Raw DB row shape (the real columns). Mapped below into QuestSession so the
+  // panel keeps its stable field names regardless of the underlying schema.
+  interface RawSessionRow {
+    id:           string;
+    child_id:     string;
+    started_at:   string;
+    finished_at:  string | null;
+    completed:    boolean | null;
+    xp_awarded:   number | null;
+  }
+
+  const rows: QuestSession[] = ((data ?? []) as RawSessionRow[]).map((r) => {
+    const durationSec = r.finished_at
+      ? Math.max(
+          0,
+          Math.round(
+            (new Date(r.finished_at).getTime() - new Date(r.started_at).getTime()) / 1000
+          )
+        )
+      : null;
+    return {
+      id:              r.id,
+      child_id:        r.child_id,
+      started_at:      r.started_at,
+      ended_at:        r.finished_at,
+      duration_sec:    durationSec,
+      quests_finished: r.completed ? 1 : 0,
+      xp_earned:       r.xp_awarded ?? 0,
+    };
+  });
+
   return rows.filter(isValidSession);
 }
 

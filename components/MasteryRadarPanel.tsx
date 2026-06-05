@@ -253,15 +253,26 @@ function Radar({ data }: { data: DomainStat[] }) {
   const RADIUS = 92;           // outer ring radius
   const N      = data.length;  // 6
 
-  // Pre-compute vertex positions for each domain
+  // Pre-compute vertex positions for each domain.
+  //
+  // We plot COVERAGE (how many words land in each domain), not avgMastery.
+  // Rationale: mastery_score only climbs via repeated correct scans (first
+  // success = 0.20), so a normal/new learner sits near 0 on every axis and the
+  // polygon collapses to a dot — even with rich coverage. Coverage answers the
+  // question a parent actually asks of a "map": is my child's vocabulary spread
+  // evenly across the senses, or lopsided? It also guarantees a visible shape
+  // whenever any words exist. Each axis is normalised to the busiest domain.
+  const maxCount = Math.max(1, ...data.map((d) => d.wordCount));
+
   const geom = useMemo(() => {
     return data.map((stat, i) => {
       const angle  = (Math.PI * 2 * i) / N - Math.PI / 2; // start at top
-      const value  = Math.max(0, Math.min(1, stat.avgMastery));
+      const value  = Math.max(0, Math.min(1, stat.wordCount / maxCount));
       const r      = RADIUS * value;
       const labelR = RADIUS + 22;
       return {
-        domain:  stat.domain,
+        domain:    stat.domain,
+        wordCount: stat.wordCount,
         angle,
         x:       CX + Math.cos(angle) * r,
         y:       CY + Math.sin(angle) * r,
@@ -271,7 +282,7 @@ function Radar({ data }: { data: DomainStat[] }) {
         spokeY:  CY + Math.sin(angle) * RADIUS,
       };
     });
-  }, [data]);
+  }, [data, maxCount]);
 
   const polygonPoints = geom.map((g) => `${g.x},${g.y}`).join(" ");
 
@@ -286,7 +297,7 @@ function Radar({ data }: { data: DomainStat[] }) {
 
   return (
     <View style={styles.radarWrap}>
-      <Svg width={SIZE} height={SIZE} accessibilityLabel="Vocabulary mastery radar">
+      <Svg width={SIZE} height={SIZE} accessibilityLabel="Vocabulary coverage radar across six sensory domains">
         {/* Guide rings — outer is solid, inner are dashed */}
         <G>
           {guideRings.map((points, i) => (
@@ -325,15 +336,19 @@ function Radar({ data }: { data: DomainStat[] }) {
           strokeWidth={2}
         />
 
-        {/* Vertex dots */}
+        {/* Vertex dots — only where the child actually has words, so empty
+            domains read as a clean pinch toward the centre rather than a
+            pile of dots stacked on the origin. */}
         <G>
-          {geom.map((g, i) => (
-            <Circle
-              key={`dot-${i}`}
-              cx={g.x} cy={g.y} r={4}
-              fill={P.amberAccent}
-            />
-          ))}
+          {geom.map((g, i) =>
+            g.wordCount > 0 ? (
+              <Circle
+                key={`dot-${i}`}
+                cx={g.x} cy={g.y} r={4}
+                fill={P.amberAccent}
+              />
+            ) : null
+          )}
         </G>
 
         {/* Labels around the perimeter */}
@@ -354,23 +369,28 @@ function Radar({ data }: { data: DomainStat[] }) {
           ))}
         </G>
       </Svg>
+      <Text style={styles.radarCaption}>
+        Shape shows how evenly words are spread across the six domains.
+      </Text>
     </View>
   );
 }
 
-/** Compact list under the radar — domain · word count · % bar. */
+/** Compact list under the radar — domain · word count · coverage bar. */
 function DomainList({ data }: { data: DomainStat[] }) {
+  const maxCount = Math.max(1, ...data.map((d) => d.wordCount));
   return (
     <View style={styles.domainList}>
       {data.map((stat) => (
-        <DomainRow key={stat.domain} stat={stat} />
+        <DomainRow key={stat.domain} stat={stat} maxCount={maxCount} />
       ))}
     </View>
   );
 }
 
-function DomainRow({ stat }: { stat: DomainStat }) {
-  const pct = Math.round(stat.avgMastery * 100);
+function DomainRow({ stat, maxCount }: { stat: DomainStat; maxCount: number }) {
+  // Bar mirrors the radar: proportion of words relative to the busiest domain.
+  const pct = Math.round((stat.wordCount / maxCount) * 100);
   return (
     <View style={styles.domainRow}>
       <Text style={styles.domainName}>{capitalise(stat.domain)}</Text>
@@ -460,6 +480,14 @@ const styles = StyleSheet.create({
 
   // Radar
   radarWrap: { alignItems: "center", justifyContent: "center", paddingVertical: 4 },
+  radarCaption: {
+    marginTop: 2,
+    fontSize: 11,
+    color: P.inkLight,
+    textAlign: "center",
+    maxWidth: 260,
+    lineHeight: 15,
+  },
 
   // Domain list under the radar
   domainList: {
