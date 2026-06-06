@@ -1031,7 +1031,7 @@ export function ScanScreen({ route, navigation }: Props) {
         hardMode={isHardMode}
         dailyLimitReached={status === "rate_limited"}
         failureStreak={currentAttempts}
-        hidden={phase === "quest_victory"}
+        hidden={phase === "quest_victory" || status === "rate_limited"}
         // v6.5 — three-branch movement: wander while framing, orbit the
         // viewfinder reticle during evaluation (larger + faster), anchor
         // during success/fail/rate-limit beats.

@@ -67,6 +67,7 @@ import { compressImageToBase64 } from "../lib/imageCompress";
 // EncodingType is not re-exported from expo-file-system 19.x namespace;
 // use the string literal "base64" which the API accepts directly.
 import { supabase } from "../lib/supabase";
+import { FunctionsHttpError } from "@supabase/supabase-js";
 import {
   updateMastery,
   type MasteryEntry,
@@ -450,6 +451,33 @@ async function callEdgeFunction(
     throw new RateLimitResponseError(rlData);
   }
 
+  // ── v6.x: 429 body arrives on error.context, NOT in `data` ───────────────
+  // supabase-js v2 functions.invoke sets data=null and error=FunctionsHttpError
+  // on any non-2xx; the response body lives on error.context (a Response). The
+  // data-based check above only catches a body riding along with a 2xx, which
+  // never happens for a rate limit. Read the real 429 body here so the wall
+  // can fire. (clone() so we never double-consume the body.)
+  if (error instanceof FunctionsHttpError) {
+    const ctxResp = error.context as Response | undefined;
+    if (ctxResp && typeof ctxResp.clone === "function") {
+      const parsed = (await ctxResp.clone().json().catch(() => null)) as RateLimitError | null;
+      if (parsed && parsed.error === "rate_limit_exceeded") {
+        addGameBreadcrumb({
+          category: "evaluate",
+          message:  `Rate limited — code: ${parsed.code}`,
+          level:    "warning",
+          data:     {
+            code:       parsed.code,
+            scansToday: parsed.scansToday,
+            limit:      parsed.limit,
+            resetsAt:   parsed.resetsAt,
+          },
+        });
+        throw new RateLimitResponseError(parsed);
+      }
+    }
+  }
+
   if (error) {
     const isTransient =
       error.message.includes("fetch")   ||
@@ -607,42 +635,51 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
       setResult(evaluationResult);
       setStatus(evaluationResult.overallMatch ? "match" : "no-match");
 
-      // ── Step 6: Update mastery for the evaluated word (v1.5) ─────────────
+      // ── Step 6: Update mastery for EVERY evaluated word (v1.5) ───────────
       //
-      // FIX: The previous call used 4 positional arguments and was missing
-      //   `childAge` and `currentMastery`. MasteryService.updateMastery()
-      //   expects a single opts object with all 6 fields.
+      // ROOT-CAUSE FIX: the previous block was gated on `payload.currentWord`,
+      // but nothing in the app ever set that field (only the type + this block
+      // and the test fixtures referenced it). So the gate was permanently
+      // false → updateMastery() never ran → update_word_mastery RPC never
+      // fired → mastery_score / mastery_updated_at stayed at the 0.0 insert
+      // default forever. (times_used still climbed, but only because
+      // record_word_learned upserts it independently of mastery.)
       //
-      //   currentMastery is sourced from payload.masteryProfile by matching
-      //   on the word. Defaults to 0 (novice) if the word isn't in the
-      //   profile yet (i.e. first time the child encounters this word).
-      //
-      if (payload.currentWord) {
-        const wordScore = evaluationResult.properties.find(
-          (p) => p.word.toLowerCase() === payload.currentWord!.toLowerCase()
+      // A single scan scores SEVERAL properties at once, so we now update
+      // mastery for each word the verdict actually evaluated — not one word.
+      // The RPC only needs (childId, word, success); definition/childAge are
+      // used client-side for the retirement synonym fetch, and currentMastery
+      // for the optimistic local calc. Runs in parallel so the verdict isn't
+      // delayed by N sequential round-trips.
+      const evaluatedWords = evaluationResult.properties ?? [];
+      if (evaluatedWords.length > 0) {
+        const results = await Promise.all(
+          evaluatedWords.map((prop) => {
+            const definition = payload.requiredProperties?.find(
+              (p) => p.word.toLowerCase() === prop.word.toLowerCase()
+            )?.definition ?? "";
+            const currentMastery = payload.masteryProfile?.find(
+              (mp) => mp.word.toLowerCase() === prop.word.toLowerCase()
+            )?.mastery ?? 0;
+            return updateMastery({
+              childId:        payload.childId,
+              word:           prop.word,
+              definition,
+              childAge:       payload.childAge,
+              success:        prop.passes,
+              currentMastery,
+            });
+          })
         );
-        const wordPassed = wordScore?.passes ?? evaluationResult.overallMatch;
 
-        const definition = payload.requiredProperties.find(
-          (p) => p.word.toLowerCase() === payload.currentWord!.toLowerCase()
-        )?.definition ?? "";
-
-        // Look up the child's existing mastery score for this word so the
-        // update function can compute the correct delta.
-        const currentMastery = payload.masteryProfile?.find(
-          (mp) => mp.word.toLowerCase() === payload.currentWord!.toLowerCase()
-        )?.mastery ?? 0;
-
-        const mResult = await updateMastery({
-          childId:        payload.childId,
-          word:           payload.currentWord,
-          definition,
-          childAge:       payload.childAge,
-          success:        wordPassed,
-          currentMastery,
-        });
-
-        if (mResult) setMasteryResult(mResult);
+        // Surface the most celebration-worthy result to the UI: a word that
+        // just crossed the retirement threshold wins; otherwise the largest
+        // mastery gain among the words that improved this scan.
+        const retired  = results.find((r) => r.justRetired);
+        const bestGain = results
+          .filter((r) => r.newMastery > r.oldMastery)
+          .sort((a, b) => b.newMastery - a.newMastery)[0];
+        setMasteryResult(retired ?? bestGain ?? null);
       }
     } catch (err) {
       // ── v3.5: Rate limit error — friendly handling ───────────────────────

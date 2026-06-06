@@ -43,6 +43,7 @@
 import * as Print   from "expo-print";
 import * as Sharing from "expo-sharing";
 import { supabase } from "../lib/supabase";
+import { parseGateError } from "../lib/gateError";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -110,6 +111,8 @@ export async function fetchPortfolioData(childId: string): Promise<PortfolioData
   );
 
   if (error) {
+    const gate = await parseGateError(error);
+    if (gate) throw gate;   // 402 need_premium / 429 monthly_cap → handled by usePdfExport
     throw new Error(`Portfolio fetch failed: ${error.message}`);
   }
 

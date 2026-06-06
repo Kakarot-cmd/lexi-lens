@@ -462,6 +462,10 @@ function reasonCopy(reason: string): string {
       return "This is a Premium quest. Unlock the full quest library, custom AI quests, and up to 100 scans a day.";
     case "parent-dashboard":
       return "Take your child's adventure further with the full Premium experience.";
+    case "generate-quest-locked":
+      return "Custom AI quests are a Premium feature. Unlock tailored quests and the full quest library.";
+    case "export-tome-locked":
+      return "PDF Word Tome export is a Premium feature. Unlock portfolio exports and custom AI quests.";
     default:
       return "Unlock the full Skanlore adventure for your child.";
   }

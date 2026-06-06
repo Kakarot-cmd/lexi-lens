@@ -1086,21 +1086,32 @@ serve(async (req: Request) => {
   const ipRl   = await checkIpRateLimit(supabase, ipHash);
   if (!ipRl.allowed) {
     return jsonResponse({
-      error:  "rate_limited_ip",
-      childFriendly: "Whoa! Too many quick scans. Take a breath and try again in a minute.",
+      error:      "rate_limit_exceeded",
+      code:       "IP_LIMIT",
+      retryAfter: 60,
+      message:    "Whoa! Too many quick scans. Take a breath and try again in a minute.",
     }, 429);
   }
 
   // ── 3. Get evaluate context (scans today, primary calls today, tier, quest) ─
+  // get_evaluate_context is RETURNS TABLE(...), so PostgREST returns an ARRAY
+  // of rows. The previous code cast the array straight to a single object —
+  // a TypeScript `as` lie that compiled fine but left every field `undefined`
+  // at runtime (ctx.scans_today, ctx.subscription_tier, ctx.quest_exists, …).
+  // That silently disabled the daily scan cap (`undefined >= limit` is false),
+  // the primary-call routing budget, AND quest min-tier gating. Unwrap the
+  // single row explicitly; tolerate either shape in case the return type
+  // changes again.
   const { data: ctxData, error: ctxError } = await supabase
     .rpc("get_evaluate_context", { p_child_id: childId, p_quest_id: questId ?? null });
 
-  if (ctxError || !ctxData) {
+  const ctxRow = Array.isArray(ctxData) ? ctxData[0] : ctxData;
+  if (ctxError || !ctxRow) {
     console.error("[evaluate] get_evaluate_context failed:", ctxError?.message);
     return jsonResponse({ error: "context_load_failed" }, 500);
   }
 
-  const ctx = ctxData as {
+  const ctx = ctxRow as {
     scans_today:         number;
     primary_calls_today: number;  // v6.3: renamed from haiku_calls_today
     subscription_tier:   string;
@@ -1135,8 +1146,12 @@ serve(async (req: Request) => {
       ...cc1LogFields,
     });
     return jsonResponse({
-      error: "daily_limit_reached",
-      childFriendly: "You've explored a lot today. Come back tomorrow, brave adventurer!",
+      error:      "rate_limit_exceeded",
+      code:       "DAILY_QUOTA",
+      scansToday: ctx.scans_today,
+      limit:      dailyLimit,
+      resetsAt:   utcMidnight(),
+      message:    "You've explored a lot today. Come back tomorrow, brave adventurer!",
     }, 429);
   }
 

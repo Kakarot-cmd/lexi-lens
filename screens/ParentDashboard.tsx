@@ -37,6 +37,7 @@ import {
   Modal,
   Linking,
   Platform,
+  Alert,
 } from "react-native";
 import { useSafeAreaInsets }  from "react-native-safe-area-context";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -645,7 +646,15 @@ export function ParentDashboard({ navigation }: Props) {
     error:  exportError,
     status: exportStatus,
     reset:  resetExport,
-  } = usePdfExport();
+  } = usePdfExport({
+    onGate: (gate) => {
+      if (gate.httpStatus === 402) {
+        navigation.navigate("Paywall", { reason: gate.reason ?? "export-tome-locked" });
+      } else {
+        Alert.alert("Monthly limit reached", gate.message);
+      }
+    },
+  });
 
   const selectedChild = dashboard?.child ?? null;
   const has2xXp       = streakInfo.currentStreak >= 7;
@@ -875,6 +884,10 @@ export function ParentDashboard({ navigation }: Props) {
      <QuestGeneratorScreen
         visible={showGenerator}
         onClose={() => setShowGenerator(false)}
+        onNeedPremium={(reason) => {
+          setShowGenerator(false);
+          navigation.navigate("Paywall", { reason: reason ?? "generate-quest-locked" });
+        }}
       />
 
       {/* Privacy Policy modal */}

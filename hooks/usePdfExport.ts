@@ -46,6 +46,7 @@
 import { useState, useCallback, useRef } from "react";
 import { generateAndSharePdf, type ExportStep } from "../services/pdfExportService";
 import { addGameBreadcrumb, captureGameError } from "../lib/sentry";
+import { GateError, type GateInfo } from "../lib/gateError";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -84,9 +85,15 @@ const STATUS_MESSAGES: Record<ExportStep, string> = {
 
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
-export function usePdfExport(): UsePdfExportResult {
+export function usePdfExport(
+  opts?: { onGate?: (gate: GateInfo) => void },
+): UsePdfExportResult {
   const [status, setStatus] = useState<ExportStep>("idle");
   const [error,  setError]  = useState<string | null>(null);
+
+  // Keep the latest onGate callback without destabilising exportPdf's deps.
+  const onGateRef = useRef(opts?.onGate);
+  onGateRef.current = opts?.onGate;
 
   // Guard against calling exportPdf while another export is in flight
   const isInFlight = useRef(false);
@@ -119,6 +126,21 @@ export function usePdfExport(): UsePdfExportResult {
 
       // generateAndSharePdf sets status to "done" via onStepChange before returning
     } catch (err: unknown) {
+      // A premium / monthly-cap gate is an expected outcome, not a crash:
+      // surface it to the caller (→ Paywall / cap message) and reset to idle
+      // without a Sentry capture or an "error" status.
+      if (err instanceof GateError) {
+        setStatus("idle");
+        addGameBreadcrumb({
+          category: "pdf_export",
+          message:  `Export gated: ${err.info.outcome}`,
+          level:    "info",
+          data:     { childId, outcome: err.info.outcome },
+        });
+        onGateRef.current?.(err.info);
+        return;
+      }
+
       const msg = err instanceof Error ? err.message : "PDF export failed.";
       setError(msg);
       setStatus("error");

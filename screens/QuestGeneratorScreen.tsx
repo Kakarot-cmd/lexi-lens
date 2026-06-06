@@ -44,6 +44,7 @@ import {
 } from "react-native";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
+import { parseGateError } from "../lib/gateError";
 import {
   buildKnownWordsSet,
   validateQuestWords,
@@ -149,6 +150,8 @@ interface Props {
   onClose:         () => void;
   defaultAgeBand?: AgeBand;
   targetChild?:    TargetChild | null;
+  /** Called on a 402 need_premium gate so the host can route to the Paywall. */
+  onNeedPremium?:  (reason?: string) => void;
 }
 
 // ─── Step 1: Theme input ──────────────────────────────────────────────────────
@@ -703,6 +706,7 @@ export default function QuestGeneratorScreen({
   onClose,
   defaultAgeBand = "7-8",
   targetChild,
+  onNeedPremium,
 }: Props) {
   const [step,             setStep]             = useState<Step>("input");
   const [theme,            setTheme]            = useState("");
@@ -803,7 +807,22 @@ export default function QuestGeneratorScreen({
         },
       });
 
-      if (fnError) throw new Error(fnError.message ?? "Generation failed");
+      if (fnError) {
+        const gate = await parseGateError(fnError);
+        if (gate?.info.httpStatus === 402) {
+          // Premium gate → reset the form, then host routes to the Paywall.
+          setStep("input");
+          onNeedPremium?.(gate.info.reason);
+          return;
+        }
+        if (gate?.info.httpStatus === 429) {
+          // Monthly cap → friendly, non-fatal message; stay on the input step.
+          setStep("input");
+          Alert.alert("Monthly limit reached", gate.info.message);
+          return;
+        }
+        throw new Error(fnError.message ?? "Generation failed");
+      }
       if (!data?.quest) throw new Error("No quest returned from AI");
 
       // ── Client-side validation ─────────────────────────────────────────────
@@ -823,7 +842,7 @@ export default function QuestGeneratorScreen({
       setStep("input");
       Alert.alert("Generation failed", err.message ?? "Please try again.");
     }
-  }, [targetChild, forAllChildren]);   // forAllChildren added — affects knownWords fetch
+  }, [targetChild, forAllChildren, onNeedPremium]);   // forAllChildren added — affects knownWords fetch
 
   // ── Save to Supabase ──────────────────────────────────────────────────────
   const handleSave = useCallback(async (quest: GeneratedQuest) => {
