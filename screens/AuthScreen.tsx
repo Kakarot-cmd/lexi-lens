@@ -207,6 +207,20 @@ export function AuthScreen() {
     switchTimer.current = setTimeout(() => setMode(next), 120);
   };
 
+  // Guarantee the form card (opacity: fadeAnim) is visible whenever we enter a
+  // mode that is NOT reached through switchMode's crossfade. The password-reset
+  // deep link sets mode directly (recoveryActive → reset_confirm) with no
+  // animation, and a prior crossfade can leave the native opacity node desynced
+  // at 0 (useNativeDriver keeps opacity on the native side) — which renders the
+  // entire form card invisible. That is the reset-link blank screen. Snapping
+  // fadeAnim to 1 re-syncs the native node. forgot_request is included as
+  // belt-and-suspenders since it shares the same card.
+  useEffect(() => {
+    if (mode === "reset_confirm" || mode === "forgot_request") {
+      fadeAnim.setValue(1);
+    }
+  }, [mode, fadeAnim]);
+
   // ── Validation ──────────────────────────────────────────────────────────────
   const validate = (): boolean => {
     const problems: string[] = [];
