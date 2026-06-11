@@ -220,10 +220,19 @@ export function classifyEngagement(summary: SessionsSummary): EngagementLevel {
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 function isValidSession(s: QuestSession): boolean {
-  // Keep sessions with no duration recorded yet (in-progress / older rows)
-  // but drop the very-short ones that are almost certainly test taps.
-  if (s.duration_sec == null) return true;
-  return s.duration_sec >= MIN_SESSION_SEC;
+  // A session is meaningful if it actually produced something.
+  const meaningful = (s.xp_earned ?? 0) > 0 || (s.quests_finished ?? 0) > 0;
+
+  // Duration-less rows are quest_sessions that were started but never closed
+  // (finished_at is null) — orphans from Metro reloads, app kills, or quick
+  // bail-outs. These are the "— · 0 quests · +0 XP" duplicates. Only keep one
+  // if it earned XP / completed a quest; otherwise it's noise, not a session.
+  if (s.duration_sec == null) return meaningful;
+
+  // Finished rows: drop test-tap-length empties (no duration AND nothing earned).
+  if (s.duration_sec < MIN_SESSION_SEC && !meaningful) return false;
+
+  return true;
 }
 
 /** Local-time YYYY-MM-DD bucket key. Matches user perception of "a day". */

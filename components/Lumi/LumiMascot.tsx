@@ -58,6 +58,7 @@ import {
 } from './lumiTypes';
 import { LUMI_QUOTES, pickLumiQuote } from './lumiQuotes';
 import { playLumiForState, subscribeLumiText } from './lumiSounds';
+import { playGameSfxForLumiState } from '../../lib/audio';
 
 // ─── Animation profiles per state ─────────────────────────────────────────────
 
@@ -271,6 +272,9 @@ export function LumiMascot(props: LumiMascotProps): React.ReactElement {
   useEffect(() => {
     if (effectiveMuted) return;
     try { playLumiForState(state); } catch { /* no-op */ }
+    // Layer a non-voice game sting (success/fail) under Lumi's voice. Sound-only
+    // — Lumi already owns haptics for these states, so we never double-buzz.
+    try { playGameSfxForLumiState(state); } catch { /* no-op */ }
   }, [state, effectiveMuted]);
 
   // Wander / drift motion. Different periods on X and Y produce a figure-8.

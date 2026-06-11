@@ -206,6 +206,14 @@ const BASE_RETRY_DELAY_MS    = 800;
 const MAX_FRAME_BASE64_CHARS = 1_600_000;
 const EDGE_FUNCTION_NAME     = "evaluate";
 
+// v6.x — client-side per-attempt timeout for the evaluate call. supabase-js
+// functions.invoke has NO built-in timeout, so a stalled edge container or a
+// dropped mobile connection can hang the await indefinitely — leaving status
+// stuck on "evaluating" (Lumi spins forever; only an app restart recovers).
+// 15s bounds the worst case while staying generous for a cold start + a slow
+// Gemini eval (~7s observed) + LTE upload of the frame.
+const EVALUATE_ATTEMPT_TIMEOUT_MS = 15000;
+
 // ─── v6.2 Phase 2 — CC1 session cache ────────────────────────────────────────
 //
 // The cc1_enabled flag is server-side (in feature_flags) but feature_flags is
@@ -274,6 +282,29 @@ async function uriToBase64(uri: string): Promise<string | null> {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// v6.x — Promise.race timeout wrapper for the evaluate invoke. functions.invoke
+// in supabase-js v2.103 does not accept an AbortSignal, so we can't truly cancel
+// the underlying fetch; what we CAN do is reject after a bound so the await stops
+// hanging and the catch path runs (status="error" → Lumi stops, child sees a
+// retry prompt instead of an infinite spinner). Unblocking the state machine is
+// the user-facing fix; the orphaned fetch resolves/aborts on its own.
+class EvaluateTimeoutError extends Error {
+  readonly timeoutMs: number;
+  constructor(ms: number) {
+    super("The scan took too long — please try again.");
+    this.name      = "EvaluateTimeoutError";
+    this.timeoutMs = ms;
+  }
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new EvaluateTimeoutError(ms)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
 
 // ─── v6.2 Phase 2 — CC1 Edge Function caller ─────────────────────────────────
 //
@@ -426,9 +457,12 @@ async function callEdgeFunction(
     "http.client",
     `evaluate • ${detectedLabel ?? "unknown"} (attempt ${attempt + 1})`,
     () =>
-      supabase.functions.invoke<EvaluationResult | RateLimitError>(
-        EDGE_FUNCTION_NAME,
-        { body }
+      withTimeout(
+        supabase.functions.invoke<EvaluationResult | RateLimitError>(
+          EDGE_FUNCTION_NAME,
+          { body }
+        ),
+        EVALUATE_ATTEMPT_TIMEOUT_MS
       )
   );
 

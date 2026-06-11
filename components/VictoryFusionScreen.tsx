@@ -52,6 +52,7 @@ import * as Haptics from "expo-haptics";
 import LottieView from "lottie-react-native";
 
 import { LumiHUD } from "./Lumi";
+import { playSfx } from "../lib/audio";
 
 const { width: W, height: H } = Dimensions.get("window");
 
@@ -319,6 +320,8 @@ function VictoryContent({
     if (!visible) return;
     op.value = withTiming(1,  { duration: 500 });
     ty.value = withSpring(0,  { damping: 14, stiffness: 80 });
+    // Triumphant clear fanfare (no-op if SFX disabled).
+    try { playSfx('quest_clear'); } catch {}
   }, [visible]);
 
   const wrapStyle = useAnimatedStyle(() => ({

@@ -63,12 +63,20 @@ export function useAnalytics() {
   // rationale. questSessionRef stays hook-local — start/finish always pair within
   // the same instance (ScanScreen) so cross-instance sharing isn't needed there.
   const questSessionRef = useRef<string | null>(null);   // current quest_sessions.id
+  // Holds the in-flight INSERT promise (resolving to the id, or null on failure).
+  // finishQuestSession awaits this so a fast unmount can't fire the close before
+  // the insert has returned an id — the cause of the stalled/orphan rows
+  // (finished_at null, 0 scans) seen across many children.
+  const questSessionPromiseRef = useRef<Promise<string | null> | null>(null);
 
   // ── App session lifecycle ──────────────────────────────────────────────────
 
   /** Call once when a child profile becomes active (app foreground / child switch). */
   const startSession = useCallback(async () => {
     if (!activeChild?.id) return;
+    // Idempotent: never open a second game_sessions row while one is already
+    // open. Guards against overlapping effects and re-entrant 'active' events.
+    if (useGameStore.getState().gameSessionId) return;
     try {
       const { data, error } = await supabase
         .from("game_sessions")
@@ -133,38 +141,44 @@ export function useAnalytics() {
 
   /** Call when ScanScreen mounts for a given quest. */
   const startQuestSession = useCallback(async (payload: QuestSessionPayload) => {
-    try {
-      // v4.4.1 — fallback now reads from store so ScanScreen's hook instance
-      // sees the value App.tsx's hook instance wrote on session start.
-      const gameSessionIdToUse =
-        payload.gameSessionId ?? useGameStore.getState().gameSessionId ?? null;
+    const insert = (async (): Promise<string | null> => {
+      try {
+        // v4.4.1 — fallback now reads from store so ScanScreen's hook instance
+        // sees the value App.tsx's hook instance wrote on session start.
+        const gameSessionIdToUse =
+          payload.gameSessionId ?? useGameStore.getState().gameSessionId ?? null;
 
-      const { data, error } = await supabase
-        .from("quest_sessions")
-        .insert({
-          child_id:        payload.childId,
-          quest_id:        payload.questId,
-          game_session_id: gameSessionIdToUse,
-          hard_mode:       payload.hardMode,
-        })
-        .select("id")
-        .single();
+        const { data, error } = await supabase
+          .from("quest_sessions")
+          .insert({
+            child_id:        payload.childId,
+            quest_id:        payload.questId,
+            game_session_id: gameSessionIdToUse,
+            hard_mode:       payload.hardMode,
+          })
+          .select("id")
+          .single();
 
-      if (error) throw error;
-      questSessionRef.current = data.id;
+        if (error) throw error;
+        questSessionRef.current = data.id;
 
-      addGameBreadcrumb({
-        category: "quest",
-        message:  `Quest started${payload.hardMode ? " (Hard Mode)" : ""}`,
-        data:     {
-          questId:         payload.questId,
-          questSessionId:  data.id,
-          gameSessionId:   gameSessionIdToUse,
-        },
-      });
-    } catch {
-      // Non-fatal.
-    }
+        addGameBreadcrumb({
+          category: "quest",
+          message:  `Quest started${payload.hardMode ? " (Hard Mode)" : ""}`,
+          data:     {
+            questId:         payload.questId,
+            questSessionId:  data.id,
+            gameSessionId:   gameSessionIdToUse,
+          },
+        });
+        return data.id;
+      } catch {
+        return null; // Non-fatal.
+      }
+    })();
+
+    questSessionPromiseRef.current = insert;
+    await insert;
   }, []);
 
   /**
@@ -176,7 +190,12 @@ export function useAnalytics() {
     totalScans:  number;
     xpAwarded:   number;
   }) => {
-    const qsid = questSessionRef.current;
+    // If the insert is still in flight (fast unmount), wait for its id rather
+    // than bailing — that early return was what left rows open as orphans.
+    let qsid = questSessionRef.current;
+    if (!qsid && questSessionPromiseRef.current) {
+      qsid = await questSessionPromiseRef.current;
+    }
     if (!qsid) return;
     try {
       await supabase
@@ -198,6 +217,7 @@ export function useAnalytics() {
       // Non-fatal.
     } finally {
       questSessionRef.current = null;
+      questSessionPromiseRef.current = null;
     }
   }, []);
 

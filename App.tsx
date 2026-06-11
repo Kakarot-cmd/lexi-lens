@@ -399,6 +399,12 @@ function App() {
         const lumiSounds = await import("./components/Lumi/lumiSounds");
         if (cancelled) return;
         await lumiSounds.initLumiSounds();
+
+        // Game-wide audio (music bed + UI/feedback SFX). Same dynamic-import
+        // safety as Lumi — a module-init failure here cannot crash the bundle.
+        const gameAudio = await import("./lib/audio");
+        if (cancelled) return;
+        await gameAudio.initGameAudio();
       } catch (err) {
         // Sound init failures are non-fatal — kids still get the game.
         console.warn("[Lumi] sound init skipped:", err);
@@ -679,6 +685,9 @@ function App() {
   // ── Game-session lifecycle — Phase 3.7 ─────────────────────────────────────
   const { startSession, endSession } = useAnalytics();
   const screenSequenceRef = useRef<string[]>([]);
+  // Tracks whether the app actually went to BACKGROUND (vs a transient
+  // 'inactive'). Only a real background→active round-trip starts a new session.
+  const wasBackgroundedRef = useRef(false);
 
   useEffect(() => {
     if (!activeChild?.id) return;
@@ -710,7 +719,13 @@ function App() {
     if (!activeChild?.id) return;
 
     const subscription = AppState.addEventListener("change", (nextState) => {
-      if (nextState === "background" || nextState === "inactive") {
+      // Only a real BACKGROUND transition ends a session / pauses music. iOS
+      // fires 'inactive' for transient interruptions (Control Center, banners,
+      // the app-switcher peek, Face ID), so treating 'inactive' as background
+      // spawned bursts of empty 0-quest sessions and stuttered the music bed.
+      if (nextState === "background") {
+        wasBackgroundedRef.current = true;
+        import("./lib/audio").then((m) => m.pauseBgmForBackground()).catch(() => {});
         const c = useGameStore.getState().sessionCounters;
         endSession({
           questsStarted:  c.questsStarted,
@@ -718,7 +733,10 @@ function App() {
           xpEarned:       c.xpEarned,
           screenSequence: screenSequenceRef.current,
         });
-      } else if (nextState === "active") {
+      } else if (nextState === "active" && wasBackgroundedRef.current) {
+        // Returning from a genuine background — start a fresh session.
+        wasBackgroundedRef.current = false;
+        import("./lib/audio").then((m) => m.resumeBgmFromForeground()).catch(() => {});
         screenSequenceRef.current = [];
         useGameStore.getState().resetSessionCounters();
 
@@ -753,6 +771,13 @@ function App() {
       if (seq[seq.length - 1] !== route.name) {
         seq.push(route.name);
       }
+
+      // Per-screen music bed + entry whoosh. Dynamic import keeps the audio
+      // tree out of any top-level App.tsx import (iOS module-init safety);
+      // it resolves from cache after initGameAudio ran. Fire-and-forget.
+      import("./lib/audio")
+        .then((m) => m.onScreenChange(route.name))
+        .catch(() => { /* audio is non-essential */ });
     }
   }, []);
 

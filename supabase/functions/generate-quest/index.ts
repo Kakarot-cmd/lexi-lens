@@ -164,14 +164,16 @@ RESPONSE: Return ONLY valid JSON. No markdown, no prose outside JSON.
     {
       "word":             "vocabulary word (from the taxonomy pool)",
       "definition":       "child-appropriate definition, ${ageBand} reading level",
-      "evaluationHints":  "one sentence: what Claude's vision model should look for in an object to verify this property"
+      "evaluationHints":  "one sentence: what Claude's vision model should look for in an object to verify this property",
+      "phonetic":         "IPA pronunciation in slashes, General American (e.g. /braʊn/). Be accurate."
     }
   ],
   "hard_mode_properties": [
     {
       "word":             "upward synonym of the base word",
       "definition":       "definition at the higher register, ${ageBand}+1 reading level",
-      "evaluationHints":  "same or more specific than the base hint"
+      "evaluationHints":  "same or more specific than the base hint",
+      "phonetic":         "IPA pronunciation in slashes, General American (e.g. /ˈrɪdʒɪd/). Be accurate."
     }
   ]
 }
@@ -324,8 +326,8 @@ Deno.serve(async (req: Request) => {
     spell_name:           string;
     weapon_emoji:         string;
     spell_description:    string;
-    required_properties:  Array<{ word: string; definition: string; evaluationHints: string }>;
-    hard_mode_properties: Array<{ word: string; definition: string; evaluationHints: string }>;
+    required_properties:  Array<{ word: string; definition: string; evaluationHints: string; phonetic?: string }>;
+    hard_mode_properties: Array<{ word: string; definition: string; evaluationHints: string; phonetic?: string }>;
   };
 
   try {

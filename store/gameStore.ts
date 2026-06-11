@@ -194,6 +194,10 @@ export interface PropertyRequirement {
   word:             string;
   definition:       string;
   evaluationHints?: string;
+  /** IPA pronunciation in slashes, emitted by generate-quest. Optional — older
+   *  quests / library quests won't have it; the client falls back to the curated
+   *  phonetics map (lib/phonetics.ts). */
+  phonetic?:        string;
 }
 
 export interface Quest {

@@ -53,6 +53,7 @@ import { usePdfExport }            from "../hooks/usePdfExport";
 import SiblingLeaderboard          from "../components/SiblingLeaderboard";
 // N4 — Achievement badge grid
 import { AchievementBadgeGrid }    from "../components/AchievementBadgeGrid";
+import { AudioSettingsSheet }    from "../components/AudioSettingsSheet";
 // Lumi — settings + ambient mascot
 import {
   LumiHUD,
@@ -629,6 +630,7 @@ export function ParentDashboard({ navigation }: Props) {
   const [streakInfo,          setStreakInfo]          = useState<StreakInfo>({ currentStreak: 0, longestStreak: 0 });
   const [notifEnabled,        setNotifEnabled]        = useState(false);
   const [showGenerator,       setShowGenerator]       = useState(false);
+  const [showAudioSheet,      setShowAudioSheet]      = useState(false);
   const [showPrivacyPolicy,   setShowPrivacyPolicy]   = useState(false);
   const [showDeleteScreen,    setShowDeleteScreen]    = useState(false);
   const [deletionScheduledAt, setDeletionScheduledAt] = useState<string | null>(null);
@@ -848,12 +850,22 @@ export function ParentDashboard({ navigation }: Props) {
             <Text style={styles.backArrow}>‹</Text>
           </TouchableOpacity>
           <Text style={styles.headerTitle}>Word Tome</Text>
-          <TouchableOpacity
-            style={styles.createQuestBtn}
-            onPress={() => setShowGenerator(true)}
-          >
-            <Text style={styles.createQuestBtnText}>✦ AI Quest</Text>
-          </TouchableOpacity>
+          <View style={styles.headerActions}>
+            <TouchableOpacity
+              style={styles.audioBtn}
+              onPress={() => setShowAudioSheet(true)}
+              accessibilityRole="button"
+              accessibilityLabel="Sound and music settings"
+            >
+              <Text style={styles.audioBtnText}>🎵</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.createQuestBtn}
+              onPress={() => setShowGenerator(true)}
+            >
+              <Text style={styles.createQuestBtnText}>✦ AI Quest</Text>
+            </TouchableOpacity>
+          </View>
         </View>
         {children.length > 1 && (
           <ScrollView
@@ -888,6 +900,12 @@ export function ParentDashboard({ navigation }: Props) {
           setShowGenerator(false);
           navigation.navigate("Paywall", { reason: reason ?? "generate-quest-locked" });
         }}
+      />
+
+      {/* Sound & Music sheet (opened from the header 🎵) */}
+      <AudioSettingsSheet
+        visible={showAudioSheet}
+        onClose={() => setShowAudioSheet(false)}
       />
 
       {/* Privacy Policy modal */}
@@ -1237,6 +1255,18 @@ const styles = StyleSheet.create({
     borderColor:       P.purpleBorder,
   },
   createQuestBtnText: { color: P.purpleAccent, fontSize: 13, fontWeight: "700" },
+  headerActions: { flexDirection: "row", alignItems: "center", gap: 8 },
+  audioBtn: {
+    width:           38,
+    height:          38,
+    borderRadius:    19,
+    alignItems:      "center",
+    justifyContent:  "center",
+    backgroundColor: P.parchment,
+    borderWidth:     1,
+    borderColor:     P.warmBorder,
+  },
+  audioBtnText: { fontSize: 17 },
   headerSub: { fontSize: 12, color: P.inkLight, marginTop: 1 },
 
   childTabs:    { marginTop: 10 },

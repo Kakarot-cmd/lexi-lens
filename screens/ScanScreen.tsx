@@ -39,6 +39,8 @@ import {
 import { Camera } from "react-native-vision-camera";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
+import { speakWord, stopSpeaking, prewarmSpeech } from "../lib/audio";
+import { getPhonetic } from "../lib/phonetics";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { useObjectScanner } from "../hooks/useObjectScanner";
@@ -154,12 +156,14 @@ function ComponentsStrip({
   browsedWord,
   hintedWords,
   onSelectWord,
+  phoneticFor,
 }: {
   components:   Array<{ propertyWord: string; found: boolean; objectUsed: string | null }>;
   current:      string | null;
   browsedWord:  string | null;
   hintedWords:  Set<string>;
   onSelectWord: (word: string) => void;
+  phoneticFor:  (word: string) => string | null;
 }) {
   const foundCount = components.filter((c) => c.found).length;
   const total      = components.length;
@@ -205,11 +209,13 @@ function ComponentsStrip({
                   isBrowsed && !comp.found && styles.chipActive,
                   comp.found && styles.chipDone,
                 ]}
-                onPress={() => !comp.found && onSelectWord(comp.propertyWord)}
-                activeOpacity={comp.found ? 1 : 0.7}
+                onPress={() => onSelectWord(comp.propertyWord)}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel={`Hear the word ${comp.propertyWord}`}
               >
                 {comp.found && (
-                  <Text style={{ fontSize: 10, marginRight: 4 }}>✓</Text>
+                  <Text style={{ fontSize: 11, marginRight: 4, color: "#4ade80" }}>✓</Text>
                 )}
                 <View>
                   <Text style={[
@@ -219,6 +225,9 @@ function ComponentsStrip({
                   ]}>
                     {comp.propertyWord}
                   </Text>
+                  {!comp.found && phoneticFor(comp.propertyWord) && (
+                    <Text style={styles.chipPhonetic}>{phoneticFor(comp.propertyWord)}</Text>
+                  )}
                   {comp.found && comp.objectUsed ? (
                     <Text style={styles.chipObject}>{comp.objectUsed}</Text>
                   ) : (
@@ -440,6 +449,10 @@ function ScanButton({
 
 export function ScanScreen({ route, navigation }: Props) {
   const insets = useSafeAreaInsets();
+
+  // Warm the native TTS engine on mount so the first word a child taps speaks
+  // immediately instead of paying the one-time engine cold-start. Silent + once.
+  useEffect(() => { prewarmSpeech(); }, []);
   const { questId, hardMode: routeHardMode = false } = route.params;
 
   // v6.5 — reticle center for Lumi's orbit-reticle motion during evaluation.
@@ -508,15 +521,55 @@ export function ScanScreen({ route, navigation }: Props) {
     };
   }, [activeChild?.id, activeQuest?.quest?.id, activeQuest?.isHardMode, startQuestSession, finishQuestSession]);
 
-  // ── Sync browsedWord to currentComponent ─────────────────────────────────
+  // ── Sync browsedWord to the CURRENT quest's component ─────────────────────
+  // Reset the browse selection whenever the quest changes, then seed it from
+  // THIS quest's current component. Keying the reset on the quest id fixes the
+  // stale-chip bug: leaving a quest via the system back button doesn't call
+  // abandonQuest, so the store's activeQuest lingers. On opening the next quest
+  // the seed below briefly latches onto the PREVIOUS quest's component before
+  // beginQuest swaps the store, and the `!browsedWord` guard then locks that
+  // stale word in. The unconditional reset on quest-id change corrects it once
+  // the new quest is active.
+  const browseQuestId = activeQuest?.quest?.id ?? null;
+  useEffect(() => {
+    setBrowsedWord(currentComponent?.propertyWord ?? null);
+    // Re-seed on quest change only — NOT on every component advance, which stays
+    // guarded below so a user's chip tap isn't overwritten.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [browseQuestId]);
+
   useEffect(() => {
     if (currentComponent && !browsedWord) {
       setBrowsedWord(currentComponent.propertyWord);
     }
-  }, [currentComponent?.propertyWord]);
+  }, [currentComponent?.propertyWord, browsedWord]);
+
+  // On leaving the screen: stop any spoken word, and clear the quest from the
+  // store ONLY if the child found nothing (the exact "open, do nothing, close"
+  // repro). Quests WITH progress are deliberately kept so a back-out can be
+  // resumed — abandoning those would punish an accidental back-press.
+  useEffect(() => () => {
+    stopSpeaking();
+    const aq = useGameStore.getState().activeQuest;
+    if (aq && !aq.components.some((c) => c.found)) {
+      useGameStore.getState().abandonQuest();
+    }
+  }, []);
 
   const isHardMode          = activeQuest?.isHardMode ?? false;
   const effectiveProperties = activeQuest?.effectiveProperties ?? [];
+
+  // Phonetic for a word: prefer the IPA generate-quest stored on the property
+  // (full coverage for AI-generated words), fall back to the curated map
+  // (lib/phonetics.ts) for older/library quests, null if neither has it.
+  const phoneticFor = useCallback(
+    (word: string | null | undefined): string | null => {
+      if (!word) return null;
+      const stored = effectiveProperties.find((p) => p.word === word)?.phonetic?.trim();
+      return stored || getPhonetic(word);
+    },
+    [effectiveProperties]
+  );
   const pendingProperties   = effectiveProperties.filter(
     (p) => !activeQuest?.components.find((c) => c.propertyWord === p.word && c.found)
   );
@@ -885,29 +938,47 @@ export function ScanScreen({ route, navigation }: Props) {
               />
             )}
 
-            {browsedWord && !activeQuest?.components.find(c => c.propertyWord === browsedWord && c.found) && (
-              <View style={[styles.seekCard, isHardMode && styles.seekCardHard]}>
-                <Text style={styles.seekLabel}>
-                  {browsedWord === currentComponent?.propertyWord
-                    ? "Find something…"
-                    : "Browse — tap chip to hunt this"}
-                </Text>
-                <Text style={[styles.seekWord, isHardMode && { color: P.hardRedText }]}>
-                  {browsedWord}
-                </Text>
-                <Text style={styles.seekDef} numberOfLines={3}>
-                  {effectiveProperties.find((p) => p.word === browsedWord)?.definition}
-                </Text>
-              </View>
-            )}
+            {browsedWord && (() => {
+              const browsedComp  = activeQuest?.components.find((c) => c.propertyWord === browsedWord);
+              const browsedFound = !!browsedComp?.found;
+              return (
+                <View style={[styles.seekCard, isHardMode && !browsedFound && styles.seekCardHard]}>
+                  <Text style={[styles.seekLabel, browsedFound && styles.seekLabelDone]}>
+                    {browsedFound
+                      ? (browsedComp?.objectUsed ? `Found ✓ · ${browsedComp.objectUsed}` : "Found ✓")
+                      : "Find something…"}
+                  </Text>
+                  <TouchableOpacity
+                    onPress={() => speakWord(browsedWord)}
+                    activeOpacity={0.7}
+                    style={styles.seekWordRow}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Hear the word ${browsedWord}`}
+                  >
+                    <Text style={[styles.seekWord, isHardMode && !browsedFound && { color: P.hardRedText }]}>
+                      {browsedWord}
+                    </Text>
+                    <Text style={styles.seekSpeaker}>🔊</Text>
+                    {phoneticFor(browsedWord) && (
+                      <Text style={styles.seekPhonetic}>{phoneticFor(browsedWord)}</Text>
+                    )}
+                  </TouchableOpacity>
+                  <Text style={styles.seekDef} numberOfLines={3}>
+                    {effectiveProperties.find((p) => p.word === browsedWord)?.definition}
+                  </Text>
+                </View>
+              );
+            })()}
 
             <ComponentsStrip
               components={components}
               current={currentComponent?.propertyWord ?? null}
               browsedWord={browsedWord}
               hintedWords={hintedWords}
+              phoneticFor={phoneticFor}
               onSelectWord={(word) => {
                 setBrowsedWord(word);
+                speakWord(word);          // say the word aloud on tap
                 Haptics.selectionAsync();
               }}
             />
@@ -1104,8 +1175,9 @@ const styles = StyleSheet.create({
   chipsRow:          { flexDirection: "row", flexWrap: "wrap", marginBottom: 8 },
   chip:              { flexDirection: "row", alignItems: "center", paddingHorizontal: 10, paddingVertical: 6, borderRadius: 20, backgroundColor: "rgba(30,16,64,0.85)", borderWidth: 0.5, borderColor: P.cardBorder, marginRight: 6, marginBottom: 6 },
   chipActive:        { borderColor: P.gold, backgroundColor: "rgba(40,24,80,0.9)" },
-  chipDone:          { borderColor: "#166534", backgroundColor: "rgba(5,46,22,0.85)" },
+  chipDone:          { borderColor: "#22c55e", backgroundColor: "rgba(22,101,52,0.9)" },
   chipText:          { fontSize: 12, color: P.textMuted, marginLeft: 5 },
+  chipPhonetic:      { fontSize: 9, color: P.textDim, opacity: 0.7, marginLeft: 5, marginTop: 1 },
   chipTextDone:      { color: "#86efac" },
   chipObject:        { fontSize: 9, color: "#4ade80", opacity: 0.8 },
   chipTapHint:       { fontSize: 8, color: P.textDim, opacity: 0.6, marginTop: 1 },
@@ -1117,7 +1189,11 @@ const styles = StyleSheet.create({
   seekCard:     { backgroundColor: "rgba(15,6,32,0.88)", borderRadius: 16, padding: 14, marginBottom: 8, borderWidth: 0.5, borderColor: P.cardBorder },
   seekCardHard: { borderColor: "#7f1d1d", backgroundColor: "rgba(26,5,5,0.88)" },
   seekLabel:    { fontSize: 11, color: P.textDim, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 2 },
-  seekWord:     { fontSize: 22, fontWeight: "700", color: P.gold, marginBottom: 4 },
+  seekLabelDone: { color: "#86efac" },
+  seekWord:     { fontSize: 22, fontWeight: "700", color: P.gold },
+  seekWordRow:  { flexDirection: "row", flexWrap: "wrap", alignItems: "center", gap: 8, marginBottom: 6 },
+  seekSpeaker:  { fontSize: 18, opacity: 0.85 },
+  seekPhonetic: { fontSize: 15, color: P.textMuted, fontWeight: "600", letterSpacing: 0.3, backgroundColor: "rgba(124,58,237,0.16)", paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8, overflow: "hidden" },
   seekDef:      { fontSize: 13, color: P.textMuted, lineHeight: 18 },
 
   // v3.3 iOS scan error toast
