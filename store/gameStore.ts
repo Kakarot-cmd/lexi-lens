@@ -736,7 +736,7 @@ export const useGameStore = create<GameState>()(
             if (p.definition?.trim()) return p;
             const canonical = quest.required_properties.find((r) => r.word === p.word);
             return canonical
-              ? { ...p, definition: canonical.definition, evaluationHints: p.evaluationHints ?? canonical.evaluationHints }
+              ? { ...p, definition: canonical.definition, evaluationHints: p.evaluationHints ?? canonical.evaluationHints, phonetic: p.phonetic ?? canonical.phonetic }
               : p;
           }
         );

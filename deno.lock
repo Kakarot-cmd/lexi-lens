@@ -29,6 +29,7 @@
         "npm:expo-notifications@~0.32.17",
         "npm:expo-print@~15.0.8",
         "npm:expo-sharing@~14.0.8",
+        "npm:expo-speech@~14.0.8",
         "npm:expo-status-bar@~3.0.9",
         "npm:expo-updates@~29.0.17",
         "npm:expo@~54.0.34",
