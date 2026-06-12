@@ -639,6 +639,18 @@ export function ParentDashboard({ navigation }: Props) {
   const [sessionRefreshKey,   setSessionRefreshKey]   = useState(0);
   // Collapse controls — keep the dashboard scannable on long tomes
   const [tomeShowAll,         setTomeShowAll]         = useState(false);
+
+  // Layer-3 discovery: a one-time "Grown-Ups" intro card the first time a parent
+  // opens the dashboard, surfacing the two tools nothing else introduces today —
+  // AI quest generation and Word Tome PDF export. Decision captured once at mount
+  // (lazy initial state); reuses the persisted seenTips flag pattern.
+  const [showParentTour, setShowParentTour] = useState(
+    () => !useGameStore.getState().seenTips["parent_tour"],
+  );
+  const dismissParentTour = useCallback(() => {
+    useGameStore.getState().markTipSeen("parent_tour");
+    setShowParentTour(false);
+  }, []);
   const [questsOpen,          setQuestsOpen]          = useState(false);
 
   const {
@@ -936,6 +948,56 @@ export function ParentDashboard({ navigation }: Props) {
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={P.amberAccent} />}
           showsVerticalScrollIndicator={false}
         >
+          {/* ── Layer-3: one-time Grown-Ups intro ─────────── */}
+          {showParentTour && (
+            <View style={styles.tourCard}>
+              <Text style={styles.tourTitle}>👋 Welcome, grown-ups!</Text>
+              <Text style={styles.tourIntro}>
+                This is your space — scroll to explore. A few things you can do here:
+              </Text>
+
+              <View style={styles.tourRow}>
+                <Text style={styles.tourEmoji}>🧩</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.tourRowTitle}>Create custom quests</Text>
+                  <Text style={styles.tourRowBody}>
+                    Generate new word quests with AI for any words you choose.
+                  </Text>
+                </View>
+              </View>
+
+              <View style={styles.tourRow}>
+                <Text style={styles.tourEmoji}>📄</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.tourRowTitle}>Export the Word Tome</Text>
+                  <Text style={styles.tourRowBody}>
+                    Save your child's collected words as a printable PDF.
+                  </Text>
+                </View>
+              </View>
+
+              <View style={styles.tourRow}>
+                <Text style={styles.tourEmoji}>📊</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.tourRowTitle}>Track &amp; manage</Text>
+                  <Text style={styles.tourRowBody}>
+                    Progress, streaks, mastery, limits, and your subscription.
+                  </Text>
+                </View>
+              </View>
+
+              <TouchableOpacity
+                style={styles.tourBtn}
+                onPress={dismissParentTour}
+                activeOpacity={0.85}
+                accessibilityRole="button"
+                accessibilityLabel="Dismiss welcome"
+              >
+                <Text style={styles.tourBtnText}>Got it</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
           {/* ── Child profile ────────────────────────────── */}
           <View style={styles.profileRow}>
             <Avatar avatarKey={selectedChild?.avatar_key ?? null} size={52} />
@@ -1361,6 +1423,31 @@ const styles = StyleSheet.create({
   },
   tomeToggleText: { fontSize: 13, fontWeight: "700", color: P.amberAccent },
   sectionTitle:  { fontSize: 16, fontWeight: "700", color: P.inkBrown },
+
+  // ── Layer-3 Grown-Ups intro card
+  tourCard: {
+    backgroundColor: P.amberLight,
+    borderWidth: 1,
+    borderColor: P.amberBorder,
+    borderRadius: 14,
+    padding: 16,
+    marginBottom: 12,
+    gap: 10,
+  },
+  tourTitle:    { fontSize: 17, fontWeight: "800", color: P.inkBrown },
+  tourIntro:    { fontSize: 13, color: P.inkMid, marginBottom: 2, lineHeight: 19 },
+  tourRow:      { flexDirection: "row", alignItems: "flex-start", gap: 10 },
+  tourEmoji:    { fontSize: 20, width: 26, textAlign: "center" },
+  tourRowTitle: { fontSize: 14, fontWeight: "700", color: P.inkBrown },
+  tourRowBody:  { fontSize: 12.5, color: P.inkMid, lineHeight: 18 },
+  tourBtn: {
+    marginTop: 4,
+    backgroundColor: P.amberAccent,
+    borderRadius: 10,
+    paddingVertical: 11,
+    alignItems: "center",
+  },
+  tourBtnText:  { color: "#ffffff", fontSize: 14, fontWeight: "700", letterSpacing: 0.3 },
   sectionDesc:   { fontSize: 13, color: P.inkLight, lineHeight: 19, marginBottom: 12 },
 
   wordCountBadge: {

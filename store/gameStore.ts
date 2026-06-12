@@ -343,6 +343,11 @@ interface GameState {
   hasSeenOnboarding:      boolean;
   markOnboardingComplete: () => void;
 
+  // Layer-1 feature discovery: once-per-device first-visit tips, keyed by id
+  // (e.g. "scan_speech"). Scalable — every future contextual tip reuses this.
+  seenTips:               Record<string, boolean>;
+  markTipSeen:            (key: string) => void;
+
   achievements:           AchievementRecord[];
   newlyEarnedBadges:      Badge[];
   isLoadingAchievements:  boolean;
@@ -506,6 +511,10 @@ export const useGameStore = create<GameState>()(
 
       hasSeenOnboarding:      false,
       markOnboardingComplete: () => set({ hasSeenOnboarding: true }),
+
+      seenTips:               {},
+      markTipSeen:            (key) =>
+        set((s) => ({ seenTips: { ...s.seenTips, [key]: true } })),
 
       achievements:          [],
       newlyEarnedBadges:     [],
@@ -1407,6 +1416,7 @@ export const useGameStore = create<GameState>()(
         isDailyQuestComplete:  state.isDailyQuestComplete,
         spellBook:             state.spellBook,
         hasSeenOnboarding:     state.hasSeenOnboarding,
+        seenTips:              state.seenTips,
         // v6.0 — persist parent tier so cold-start QuestMap doesn't flash
         // unlocked content for a beat before loadParentProfile() resolves.
         parentSubscriptionTier: state.parentSubscriptionTier,

@@ -470,6 +470,9 @@ export function ScanScreen({ route, navigation }: Props) {
   const questLibrary     = useGameStore((s) => s.questLibrary);
   const currentComponent = useGameStore(selectCurrentComponent);
   const currentAttempts  = useGameStore(selectCurrentAttempts);
+  // Layer-1 discovery tip flags (persisted; reuses gameStore seenTips)
+  const seenTips         = useGameStore((s) => s.seenTips);
+  const markTipSeen      = useGameStore((s) => s.markTipSeen);
   const questComplete    = useGameStore(selectQuestComplete);
   const streakMultiplier = useGameStore(selectStreakMultiplier);
 
@@ -492,6 +495,8 @@ export function ScanScreen({ route, navigation }: Props) {
   const [limitBannerDismissed, setLimitBannerDismissed] = useState(false);
   // v3.3 iOS patch — surface capture errors as an in-UI toast
   const [scanErrorMsg,        setScanErrorMsg]        = useState<string | null>(null);
+  // Layer-1: one-time Lumi tip teaching tap-to-hear + phonetics on first scan
+  const [lumiTip,             setLumiTip]             = useState<string | null>(null);
 
   // ── Begin quest on mount ──────────────────────────────────────────────────
   useEffect(() => {
@@ -500,6 +505,19 @@ export function ScanScreen({ route, navigation }: Props) {
       beginQuest(quest, routeHardMode);
     }
   }, [questId]);
+
+  // ── Layer-1 discovery tip ─────────────────────────────────────────────────
+  // Once per device, the first time the child reaches the scanning phase, Lumi
+  // teaches the two on-screen features kids miss: tap-a-word-to-hear-it and the
+  // phonetic spelling. Shown for ~5s, then cleared so her normal scan-state
+  // messages resume (LumiMascot: a defined `message` prop always wins).
+  useEffect(() => {
+    if (phase !== "scanning" || seenTips["scan_speech"]) return;
+    markTipSeen("scan_speech");
+    setLumiTip("Tap any word to hear it — the tiny letters show how to say it! 🔊");
+    const id = setTimeout(() => setLumiTip(null), 5200);
+    return () => clearTimeout(id);
+  }, [phase, seenTips, markTipSeen]);
 
   // ── Quest session lifecycle (Phase 3.7) ──────────────────────────────────
   useEffect(() => {
@@ -590,6 +608,12 @@ export function ScanScreen({ route, navigation }: Props) {
     approachingLimit,
     resetsAt,
   } = useLexiEvaluate();
+
+  // Layer-1: don't let the discovery tip mask live scan feedback
+  // ("scanning…", "correct!") — clear it the moment evaluation begins.
+  useEffect(() => {
+    if (status !== "idle" && lumiTip) setLumiTip(null);
+  }, [status, lumiTip]);
 
   // ── Result effect ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -1098,6 +1122,7 @@ export function ScanScreen({ route, navigation }: Props) {
        */}
       <LumiHUD
         screen="scan"
+        message={lumiTip ?? undefined}
         evaluationStatus={status}
         hardMode={isHardMode}
         dailyLimitReached={status === "rate_limited"}

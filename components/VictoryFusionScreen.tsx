@@ -53,6 +53,7 @@ import LottieView from "lottie-react-native";
 
 import { LumiHUD } from "./Lumi";
 import { playSfx } from "../lib/audio";
+import { useGameStore } from "../store/gameStore";
 
 const { width: W, height: H } = Dimensions.get("window");
 
@@ -423,6 +424,18 @@ export function VictoryFusionScreen({
   const [explodeTriggered, setExplodeTriggered] = React.useState(false);
   const [showContent,      setShowContent]      = React.useState(false);
 
+  // Layer-1 discovery: on the child's first-ever quest victory, Lumi points them
+  // to the Word Tome. The decision is captured once at mount (lazy initial state)
+  // so flipping the persisted flag can't yank the tip mid-celebration.
+  const [showTomeTip] = React.useState(
+    () => !useGameStore.getState().seenTips["first_victory_tome"],
+  );
+  useEffect(() => {
+    if (showTomeTip && showContent) {
+      useGameStore.getState().markTipSeen("first_victory_tome");
+    }
+  }, [showTomeTip, showContent]);
+
   const particleCount = Math.min(components.length, 5);
 
   // Haptics on mount
@@ -515,6 +528,11 @@ export function VictoryFusionScreen({
         screen="victory"
         hardMode={isHardMode}
         hidden={!showContent}
+        message={
+          showTomeTip
+            ? "🎉 Your new words are in your Word Tome — go take a look!"
+            : undefined
+        }
       />
     </View>
   );

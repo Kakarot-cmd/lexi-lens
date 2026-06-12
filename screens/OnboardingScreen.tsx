@@ -93,17 +93,17 @@ const P = {
 const STEPS = [
   {
     title: "Your Magic Lens",
-    body:  "Point your camera at anything around you — a chair, a cup, a leaf. Skanlore spots it and builds a quest just for that object.",
+    body:  "Your camera is a magic lens! Point it at real things around you — a chair, a cup, a leaf — and tap to scan them.",
     cta:   "Show me →",
   },
   {
     title: "Pick a Quest",
-    body:  "Each quest hides vocabulary inside everyday objects. Find colours, textures, shapes and sounds — one word at a time.",
+    body:  "Tap a quest to meet its monster. It gives you word clues — then scan real objects that match each clue to win the battle!",
     cta:   "Next →",
   },
   {
     title: "Your Word Tome",
-    body:  "Every word you discover lives in your Word Tome forever. Master words to unlock new spells and level up your adventurer!",
+    body:  "Every word you find is saved in your Word Tome. Master words to unlock magic spells and level up your adventurer!",
     cta:   "Let's go! 🚀",
   },
 ] as const;
@@ -111,7 +111,7 @@ const STEPS = [
 // Lumi messages keyed to each step
 const LUMI_STEP_MESSAGES = [
   "Hi! I'm Lumi, your spark guide ✨",
-  "Pick the next quest you want to try!",
+  "Tap a quest and match its word clues!",
   "Words you find live in your Tome ✨",
 ] as const;
 
