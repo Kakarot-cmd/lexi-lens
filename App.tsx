@@ -387,6 +387,7 @@ function App() {
   }, []);
 
   const navigationRef = useNavigationContainerRef();
+  const audioReadyRef = useRef(false);
 
   // ── Lumi sound bootstrap (once at app start) ──────────────────────────────
   // v4.5.8 — dynamic import so a module-init failure in expo-audio or the
@@ -405,6 +406,15 @@ function App() {
         const gameAudio = await import("./lib/audio");
         if (cancelled) return;
         await gameAudio.initGameAudio();
+        // Engine ready (assets localized). Start the bed for whatever screen is
+        // already showing: onReady may have fired before init finished, in which
+        // case the nav handler deliberately skipped audio (see below). This is
+        // the other half — whichever of {nav-ready, init-done} lands last starts
+        // the initial bed, exactly once.
+        if (cancelled) return;
+        audioReadyRef.current = true;
+        const current = navigationRef.isReady() ? navigationRef.getCurrentRoute() : null;
+        if (current) gameAudio.onScreenChange(current.name);
       } catch (err) {
         // Sound init failures are non-fatal — kids still get the game.
         console.warn("[Lumi] sound init skipped:", err);
@@ -775,9 +785,15 @@ function App() {
       // Per-screen music bed + entry whoosh. Dynamic import keeps the audio
       // tree out of any top-level App.tsx import (iOS module-init safety);
       // it resolves from cache after initGameAudio ran. Fire-and-forget.
-      import("./lib/audio")
-        .then((m) => m.onScreenChange(route.name))
-        .catch(() => { /* audio is non-essential */ });
+      // Gated on audioReadyRef: before the engine localizes its assets, a
+      // startBgm() on the not-yet-localized track fails silently AND poisons the
+      // committed-route state, so the bed wouldn't start until the next screen.
+      // Until then the init effect owns the initial bed.
+      if (audioReadyRef.current) {
+        import("./lib/audio")
+          .then((m) => m.onScreenChange(route.name))
+          .catch(() => { /* audio is non-essential */ });
+      }
     }
   }, []);
 
@@ -818,6 +834,7 @@ function App() {
       <SafeAreaProvider>
         <NavigationContainer
           ref={navigationRef}
+          onReady={handleNavigationStateChange}
           onStateChange={handleNavigationStateChange}
         >
           {showAuth ? (

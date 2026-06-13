@@ -33,25 +33,34 @@ const NO_ENTRY_SFX = new Set<string>([
   'Scan', // Lumi's scan chime owns this moment
 ]);
 
+/**
+ * Master switch for the screen-change whoosh. OFF by default: a music bed plays
+ * continuously, so a sound on every navigation tends to fatigue more than it
+ * delights, and tap feedback belongs on buttons rather than global nav. Flip to
+ * true to bring it back (optionally swap assets/sounds/sfx/screen_in.mp3 for a
+ * cuter pop/twinkle/boop). The leading-edge timing below works either way.
+ */
+const SCREEN_WHOOSH_ENABLED = false;
+
 // React Navigation's onStateChange can fire several times during a push
 // animation, and getCurrentRoute() briefly reports intermediate routes — so a
-// single tap can look like map→scan→map→scan. We coalesce per-frame flapping,
-// but with TWO windows, because the two cues have opposite needs:
+// single tap can look like map→scan→map→scan. The two cues handle that
+// flapping differently, because they have opposite needs:
 //
 //   • BGM  — switching beds tears the player down and rebuilds it (~350ms iOS
-//            load). It must only react to the SETTLED route, so a longer window
-//            is fine; the latency is inaudible for music.
-//   • Whoosh — a UI sound that must feel tied to the tap. A long window made it
-//            land ~350ms late ("not matching the action"). Reused pooled player,
-//            so firing it promptly is cheap and safe — short window.
-const BGM_SETTLE_MS    = 300;
-const WHOOSH_SETTLE_MS  = 110;
+//            load). It must only react to the SETTLED route, so a trailing
+//            settle window is right; the latency is inaudible for music.
+//   • Whoosh — a UI sound that must feel tied to the tap. So it fires on the
+//            LEADING edge — the instant the route first changes — then locks
+//            out briefly to swallow the flap, so one tap = one prompt whoosh.
+const BGM_SETTLE_MS  = 300;
+const WHOOSH_LOCK_MS = 350;
 
 let _committedBgm:    string | null = null;
 let _committedWhoosh: string | null = null;
 let _pendingRoute:    string | null = null;
 let _bgmTimer:    ReturnType<typeof setTimeout> | null = null;
-let _whooshTimer: ReturnType<typeof setTimeout> | null = null;
+let _whooshLockUntil = 0;
 
 function commitBgm(): void {
   _bgmTimer = null;
@@ -62,13 +71,17 @@ function commitBgm(): void {
   if (bed) void startBgm(bed); // engine no-ops if it's already the active bed
 }
 
-function commitWhoosh(): void {
-  _whooshTimer = null;
-  const r = _pendingRoute;
-  if (!r || r === _committedWhoosh) return;
-  const isFirst = _committedWhoosh === null;
-  _committedWhoosh = r;
-  if (!isFirst && !NO_ENTRY_SFX.has(r)) playSfx('screen_in');
+function fireWhoosh(route: string): void {
+  if (route === _committedWhoosh) return;            // same screen — nothing to do
+  const wasFirst = _committedWhoosh === null;        // never whoosh INTO the first screen
+  const now = Date.now();
+  if (now < _whooshLockUntil) {                      // mid-transition flap: track, don't fire
+    _committedWhoosh = route;
+    return;
+  }
+  _committedWhoosh = route;
+  _whooshLockUntil = now + WHOOSH_LOCK_MS;
+  if (SCREEN_WHOOSH_ENABLED && !wasFirst && !NO_ENTRY_SFX.has(route)) playSfx('screen_in');
 }
 
 /**
@@ -79,18 +92,16 @@ function commitWhoosh(): void {
 export function onScreenChange(routeName: string | null | undefined): void {
   if (!routeName) return;
   _pendingRoute = routeName;
-  if (_whooshTimer) clearTimeout(_whooshTimer);
-  if (_bgmTimer)    clearTimeout(_bgmTimer);
-  _whooshTimer = setTimeout(commitWhoosh, WHOOSH_SETTLE_MS);
-  _bgmTimer    = setTimeout(commitBgm,    BGM_SETTLE_MS);
+  fireWhoosh(routeName);                    // leading-edge → instant, tied to the tap
+  if (_bgmTimer) clearTimeout(_bgmTimer);   // BGM still settles (player swap is costly)
+  _bgmTimer = setTimeout(commitBgm, BGM_SETTLE_MS);
 }
 
 /** Reset (e.g. on sign-out) so the next cold navigation isn't treated as a transition. */
 export function resetScreenAudio(): void {
-  if (_whooshTimer) clearTimeout(_whooshTimer);
-  if (_bgmTimer)    clearTimeout(_bgmTimer);
-  _whooshTimer = null;
+  if (_bgmTimer) clearTimeout(_bgmTimer);
   _bgmTimer = null;
+  _whooshLockUntil = 0;
   _committedBgm = null;
   _committedWhoosh = null;
   _pendingRoute = null;
