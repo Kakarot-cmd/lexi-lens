@@ -219,6 +219,7 @@ export default {
       edgeToEdgeEnabled: true,
       predictiveBackGestureEnabled: false,
       permissions: ['android.permission.CAMERA'],
+      blockedPermissions: ['android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK'],
       package: id.androidPackage,
     },
 
