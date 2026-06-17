@@ -67,7 +67,7 @@ const SECTIONS: PolicySection[] = [
 
 We take children's privacy very seriously. We comply fully with the Children's Online Privacy Protection Act (COPPA), the provisions of the EU General Data Protection Regulation that apply to children (GDPR-K), and the requirements of the Google Play "Designed for Families" programme and Apple App Store Kids category.
 
-Contact for privacy matters: beautifulhearts.n@gmail.com
+Contact for privacy matters: support-skanlore@njlabs.app
 Last updated: June 2026  |  Policy version: 1.1`,
   },
   {
@@ -180,7 +180,7 @@ WE DO NOT SHARE DATA WITH:
     id:    "retention",
     emoji: "📅",
     title: "How long we keep data",
-    body: `PARENT ACCOUNT DATA: Retained for the lifetime of the account. Permanently deleted within 30 days of an account deletion request via the in-app Delete Account flow or by emailing beautifulhearts.n@gmail.com.
+    body: `PARENT ACCOUNT DATA: Retained for the lifetime of the account. Permanently deleted within 30 days of an account deletion request via the in-app Delete Account flow or by emailing support-skanlore@njlabs.app.
 
 CHILD PROFILE DATA (name, age band, avatar): Deleted immediately when a parent removes the child profile. Deleted within 24 hours of an account deletion request.
 
@@ -212,7 +212,7 @@ UNDER GDPR (EU/UK PARENTS), you also have the right to:
 
 HOW TO EXERCISE YOUR RIGHTS:
 • In-app: Parent Dashboard → Settings → Delete Account (for full deletion)
-• By email: beautifulhearts.n@gmail.com (for access, portability, or other requests)
+• By email: support-skanlore@njlabs.app (for access, portability, or other requests)
 • We will respond within 30 days. For children's data, we will prioritise and aim to respond within 5 business days.`,
   },
   {
@@ -231,7 +231,7 @@ ROW LEVEL SECURITY: PostgreSQL Row Level Security (RLS) policies ensure that eac
 
 EDGE FUNCTION SECURITY: All write operations and AI calls go through authenticated Edge Functions. The mobile app uses an anonymous key that can only read/write data belonging to the authenticated user.
 
-VULNERABILITY DISCLOSURE: If you discover a security issue, please email beautifulhearts.n@gmail.com. Do not open a public GitHub issue. We will acknowledge within 48 hours and aim to release a fix within 7 days.`,
+VULNERABILITY DISCLOSURE: If you discover a security issue, please email support-skanlore@njlabs.app. Do not open a public GitHub issue. We will acknowledge within 48 hours and aim to release a fix within 7 days.`,
   },
   {
     id:    "children",
@@ -249,7 +249,7 @@ VULNERABILITY DISCLOSURE: If you discover a security issue, please email beautif
 
 • We do not knowingly collect any information from children beyond what is strictly necessary for the educational vocabulary game to function (name, age band, words scanned, XP).
 
-• If we discover we have accidentally collected data from a child under 5 (below our target age), we will delete it immediately. Please contact beautifulhearts.n@gmail.com if you believe this has occurred.`,
+• If we discover we have accidentally collected data from a child under 5 (below our target age), we will delete it immediately. Please contact support-skanlore@njlabs.app if you believe this has occurred.`,
   },
   {
     id:    "changes",
@@ -272,11 +272,11 @@ If you do not agree with a material change, you may delete your account at any t
     title: "Contact us",
     body: `For any privacy-related question, data access request, or concern about your child's data:
 
-Email: beautifulhearts.n@gmail.com
+Email: support-skanlore@njlabs.app
 Response time: Within 30 days (we aim for within 5 business days for children's data requests)
 
 For security vulnerabilities:
-Email: beautifulhearts.n@gmail.com
+Email: support-skanlore@njlabs.app
 
 For urgent child safety concerns, please contact your local child protection authority directly. We cooperate fully with legitimate law enforcement requests.
 
@@ -351,11 +351,11 @@ export function PrivacyPolicyScreen({ onClose }: Props) {
         {/* Email contact CTA */}
         <TouchableOpacity
           style={styles.emailBtn}
-          onPress={() => Linking.openURL("mailto:beautifulhearts.n@gmail.com").catch(() => null)}
+          onPress={() => Linking.openURL("mailto:support-skanlore@njlabs.app").catch(() => null)}
           accessibilityRole="link"
-          accessibilityLabel="Email beautifulhearts.n@gmail.com"
+          accessibilityLabel="Email support-skanlore@njlabs.app"
         >
-          <Text style={styles.emailBtnText}>📬  Email  beautifulhearts.n@gmail.com</Text>
+          <Text style={styles.emailBtnText}>📬  Email  support-skanlore@njlabs.app</Text>
         </TouchableOpacity>
 
         <Text style={styles.footer}>

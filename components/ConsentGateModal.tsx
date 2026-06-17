@@ -457,7 +457,7 @@ export function ConsentGateModal({ visible, onConsented, onCancel, onOpenPrivacy
     if (onOpenPrivacyPolicy) {
       onOpenPrivacyPolicy();
     } else {
-      Linking.openURL("https://lexi-lens.app/privacy").catch(() => null);
+      Linking.openURL("https://njlabs.app/skanlore/privacy-policy.html").catch(() => null);
     }
   }, [onOpenPrivacyPolicy]);
 

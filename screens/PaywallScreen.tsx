@@ -273,11 +273,11 @@ export default function PaywallScreen({ navigation, route }: Props) {
   }, [restoring, navigation, setSubscriptionFromRC]);
 
   const handlePrivacy = useCallback(() => {
-    Linking.openURL("https://lexilens.app/privacy-policy").catch(() => null);
+    Linking.openURL("https://njlabs.app/skanlore/privacy-policy.html").catch(() => null);
   }, []);
 
   const handleTerms = useCallback(() => {
-    Linking.openURL("https://lexilens.app/terms").catch(() => null);
+    Linking.openURL("https://njlabs.app/skanlore/terms.html").catch(() => null);
   }, []);
 
   const handleManage = useCallback(() => {

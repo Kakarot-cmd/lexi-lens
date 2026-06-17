@@ -398,10 +398,10 @@ function ErrorStep({
 
       <TouchableOpacity
         style={styles.emailFallbackBtn}
-        onPress={() => Linking.openURL("mailto:privacy@lexi-lens.app?subject=Data%20Deletion%20Request").catch(() => null)}
+        onPress={() => Linking.openURL("mailto:support-skanlore@njlabs.app?subject=Data%20Deletion%20Request").catch(() => null)}
         accessibilityRole="link"
       >
-        <Text style={styles.emailFallbackText}>📬  Email privacy@lexi-lens.app</Text>
+        <Text style={styles.emailFallbackText}>📬  Email support-skanlore@njlabs.app</Text>
       </TouchableOpacity>
 
       <TouchableOpacity style={styles.cancelBtn} onPress={onClose} accessibilityRole="button">
