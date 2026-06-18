@@ -139,14 +139,29 @@ function packageTitle(pkg: PurchasesPackage): string {
 }
 
 function perUnitString(pkg: PurchasesPackage): string | null {
-  // Render "≈ ₹29/mo" under the annual price when we can compute it.
+  // Render "≈ ₹33/month" under the annual price when we can compute it.
   if (pkg.packageType !== "ANNUAL") return null;
+
+  // Prefer RC's storefront-localized per-month string: it carries the correct
+  // currency symbol AND the correct decimal rules for that currency
+  // (e.g. "₹33.25", "Rp 5,750" with no decimals, "$2.50"). This is what fixes
+  // the old "≈ INR 33.25/month" output that showed the ISO code, not the symbol.
+  const perMonthString = pkg.product.pricePerMonthString;
+  if (perMonthString) return `≈ ${perMonthString}/month`;
+
+  // Fallback for older payloads where the per-period string is null: locale-aware
+  // currency formatting via Intl (Hermes supports this on both iOS and Android in
+  // RN 0.81). Still yields the right symbol + decimals from the currency code.
   const price = pkg.product.price;
-  if (!price || price <= 0) return null;
-  const perMonth = price / 12;
-  const currency = pkg.product.currencyCode || "";
-  const formatted = perMonth.toFixed(2);
-  return `≈ ${currency} ${formatted}/month`;
+  const code = pkg.product.currencyCode;
+  if (!price || price <= 0 || !code) return null;
+  try {
+    const fmt = new Intl.NumberFormat(undefined, { style: "currency", currency: code });
+    return `≈ ${fmt.format(price / 12)}/month`;
+  } catch {
+    // Last resort — never crash the paywall over a sub-line.
+    return `≈ ${code} ${(price / 12).toFixed(2)}/month`;
+  }
 }
 
 // ─── Highlight selector ───────────────────────────────────────────────────

@@ -380,7 +380,7 @@ function planLabelFromDetails(details: SubscriptionDetails): string {
 }
 
 function renewalLabelFromDetails(details: SubscriptionDetails): string | null {
-  if (!details.isActive) return "Unlock the full quest library + unlimited scans.";
+  if (!details.isActive) return "Unlock the full quest library + up to 100 scans a day.";
   if (details.inGracePeriod) return "Free trial — enjoy!";
   if (!details.expirationDate) return null;
   const when = new Date(details.expirationDate);
