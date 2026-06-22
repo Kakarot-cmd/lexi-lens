@@ -55,6 +55,14 @@ export interface PropertyRequirement {
   word:             string;
   definition:       string;
   evaluationHints?: string;
+  /**
+   * v6.x noun×adjective hybrid. "category" → judge is-a MEMBERSHIP (is the
+   * object a utensil?) rather than attribute possession. Absent/"adjective"
+   * = today's behaviour. Back-compatible: existing quests have no `kind`.
+   */
+  kind?:            "adjective" | "category";
+  /** Category requirements only: example members, used as an eval hint. */
+  examples?:        string[];
 }
 
 export interface PropertyScore {
@@ -450,6 +458,8 @@ ${questName ? `Quest: "${questName}"` : ""}
 ${masterySection}
 Your task: evaluate whether the detected object genuinely demonstrates each required vocabulary property, AND produce age-banded kid-voice messages for each verdict.
 
+CATEGORY PROPERTIES: a property tagged [CATEGORY] is judged differently — score whether the object BELONGS TO that noun category (is-a), not whether it has an attribute. Use everyday, child-reasonable categorization: a more specific object belongs to its broader category (a mug is a container, a bus is a vehicle, a spoon is a utensil). Score 1.0 (passes) if it is a member, 0.0 (fails) if not. A generic "object"/"thing" label, a person, a face, or a document is NOT a member of any category — score those 0.0.
+
 OUTPUT SHAPE (strict — return exactly this JSON shape; no prose, no markdown):
 {
   "resolvedObjectName": "<bare lowercase common noun, NO articles (a/an/the), NO sentence punctuation. examples: 'apple', 'remote control', 'biscuit packet'. NOT 'a chair', 'The Bottle.', 'an apple'>",
@@ -551,7 +561,15 @@ Return only the JSON. No commentary, no markdown fences.`;
 
 function buildUserText(opts: EvaluateObjectOptions): string {
   const propertyList = opts.requiredProperties
-    .map((p) => `  • "${p.word}" — ${p.definition}${p.evaluationHints ? ` (hint: ${p.evaluationHints})` : ""}`)
+    .map((p) => {
+      if (p.kind === "category") {
+        const egs = p.examples && p.examples.length > 0
+          ? ` Examples of members: ${p.examples.join(", ")}.`
+          : "";
+        return `  • "${p.word}" [CATEGORY] — pass only if the object IS A KIND OF ${p.word} (is-a membership), not because it merely looks like one.${egs}${p.evaluationHints ? ` (hint: ${p.evaluationHints})` : ""}`;
+      }
+      return `  • "${p.word}" — ${p.definition}${p.evaluationHints ? ` (hint: ${p.evaluationHints})` : ""}`;
+    })
     .join("\n");
 
   const alreadyFoundContext = (opts.alreadyFoundWords ?? []).length > 0

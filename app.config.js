@@ -217,6 +217,10 @@ export default {
         backgroundColor: '#ffffff',
       },
       edgeToEdgeEnabled: true,
+      // Edge-to-edge (Android 15 / API 35) no longer auto-resizes the window for
+      // the IME under the legacy default. "resize" is the edge-to-edge-compatible
+      // mode and works in concert with the in-app KeyboardAware* components.
+      softwareKeyboardLayoutMode: 'resize',
       predictiveBackGestureEnabled: false,
       permissions: ['android.permission.CAMERA'],
       blockedPermissions: ['android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK'],

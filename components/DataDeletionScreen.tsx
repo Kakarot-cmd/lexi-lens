@@ -50,6 +50,7 @@ import {
   Modal,
   Linking,
 } from "react-native";
+import { KeyboardAwareScrollView } from "./KeyboardAware";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
@@ -485,6 +486,7 @@ export function DataDeletionScreen({ visible, onClose, onDeleted }: DataDeletion
       transparent={false}
       onRequestClose={handleClose}
       statusBarTranslucent
+      navigationBarTranslucent
     >
       <View style={[styles.root, { paddingTop: insets.top }]}>
 
@@ -521,7 +523,7 @@ export function DataDeletionScreen({ visible, onClose, onDeleted }: DataDeletion
           </View>
         )}
 
-        <ScrollView
+        <KeyboardAwareScrollView
           contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 32 }]}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
@@ -557,7 +559,7 @@ export function DataDeletionScreen({ visible, onClose, onDeleted }: DataDeletion
               onClose={handleClose}
             />
           )}
-        </ScrollView>
+        </KeyboardAwareScrollView>
       </View>
     </Modal>
   );

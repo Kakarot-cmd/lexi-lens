@@ -37,11 +37,11 @@ import {
   StyleSheet,
   Modal,
   ActivityIndicator,
-  KeyboardAvoidingView,
   Platform,
   Alert,
   Dimensions,
 } from "react-native";
+import { KeyboardAwareScrollView } from "../components/KeyboardAware";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
 import { parseGateError } from "../lib/gateError";
@@ -180,15 +180,12 @@ function StepInput({
   const canGenerate = theme.trim().length >= 3;
 
   return (
-    <KeyboardAvoidingView
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
+    <KeyboardAwareScrollView
       style={{ flex: 1 }}
+      contentContainerStyle={styles.stepPad}
+      keyboardShouldPersistTaps="handled"
+      showsVerticalScrollIndicator={false}
     >
-      <ScrollView
-        contentContainerStyle={styles.stepPad}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
-      >
         {/* Intro */}
         <Text style={styles.stepTitle}>✨ Create a Quest</Text>
         <Text style={styles.stepSub}>
@@ -322,8 +319,7 @@ function StepInput({
         <Text style={styles.aiNote}>
           Powered by Claude AI · Generates in ~5 seconds · You can edit before saving
         </Text>
-      </ScrollView>
-    </KeyboardAvoidingView>
+    </KeyboardAwareScrollView>
   );
 }
 
@@ -463,7 +459,7 @@ function StepPreview({
   const atMin     = propCount <= MIN_PROPS;
 
   return (
-    <ScrollView
+    <KeyboardAwareScrollView
       contentContainerStyle={styles.stepPad}
       showsVerticalScrollIndicator={false}
       keyboardShouldPersistTaps="handled"
@@ -629,7 +625,7 @@ function StepPreview({
       <TouchableOpacity style={styles.regenBtn} onPress={onRegenerate} disabled={saving}>
         <Text style={styles.regenBtnText}>↺ Regenerate with AI</Text>
       </TouchableOpacity>
-    </ScrollView>
+    </KeyboardAwareScrollView>
   );
 }
 

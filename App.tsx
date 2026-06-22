@@ -151,6 +151,18 @@ import { useAnalytics } from "./hooks/useAnalytics";
 // failure cannot affect the rest of the app.
 import { prefetchLazyScreens } from "./lib/prefetchLazyScreens";
 
+// ─── Global font-scale cap (issue #3a) ───────────────────────────────────────
+// Large system font settings can grow text past the point where fixed-height
+// chrome (buttons, badges, card headers) clips it. Cap text growth at 1.4×
+// app-wide — generous enough to honor accessibility, tight enough to protect
+// layout. Mirrors MAX_FONT_SCALE_CHROME in utils/responsive.ts. Visual-only;
+// does not affect any logic.
+import { Text as _CapText, TextInput as _CapInput } from "react-native";
+(_CapText as any).defaultProps = (_CapText as any).defaultProps || {};
+(_CapText as any).defaultProps.maxFontSizeMultiplier = 1.4;
+(_CapInput as any).defaultProps = (_CapInput as any).defaultProps || {};
+(_CapInput as any).defaultProps.maxFontSizeMultiplier = 1.4;
+
 // ─── Lumi mascot (lazy) ──────────────────────────────────────────────────────
 //
 // v4.5.8 — Lumi imports are deferred. They previously loaded at module-init

@@ -198,6 +198,17 @@ export interface PropertyRequirement {
    *  quests / library quests won't have it; the client falls back to the curated
    *  phonetics map (lib/phonetics.ts). */
   phonetic?:        string;
+  /**
+   * v6.x noun×adjective hybrid. "adjective" (default / absent) = the object must
+   * HAVE this attribute (shiny, round). "category" = the object must BE a member
+   * of this noun category (a utensil, a toy) — scored by is-a membership, and
+   * surfaced to the child as "find a {word}". Every existing quest has no `kind`,
+   * so it's treated as an adjective — fully back-compatible.
+   */
+  kind?:            "adjective" | "category";
+  /** For category requirements: a few child-friendly example members (spoon,
+   *  fork) used in the scan UI and as an eval hint. Ignored for adjectives. */
+  examples?:        string[];
 }
 
 export interface Quest {

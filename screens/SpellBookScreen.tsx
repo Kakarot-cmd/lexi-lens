@@ -15,7 +15,6 @@ import {
   ScrollView,
   TouchableOpacity,
   StyleSheet,
-  Dimensions,
   Modal,
   StatusBar,
   ActivityIndicator,
@@ -35,14 +34,22 @@ import { useGameStore, QuestTier, TIER_META, TIER_ORDER } from "../store/gameSto
 // ─── Navigation ───────────────────────────────────────────────────────────────
 
 import type { RootStackParamList } from "../types/navigation";
+import { useResponsive } from "../utils/responsive";
+import ContentContainer from "../components/ContentContainer";
 type Props = NativeStackScreenProps<RootStackParamList, "SpellBook">;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const { width: W } = Dimensions.get("window");
 const H_PAD   = 16;
 const COL_GAP = 12;
-const CARD_W  = (W - H_PAD * 2 - COL_GAP) / 2;
+
+/** Reactive two-column card width. Derives from the centered content column
+ *  (issue #3b/#3c) so it stays correct on phone, tablet, and split-view —
+ *  on tablet the cards size to the 560px column, not the full screen width. */
+function useCardWidth(): number {
+  const { contentWidth } = useResponsive();
+  return (contentWidth - H_PAD * 2 - COL_GAP) / 2;
+}
 
 // ─── Tier colours ─────────────────────────────────────────────────────────────
 
@@ -91,6 +98,8 @@ function SpellCard({
     op.value = withDelay(80, withTiming(1,  { duration: 300 }));
     ty.value = withDelay(80, withSpring(0,  { damping: 16, stiffness: 120 }));
   }, []);
+
+  const CARD_W   = useCardWidth();
 
   const anim = useAnimatedStyle(() => ({
     opacity:   op.value,
@@ -174,6 +183,7 @@ function SpellGrid({
   onPress: (s: SpellEntry) => void;
 }) {
   // Split into left and right columns
+  const CARD_W = useCardWidth();
   const left:  SpellEntry[] = [];
   const right: SpellEntry[] = [];
   spells.forEach((s, i) => (i % 2 === 0 ? left : right).push(s));
@@ -505,6 +515,7 @@ export default function SpellBookScreen({ navigation }: Props) {
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.scrollContent}
         >
+          <ContentContainer>
           {TIER_ORDER.map((tier) => {
             const spells = grouped[tier];
             if (!spells || spells.length === 0) return null;
@@ -524,6 +535,7 @@ export default function SpellBookScreen({ navigation }: Props) {
             );
           })}
           <View style={{ height: 40 }} />
+          </ContentContainer>
         </ScrollView>
       )}
 

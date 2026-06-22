@@ -36,6 +36,7 @@ import {
   Platform,
   Modal,
 } from "react-native";
+import { KeyboardAwareScrollView } from "../components/KeyboardAware";
 import { useSafeAreaInsets }  from "react-native-safe-area-context";
 import * as Haptics           from "expo-haptics";
 import type { NativeStackScreenProps } from "@react-navigation/native-stack";
@@ -520,7 +521,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
         </View>
       </View>
 
-      <ScrollView
+      <KeyboardAwareScrollView
         contentContainerStyle={[styles.scroll, { paddingBottom: insets.bottom + 32 }]}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
@@ -589,7 +590,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
             )}
           </>
         )}
-      </ScrollView>
+      </KeyboardAwareScrollView>
     </View>
   );
 }

@@ -294,6 +294,16 @@ function EnemyBar({
 
 // ─── Quest intro ──────────────────────────────────────────────────────────────
 
+// Kid-facing article for a category requirement so a row reads "a utensil" /
+// "an apple" / "some clothing" rather than the bare word. Uncountable nouns get
+// "some" (a literacy app must not print "a clothing"); a/e/i/o → "an"; else "a".
+const UNCOUNTABLE_CATEGORIES = new Set(["clothing", "furniture"]);
+function categoryArticle(word: string): string {
+  const w = word.trim().toLowerCase();
+  if (UNCOUNTABLE_CATEGORIES.has(w)) return "some";
+  return /^[aeio]/i.test(w) ? "an" : "a";
+}
+
 function QuestIntro({
   quest,
   effectiveProperties,
@@ -336,13 +346,17 @@ function QuestIntro({
       </Text>
       {effectiveProperties.map((p, i) => (
         <View key={p.word} style={styles.introPropRow}>
-          <Text style={styles.introPropWord}>{i + 1}. {p.word}</Text>
+          <Text style={styles.introPropWord}>
+            {i + 1}. {p.kind === "category" ? `${categoryArticle(p.word)} ${p.word}` : p.word}
+          </Text>
           <View style={{ flex: 1 }}>
             {p.definition?.trim() ? (
               <Text style={styles.introPropDef}>{p.definition}</Text>
             ) : (
               <Text style={styles.introPropDefMissing}>
-                Find something that is {p.word}!
+                {p.kind === "category"
+                  ? `Find ${categoryArticle(p.word)} ${p.word}!`
+                  : `Find something that is ${p.word}!`}
               </Text>
             )}
           </View>

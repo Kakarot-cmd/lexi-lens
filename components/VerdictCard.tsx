@@ -46,8 +46,8 @@ import {
   Modal,
   TextInput,
   ActivityIndicator,
-  KeyboardAvoidingView,
 } from "react-native";
+import { KeyboardAwareView } from "./KeyboardAware";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { EvaluationResult, EvaluateStatus } from "../hooks/useLexiEvaluate";
 import type { MasteryUpdateResult } from "../services/MasteryService";
@@ -302,11 +302,10 @@ function ReportSheet({
       transparent
       animationType="fade"
       onRequestClose={state === "sending" ? undefined : onClose}
+      statusBarTranslucent
+      navigationBarTranslucent
     >
-      <KeyboardAvoidingView
-        style={reportStyles.backdrop}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-      >
+      <KeyboardAwareView style={reportStyles.backdrop}>
         <View style={reportStyles.sheet}>
           <View style={reportStyles.handle} />
 
@@ -395,7 +394,7 @@ function ReportSheet({
             </>
           )}
         </View>
-      </KeyboardAvoidingView>
+      </KeyboardAwareView>
     </Modal>
   );
 }

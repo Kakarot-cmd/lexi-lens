@@ -72,6 +72,7 @@
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 import { getModelAdapter } from "../_shared/models/index.ts";
+import { pickCategory, categoryPromptBlock, enforceCategoryProperty, type PickedCategory } from "../_shared/nounTarget.ts";
 import { TAXONOMY } from "../_shared/vocabularyTaxonomy.ts";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -175,10 +176,14 @@ Constraints:
       pseudo-technical words for a young child.
   • Choose vocabulary words FROM these perceptual axes (or close synonyms):
 ${DAILY_AXIS_POOL}
-  • VARIETY RULE: draw the ${DAILY_PROP_COUNT} properties from DIFFERENT axes
-    (e.g. one color + one shape + one texture), NOT three words from the same
-    axis. Mixing axes keeps daily quests feeling fresh and teaches broader
-    vocabulary. Pick a different combination than an obvious one.
+  • VARIETY RULE: draw the ${DAILY_PROP_COUNT} properties from DIFFERENT axes,
+    and FAVOUR THE ESCALATING AXES (sensory, transparency, finish, edge) — they
+    teach vocabulary that grows with the child. The non-escalating axes (color,
+    shape, size, pattern) are basics a 7-8 child already knows, so use AT MOST
+    ONE of them across the ${DAILY_PROP_COUNT} properties, and NEVER lead with
+    color. Good mix: one finish + one edge + one transparency (e.g. "glossy",
+    "tapered", "see-through"). Avoid two words from the same axis, and pick a
+    different combination than an obvious one.
   • All words must be easy to verify from a photo of a real object.
   • AVOID abstract or invisible properties (e.g., "expensive", "old", "useful",
     "magnetic", "warm" — anything a camera cannot see).
@@ -218,6 +223,8 @@ interface QuestProperty {
   definition:      string;
   evaluationHints: string;
   phonetic?:       string;
+  kind?:           "adjective" | "category";  // category → is-a membership (property model)
+  examples?:       string[];                  // category members, for the eval hint + scan UI
 }
 
 interface GeneratedQuest {
@@ -297,6 +304,7 @@ async function generateQuestViaModel(
   supabase:   SupabaseClient,
   avoidNames: string[] = [],
   avoidWords: string[] = [],
+  category:   PickedCategory | null = null,
 ): Promise<GeneratedQuest> {
   // Wired to the shared factory for consistency with the other model-calling
   // functions. Default stays 'anthropic' (Haiku) via the seed migration —
@@ -328,7 +336,7 @@ async function generateQuestViaModel(
 
   const adapter = await getModelAdapter("generate-quest", supabase);
   const result  = await adapter.call({
-    systemPrompt: SYSTEM_PROMPT,
+    systemPrompt: SYSTEM_PROMPT + categoryPromptBlock(category),
     userText:     USER_MESSAGE + avoidClause + wordClause,
     maxTokens:    MAX_TOKENS,
     jsonMode:     true,
@@ -350,6 +358,19 @@ async function generateQuestViaModel(
   }
   if (!Array.isArray(quest.hard_mode_properties)) {
     quest.hard_mode_properties = [];
+  }
+
+  // Property model: guarantee exactly one category requirement when one was
+  // picked. No-op when category is null (every adjective-only quest).
+  if (category) {
+    enforceCategoryProperty(quest.required_properties, category.category, category.examples);
+    if (quest.hard_mode_properties.length > 0) {
+      enforceCategoryProperty(
+        quest.hard_mode_properties,
+        category.harder ?? category.category,
+        category.examples,
+      );
+    }
   }
 
   return quest;
@@ -639,6 +660,10 @@ Deno.serve(async (req: Request) => {
   let attempt = 0;
   let lastFailReason = "";
 
+  // Property model: pick the (optional) category once so all retry candidates
+  // share it. null when noun_target_rate_pct is 0 or the roll misses.
+  const dailyCategory = await pickCategory(supabase, DAILY_AGE_BAND);
+
   // Read the rotation window + strictness (flag-driven, ask #4).
   const windowDays  = await readIntFlag(supabase, WORD_WINDOW_FLAG, WORD_WINDOW_DEFAULT);
   const baseMaxShared = await readIntFlag(supabase, MAX_SHARED_FLAG, MAX_SHARED_DEFAULT);
@@ -666,7 +691,7 @@ Deno.serve(async (req: Request) => {
     const maxShared   = baseMaxShared + (attempt >= STRICT_ATTEMPTS ? relaxStep : 0);
     attempt++;
     try {
-      const candidate = await generateQuestViaModel(supabase, avoidNames, avoidWords);
+      const candidate = await generateQuestViaModel(supabase, avoidNames, avoidWords, dailyCategory);
 
       if (await nameCollides(supabase, candidate.enemy_name)) {
         lastFailReason = `name_collision: "${candidate.enemy_name}"`;

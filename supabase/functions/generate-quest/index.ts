@@ -39,6 +39,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 import { getModelAdapter } from "../_shared/models/index.ts";
 import { TAXONOMY } from "../_shared/vocabularyTaxonomy.ts";
+import { pickCategory, categoryPromptBlock, enforceCategoryProperty, type PickedCategory } from "../_shared/nounTarget.ts";
 import {
   resolveFeatureAccess,
   statusFor,
@@ -72,6 +73,7 @@ function buildSystemPrompt(
   knownWords:     string[],
   masteryProfile: Array<{ word: string; mastery: number; masteryTier: string; timesUsed: number }>,
   propCount:      number,   // parent-specified, already clamped to 1–5
+  category:       PickedCategory | null,
 ): string {
   const tax = TAXONOMY[ageBand] ?? TAXONOMY["7-8"];
 
@@ -104,11 +106,11 @@ VOCABULARY TAXONOMY FOR THIS AGE BAND (${ageBand}):
   Property type: ${tax.propertyType}
   Word pool — organised by PERCEPTUAL AXIS (choose FROM these or close synonyms):
 ${tax.axes.map((a) => `    - ${a.name}: ${a.words.join(", ")}`).join("\n")}
-  AXIS RULE: prefer drawing the ${propCount > 1 ? `${propCount} properties from DIFFERENT axes` : "property from whichever axis best fits the object"} (e.g. one color + one shape, not two colors). Mixing axes makes quests feel varied and teaches broader vocabulary.
+  AXIS RULE: ${propCount > 1 ? `Draw the ${propCount} properties from DIFFERENT axes` : "Choose the single property"} and FAVOUR THE ESCALATING AXES (sensory, material, advanced-material, transparency, finish, edge) — these teach vocabulary that grows with the child. The non-escalating axes (color, shape, size, count, pattern, form) are early-childhood basics a child this age largely knows already; use AT MOST ONE of them per quest, and NEVER lead with color. ${propCount > 1 ? `Good mix: finish + edge + transparency (e.g. "glossy", "tapered", "see-through"), not two words from one axis.` : "Prefer an escalating axis over color/shape/size unless none genuinely fits the object."}
   Max syllables per vocabulary word: ${tax.maxSyllables}
   Number of required_properties: EXACTLY ${propCount}
   Target object concreteness: ${tax.objectExamples}
-
+${categoryPromptBlock(category)}
 TIER BEHAVIOUR:
   apprentice — Use the simplest words from the pool. One-syllable preferred. Very common objects.
   scholar    — Middle of the pool. Objects children encounter regularly.
@@ -123,7 +125,7 @@ HARD MODE PROPERTIES (hard_mode_properties array):
 
   Two kinds of base word, handled DIFFERENTLY:
 
-  (a) ESCALATING axes (sensory, physical-state, material, advanced-material):
+  (a) ESCALATING axes (sensory, material, advanced-material, transparency, finish, edge):
       the hard-mode word MUST be an UPWARD SYNONYM of its base word:
         • Same physical property as the base word
         • Higher vocabulary register (more technical, more specific, or Latin/Greek origin)
@@ -131,7 +133,7 @@ HARD MODE PROPERTIES (hard_mode_properties array):
       Hard-mode synonym guide:
 ${tax.hardModePool}
 
-  (b) NON-ESCALATING axes (color, shape, size, count, pattern):
+  (b) NON-ESCALATING axes (color, shape, size, count, pattern, form):
       these words have NO higher register — do NOT invent fancy synonyms
       (e.g. NEVER "red → crimson → vermillion" for a 5-6 child, NEVER
       "flat → planar → laminated"). Instead, make hard mode HARDER by:
@@ -289,7 +291,8 @@ Deno.serve(async (req: Request) => {
   }
 
   // ── Call the model (provider chosen by feature_flags via _shared/models) ───
-  const systemPrompt = buildSystemPrompt(ageBand, tier, knownWords, masteryProfile, propCount);
+  const category     = await pickCategory(admin, ageBand);
+  const systemPrompt = buildSystemPrompt(ageBand, tier, knownWords, masteryProfile, propCount, category);
   const userMessage  = buildUserMessage(theme, ageBand, tier);
 
   // Scale token budget with propCount — 5 properties needs ~400 more tokens than 1
@@ -326,8 +329,8 @@ Deno.serve(async (req: Request) => {
     spell_name:           string;
     weapon_emoji:         string;
     spell_description:    string;
-    required_properties:  Array<{ word: string; definition: string; evaluationHints: string; phonetic?: string }>;
-    hard_mode_properties: Array<{ word: string; definition: string; evaluationHints: string; phonetic?: string }>;
+    required_properties:  Array<{ word: string; definition: string; evaluationHints: string; phonetic?: string; kind?: "adjective" | "category"; examples?: string[] }>;
+    hard_mode_properties: Array<{ word: string; definition: string; evaluationHints: string; phonetic?: string; kind?: "adjective" | "category"; examples?: string[] }>;
   };
 
   try {
@@ -347,6 +350,20 @@ Deno.serve(async (req: Request) => {
   // Ensure hard_mode_properties exists
   if (!Array.isArray(quest.hard_mode_properties)) {
     quest.hard_mode_properties = [];
+  }
+
+  // Property model: guarantee exactly one category requirement when picked.
+  // No-op when category is null. Category rides inside required_properties, so
+  // the client insert persists it unchanged — no return-shape change.
+  if (category) {
+    enforceCategoryProperty(quest.required_properties, category.category, category.examples);
+    if (quest.hard_mode_properties.length > 0) {
+      enforceCategoryProperty(
+        quest.hard_mode_properties,
+        category.harder ?? category.category,
+        category.examples,
+      );
+    }
   }
 
   // Guard: never return a quest where required_property.word is in knownWords

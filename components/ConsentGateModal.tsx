@@ -45,6 +45,7 @@ import {
   Platform,
   Linking,
 } from "react-native";
+import { KeyboardAwareScrollView } from "./KeyboardAware";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 
@@ -473,6 +474,7 @@ export function ConsentGateModal({ visible, onConsented, onCancel, onOpenPrivacy
       transparent
       onRequestClose={onCancel}
       statusBarTranslucent
+      navigationBarTranslucent
     >
       <View style={styles.overlay}>
         <View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, 16) }]}>
@@ -490,7 +492,7 @@ export function ConsentGateModal({ visible, onConsented, onCancel, onOpenPrivacy
             </TouchableOpacity>
           </View>
 
-          <ScrollView
+          <KeyboardAwareScrollView
             contentContainerStyle={styles.sheetBody}
             showsVerticalScrollIndicator={false}
             keyboardShouldPersistTaps="handled"
@@ -520,7 +522,7 @@ export function ConsentGateModal({ visible, onConsented, onCancel, onOpenPrivacy
                 allChecked={allChecked}
               />
             )}
-          </ScrollView>
+          </KeyboardAwareScrollView>
         </View>
       </View>
     </Modal>

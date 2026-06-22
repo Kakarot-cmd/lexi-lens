@@ -41,12 +41,12 @@ import {
   StyleSheet,
   ScrollView,
   Animated,
-  KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
   Modal,
   Linking,
 } from "react-native";
+import { KeyboardAwareScrollView } from "../components/KeyboardAware";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 import { supabase } from "../lib/supabase";
@@ -521,18 +521,15 @@ export function AuthScreen() {
   // ── Standard form (sign_in / sign_up / forgot_request / reset_confirm) ───
   return (
     <>
-      <KeyboardAvoidingView
+      <KeyboardAwareScrollView
         style={styles.root}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        contentContainerStyle={[
+          styles.scroll,
+          { paddingTop: insets.top + 28, paddingBottom: insets.bottom + 32 },
+        ]}
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
       >
-        <ScrollView
-          contentContainerStyle={[
-            styles.scroll,
-            { paddingTop: insets.top + 28, paddingBottom: insets.bottom + 32 },
-          ]}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-        >
 
           {/* ── Wordmark ──────────────────────────────────── */}
           <View style={styles.wordmark}>
@@ -801,8 +798,7 @@ export function AuthScreen() {
             .{"\n"}
             Skanlore complies with COPPA — no personal data is collected from children.
           </Text>
-        </ScrollView>
-      </KeyboardAvoidingView>
+      </KeyboardAwareScrollView>
 
       {/* COPPA Parental Gate + Consent */}
       <ConsentGateModal

@@ -54,10 +54,10 @@ import {
   StyleSheet,
   Animated,
   TextInput,
-  KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
 } from "react-native";
+import { KeyboardAwareView } from "./KeyboardAware";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -439,11 +439,9 @@ export function ParentPinGateModal({
       animationType="slide"
       onRequestClose={onDismiss}
       statusBarTranslucent
+      navigationBarTranslucent
     >
-      <KeyboardAvoidingView
-        style={styles.overlay}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-      >
+      <KeyboardAwareView style={styles.overlay}>
         <TouchableOpacity
           style={StyleSheet.absoluteFill}
           activeOpacity={1}
@@ -464,7 +462,7 @@ export function ParentPinGateModal({
             <View style={styles.lockBadge}>
               <Text style={styles.lockIcon}>🔒</Text>
             </View>
-            <TouchableOpacity onPress={onDismiss} style={styles.closeBtn}>
+            <TouchableOpacity onPress={onDismiss} style={styles.closeBtn} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
               <Text style={styles.closeText}>✕</Text>
             </TouchableOpacity>
           </View>
@@ -529,7 +527,7 @@ export function ParentPinGateModal({
             </>
           )}
         </Animated.View>
-      </KeyboardAvoidingView>
+      </KeyboardAwareView>
     </Modal>
   );
 }
