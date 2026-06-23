@@ -110,6 +110,15 @@ const WORD_WINDOW_FLAG       = "daily_quest_word_window";
 const WORD_WINDOW_DEFAULT    = 10;
 const MAX_SHARED_FLAG        = "daily_quest_max_shared_words";
 const MAX_SHARED_DEFAULT     = 0;
+// ─── Lever B: deterministic axis rotation ────────────────────────────────────
+// The word-window stops the SAME word recurring, but color has ~10 words, so the
+// model can lead with a different color every day and never repeat a word. This
+// benches whole AXES that dominated recent dailies (color especially), forcing
+// day-to-day perceptual variety. Flag-driven; 0 = off (dormant on deploy).
+//   daily_quest_axis_window → integer days to look back (0 disables Lever B)
+const AXIS_WINDOW_FLAG       = "daily_quest_axis_window";
+const AXIS_WINDOW_DEFAULT    = 0;   // 0 = off; set e.g. 7 to enable
+const AXIS_OVERUSE_MIN       = 2;   // axis benched once ≥ this many of its words appear in the window
 // Strict attempts before the relaxation ladder kicks in. After STRICT_ATTEMPTS
 // collisions we bump the allowed-overlap by 1 each further attempt rather than
 // dropping straight to the recycled-daily fallback — a daily with one shared
@@ -144,6 +153,32 @@ const DAILY_TAX = TAXONOMY[DAILY_AGE_BAND] ?? TAXONOMY["7-8"];
 const DAILY_AXIS_POOL = DAILY_TAX.axes
   .map((a) => `    - ${a.name}: ${a.words.join(", ")}`)
   .join("\n");
+
+// Lever B — word→axis reverse-map, built once. Only adjective axis words are in
+// here; category words ("utensil") map to nothing and are simply ignored.
+const AXIS_OF_WORD: Map<string, string> = (() => {
+  const m = new Map<string, string>();
+  for (const ax of DAILY_TAX.axes) for (const w of ax.words) m.set(w.toLowerCase(), ax.name);
+  return m;
+})();
+const DAILY_TOTAL_AXES = DAILY_TAX.axes.length;
+
+// From the rotation window's words, bench the axes that dominated recent dailies
+// (most-used first — color tends to top this). Caps the bench so at least
+// DAILY_PROP_COUNT+1 axes always remain available to build a fresh quest.
+function computeForbiddenAxes(windowWords: Set<string>): string[] {
+  const counts = new Map<string, number>();
+  for (const w of windowWords) {
+    const ax = AXIS_OF_WORD.get(w.trim().toLowerCase());
+    if (ax) counts.set(ax, (counts.get(ax) ?? 0) + 1);
+  }
+  const overused = [...counts.entries()]
+    .filter(([, c]) => c >= AXIS_OVERUSE_MIN)
+    .sort((a, b) => b[1] - a[1])
+    .map(([ax]) => ax);
+  const maxForbid = Math.max(0, DAILY_TOTAL_AXES - (DAILY_PROP_COUNT + 1));
+  return overused.slice(0, maxForbid);
+}
 
 const SYSTEM_PROMPT = `${CHILD_SAFETY_PREFIX}
 
@@ -301,10 +336,11 @@ async function readIntFlag(
 // ─── Model call (provider via factory; default anthropic = unchanged) ────────
 
 async function generateQuestViaModel(
-  supabase:   SupabaseClient,
-  avoidNames: string[] = [],
-  avoidWords: string[] = [],
-  category:   PickedCategory | null = null,
+  supabase:      SupabaseClient,
+  avoidNames:    string[] = [],
+  avoidWords:    string[] = [],
+  category:      PickedCategory | null = null,
+  forbiddenAxes: string[] = [],
 ): Promise<GeneratedQuest> {
   // Wired to the shared factory for consistency with the other model-calling
   // functions. Default stays 'anthropic' (Haiku) via the seed migration —
@@ -334,10 +370,16 @@ async function generateQuestViaModel(
       `Choose entirely different words from the perceptual axes above.`
     : "";
 
+  const axisClause = forbiddenAxes.length
+    ? ` AXIS ROTATION: these perceptual axes dominated recent daily quests — do ` +
+      `NOT draw ANY property from them this time: ${forbiddenAxes.join(", ")}. ` +
+      `Use the other axes instead, and never lead with color.`
+    : "";
+
   const adapter = await getModelAdapter("generate-quest", supabase);
   const result  = await adapter.call({
     systemPrompt: SYSTEM_PROMPT + categoryPromptBlock(category),
-    userText:     USER_MESSAGE + avoidClause + wordClause,
+    userText:     USER_MESSAGE + avoidClause + wordClause + axisClause,
     maxTokens:    MAX_TOKENS,
     jsonMode:     true,
   });
@@ -669,6 +711,16 @@ Deno.serve(async (req: Request) => {
   const baseMaxShared = await readIntFlag(supabase, MAX_SHARED_FLAG, MAX_SHARED_DEFAULT);
   const windowWords = await wordsInRecentWindow(supabase, windowDays);
 
+  // Lever B — bench axes that dominated recent dailies (flag-gated; 0 = off).
+  // Reuses the word-window fetch when the axis window matches, else fetches its own.
+  const axisWindow  = await readIntFlag(supabase, AXIS_WINDOW_FLAG, AXIS_WINDOW_DEFAULT);
+  const axisWords   = axisWindow <= 0
+    ? new Set<string>()
+    : axisWindow === windowDays
+      ? windowWords
+      : await wordsInRecentWindow(supabase, axisWindow);
+  const forbiddenAxes = axisWindow > 0 ? computeForbiddenAxes(axisWords) : [];
+
   // Seed the avoid-list with recent dailies' enemy names so generation steers
   // clear of collisions from attempt #1, then grow it with every name we try.
   const recentDailies = await fetchRecentDailyQuests(supabase);
@@ -691,7 +743,7 @@ Deno.serve(async (req: Request) => {
     const maxShared   = baseMaxShared + (attempt >= STRICT_ATTEMPTS ? relaxStep : 0);
     attempt++;
     try {
-      const candidate = await generateQuestViaModel(supabase, avoidNames, avoidWords, dailyCategory);
+      const candidate = await generateQuestViaModel(supabase, avoidNames, avoidWords, dailyCategory, forbiddenAxes);
 
       if (await nameCollides(supabase, candidate.enemy_name)) {
         lastFailReason = `name_collision: "${candidate.enemy_name}"`;
