@@ -67,7 +67,7 @@ export function SocialAuthButtons({ onGoogle, onApple, loading, disabled }: Prop
 
   if (!googleOn && !appleOn) return null;
 
-  const busy = loading !== null || disabled;
+  const busy = loading !== null || !!disabled;
 
   return (
     <View style={styles.wrap}>
@@ -107,7 +107,7 @@ export function SocialAuthButtons({ onGoogle, onApple, loading, disabled }: Prop
             buttonStyle={AppleAuthentication.AppleAuthenticationButtonStyle.BLACK}
             cornerRadius={14}
             style={[styles.appleBtn, busy && styles.btnDisabled]}
-            onPress={busy ? undefined : onApple}
+            onPress={() => { if (!busy) onApple(); }}
           />
         )
       )}

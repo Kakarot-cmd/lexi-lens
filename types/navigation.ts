@@ -27,3 +27,27 @@ export type RootStackParamList = {
   OnboardingBackstory: undefined;
   Paywall:             { reason?: string } | undefined;
 };
+
+/**
+ * Global default param list for React Navigation.
+ *
+ * Augmenting `ReactNavigation.RootParamList` makes every *untyped* navigation
+ * primitive — `useNavigation()`, `useNavigationContainerRef()`, `<Link>`, the
+ * container `ref` — resolve to these routes instead of the empty default.
+ *
+ * Why this is required: since @react-navigation/core 7.21.x, the container
+ * ref's `getCurrentRoute()` returns `MaybeParamListRoute<ParamList>`, which
+ * collapses to `never` when the default param list is the empty `{}`. That made
+ * `navigationRef.getCurrentRoute()?.name` fail to typecheck across App.tsx.
+ * With this augmentation the default param list is non-empty, so the route is
+ * correctly typed and `.name` resolves to a screen-name union.
+ *
+ * Adding a screen still happens in RootStackParamList above ONLY — this picks
+ * it up automatically.
+ */
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace ReactNavigation {
+    interface RootParamList extends RootStackParamList, AuthStackParamList {}
+  }
+}
