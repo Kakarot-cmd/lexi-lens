@@ -54,6 +54,12 @@ import { ENV } from "../lib/env";
 import { useAuthFlow } from "../lib/authFlow";
 import { ConsentGateModal, ConsentMetadata } from "../components/ConsentGateModal";
 import { PrivacyPolicyScreen }               from "../components/PrivacyPolicyScreen";
+import { SocialAuthButtons }                 from "../components/SocialAuthButtons";
+import {
+  signInWithGoogle,
+  signInWithApple,
+  configureGoogleSignin,
+} from "../lib/socialAuth";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -137,6 +143,19 @@ export function AuthScreen() {
   // cancel-deletion call in handleRestoreAccount still works.
   const deletionScheduledAt = useAuthFlow((s) => s.deletionScheduledAt);
   const clearDeletionGate   = useAuthFlow((s) => s.clearDeletionGate);
+
+  // social-auth — consent gate for new Google/Apple users. App.tsx raises
+  // consentPending when a live session has no COPPA consent stamp; this screen
+  // forces the ConsentGateModal and records consent before entry.
+  const consentPending      = useAuthFlow((s) => s.consentPending);
+  const clearConsentGate    = useAuthFlow((s) => s.clearConsentGate);
+  const pendingDisplayName  = useAuthFlow((s) => s.pendingDisplayName);
+
+  // Which social provider is mid-flight (null = none). Drives spinners.
+  const [socialLoading, setSocialLoading] = useState<"google" | "apple" | null>(null);
+
+  // Warm the Google SDK so the first tap isn't slow. No-op without a client ID.
+  useEffect(() => { configureGoogleSignin(); }, []);
 
   // Detect cold-start via auth-confirm or auth-reset deep links.
   // Warm-start is handled in App.tsx, but we also re-listen here for the
@@ -467,6 +486,100 @@ export function AuthScreen() {
     setShowConsentGate(false);
   }, []);
 
+  // ── Social sign-in (Google / Apple) ───────────────────────────────────────
+  // These establish the parent session only. A *new* social user lands with a
+  // session but no consent metadata, so App.tsx raises consentPending and the
+  // OAuth consent gate below runs before the app opens. A returning user (who
+  // already consented) is routed straight in by App.tsx.
+  const handleGoogleSignIn = useCallback(async () => {
+    setApiError(null);
+    setSocialLoading("google");
+    const result = await signInWithGoogle();
+    setSocialLoading(null);
+    if (!result.ok && !result.cancelled) {
+      setApiError(result.message ?? "Google sign-in failed. Please try again.");
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    }
+  }, []);
+
+  const handleAppleSignIn = useCallback(async () => {
+    setApiError(null);
+    setSocialLoading("apple");
+    const result = await signInWithApple();
+    setSocialLoading(null);
+    if (!result.ok && !result.cancelled) {
+      setApiError(result.message ?? "Apple sign-in failed. Please try again.");
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    }
+  }, []);
+
+  // ── OAuth consent gate handlers (new social users) ─────────────────────────
+  // Reuses ConsentGateModal (incl. the parental math gate). On success we both
+  // (a) insert the parental_consents compliance row via record-consent — the
+  // AFTER-INSERT DB trigger never fired for this user because no consent
+  // metadata existed at account-creation time — and (b) stamp user_metadata so
+  // the consent gate clears permanently. clearConsentGate() routes into the app.
+  const performOAuthConsent = useCallback(async (meta: ConsentMetadata) => {
+    setLoading(true);
+    setApiError(null);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error("No active session.");
+
+      // (a) Compliance row — service-role, idempotent.
+      try {
+        const { error: fnError } = await supabase.functions.invoke("record-consent", {
+          body: {
+            userId:                user.id,
+            policyVersion:         meta.policyVersion,
+            consentedAt:           meta.consentedAt,
+            coppaConfirmed:        meta.coppaConfirmed,
+            gdprKConfirmed:        meta.gdprKConfirmed,
+            aiProcessingConfirmed: meta.aiProcessingConfirmed,
+            parentalGatePassed:    meta.parentalGatePassed,
+          },
+        });
+        if (fnError) console.warn("[oauth-consent] record-consent error:", fnError.message);
+      } catch (consentErr: any) {
+        console.warn("[oauth-consent] record-consent call failed:", consentErr?.message);
+      }
+
+      // (b) Stamp user_metadata (clears the gate for good) + capture the
+      // provider display name (Apple gives it only on first sign-in).
+      const fallbackName =
+        pendingDisplayName ||
+        (user.user_metadata?.display_name as string | undefined) ||
+        (user.email ? user.email.split("@")[0] : "Parent");
+
+      const { error } = await supabase.auth.updateUser({
+        data: {
+          display_name:                    fallbackName,
+          consent_policy_version:          meta.policyVersion,
+          consent_consented_at:            meta.consentedAt,
+          consent_coppa_confirmed:         meta.coppaConfirmed,
+          consent_gdpr_k_confirmed:        meta.gdprKConfirmed,
+          consent_ai_processing_confirmed: meta.aiProcessingConfirmed,
+          consent_parental_gate_passed:    meta.parentalGatePassed,
+        },
+      });
+      if (error) throw error;
+
+      clearConsentGate();
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (err: any) {
+      setApiError("Couldn't save consent: " + (err?.message ?? "Unknown error"));
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+    } finally {
+      setLoading(false);
+    }
+  }, [pendingDisplayName, clearConsentGate]);
+
+  // Declining consent can't grant entry — sign out and drop back to the form.
+  const handleOAuthConsentCancelled = useCallback(async () => {
+    clearConsentGate();
+    await supabase.auth.signOut();
+  }, [clearConsentGate]);
+
   // ─────────────────────────────────────────────────────────────────────────
   // Render — the form changes shape based on `mode`. A single ScrollView
   // contains the relevant fields + actions for each mode.
@@ -753,6 +866,20 @@ export function AuthScreen() {
                   </Text>
                 )}
               </TouchableOpacity>
+
+              {/* Social sign-in — only on the two account-entry modes.
+                  Hidden during forgot_request / reset_confirm. Google renders
+                  only when a webClientId is configured; Apple only on iOS where
+                  the native button is available. Both routes converge on the
+                  same COPPA consent gate via App.tsx → consentPending. */}
+              {(mode === "sign_in" || mode === "sign_up") && (
+                <SocialAuthButtons
+                  onGoogle={handleGoogleSignIn}
+                  onApple={handleAppleSignIn}
+                  loading={socialLoading}
+                  disabled={loading}
+                />
+              )}
             </Animated.View>
           )}
 
@@ -800,13 +927,20 @@ export function AuthScreen() {
           </Text>
       </KeyboardAwareScrollView>
 
-      {/* COPPA Parental Gate + Consent */}
+      {/* COPPA Parental Gate + Consent.
+          Serves two callers:
+          1. Email sign-up  → showConsentGate, handleConsented (writes metadata
+             then performs the actual signUp).
+          2. OAuth sign-in of a consent-less account → consentPending (raised by
+             App.tsx). The user already has a live session, so performOAuthConsent
+             records consent + stamps user_metadata, then clears the gate. Cancel
+             signs them back out so a half-consented session never enters the app. */}
       <ConsentGateModal
-        visible={showConsentGate}
-        onConsented={handleConsented}
-        onCancel={handleConsentCancelled}
+        visible={showConsentGate || consentPending}
+        onConsented={consentPending ? performOAuthConsent : handleConsented}
+        onCancel={consentPending ? handleOAuthConsentCancelled : handleConsentCancelled}
         onOpenPrivacyPolicy={() => {
-          setShowConsentGate(false);
+          if (!consentPending) setShowConsentGate(false);
           setShowPrivacyPolicy(true);
         }}
       />

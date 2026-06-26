@@ -104,6 +104,22 @@ function readRevenueCatAndroidKey(): string | null {
   return process.env.EXPO_PUBLIC_REVENUECAT_ANDROID_KEY ?? null;
 }
 
+// ─── Social OAuth (Google / Apple) ───────────────────────────────────────────
+//
+// These are PUBLIC client identifiers, not secrets — safe to ship in the
+// bundle. The Web client ID is what Supabase validates the Google ID token's
+// audience against, so it must match the Google provider config on BOTH the
+// staging and prod Supabase projects (see docs/SOCIAL_AUTH_SETUP.md). Apple
+// needs no runtime client ID here — its audience is the app's bundle ID.
+
+function readGoogleWebClientId(): string | null {
+  return process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID ?? null;
+}
+
+function readGoogleIosClientId(): string | null {
+  return process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID ?? null;
+}
+
 // ─── Deep-link scheme ─────────────────────────────────────────────────────────
 //
 // Per-variant scheme so a developer running the dev client with a staging
@@ -143,6 +159,11 @@ export const ENV = {
   revenueCat: {
     iosKey:     readRevenueCatIosKey(),
     androidKey: readRevenueCatAndroidKey(),
+  },
+
+  oauth: {
+    googleWebClientId: readGoogleWebClientId(),
+    googleIosClientId: readGoogleIosClientId(),
   },
 
   deepLink: {

@@ -365,6 +365,12 @@ function App() {
   // lib/authFlow.ts for the full rationale.
   const deletionScheduledAt = useAuthFlow((s) => s.deletionScheduledAt);
 
+  // social-auth — consent gate. True when a live session has no COPPA consent
+  // metadata (a brand-new Google/Apple sign-in, or a legacy consent-less
+  // account). Keeps AuthScreen mounted so the ConsentGateModal can run before
+  // any child-facing screen renders. See lib/authFlow.ts.
+  const consentPending = useAuthFlow((s) => s.consentPending);
+
   // ── Backstory gate (v6.6) ─────────────────────────────────────────────────
   //
   // null   = AsyncStorage read in flight (don't decide yet)
@@ -450,6 +456,12 @@ function App() {
         const at = s?.user?.app_metadata?.deletion_scheduled_at;
         if (at) getAuthFlow().beginDeletionGate(at);
         else    getAuthFlow().clearDeletionGate();
+        // social-auth — raise the consent gate for a live session that carries
+        // no COPPA consent stamp (new Google/Apple user). Deletion takes
+        // precedence; those accounts always have consent already.
+        const consented = !!s?.user?.user_metadata?.consent_consented_at;
+        if (s && !at && !consented) getAuthFlow().beginConsentGate();
+        else                        getAuthFlow().clearConsentGate();
         setInitialising(false);
       })
       .catch(() => {
@@ -475,6 +487,7 @@ function App() {
         if (!s) {
           clearUserContext();
           getAuthFlow().clearDeletionGate();
+          getAuthFlow().clearConsentGate();
           addGameBreadcrumb({ category: "auth", message: "User signed out" });
         } else {
           // v4.6 — warm path (e.g. sign-in, token refresh). If this account is
@@ -482,6 +495,12 @@ function App() {
           // session update so AuthScreen stays mounted to show the banner.
           const at = s.user?.app_metadata?.deletion_scheduled_at;
           if (at) getAuthFlow().beginDeletionGate(at);
+          // social-auth — same consent net on the warm path (sign-in, token
+          // refresh, USER_UPDATED). A new Google/Apple session has no consent
+          // stamp → gate; the AuthScreen consent step stamps it and clears.
+          const consented = !!s.user?.user_metadata?.consent_consented_at;
+          if (!at && !consented) getAuthFlow().beginConsentGate();
+          else if (!at)          getAuthFlow().clearConsentGate();
           addGameBreadcrumb({
             category: "auth",
             message:  "Session established",
@@ -830,7 +849,9 @@ function App() {
   // before reaching the game).
   // v4.6 — also stay on AuthNavigator while a deletion gate is up: the parent
   // has a live session but must first decide Restore vs Sign out.
-  const showAuth = !session || recoveryActive || !!deletionScheduledAt;
+  // social-auth — and while a consent gate is up: a new Google/Apple user has a
+  // live session but must clear the COPPA consent step before entering.
+  const showAuth = !session || recoveryActive || !!deletionScheduledAt || consentPending;
 
   // v4.6 — the backstory is NO LONGER a standalone pre-app branch. It moved
   // into AppNavigator as a stack screen reached after the first child

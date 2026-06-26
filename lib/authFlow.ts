@@ -72,6 +72,39 @@ interface AuthFlowState {
 
   /** Called by AuthScreen on successful restore, or on sign-out. */
   clearDeletionGate: () => void;
+
+  /**
+   * C. Consent gate (social-login COPPA net)  [social-auth fix]
+   * ──────────────────────────────────────────────────────────
+   * Email/password sign-up runs the ConsentGateModal BEFORE an account exists,
+   * so every email account carries consent metadata. Social sign-in
+   * (Google / Apple) is different: signInWithIdToken creates-or-signs-in and
+   * lands a live session in one step, with NO chance to gate beforehand.
+   *
+   * App.tsx therefore inspects every established session: if it lacks the
+   * `consent_consented_at` user-metadata stamp (and isn't mid-deletion), it
+   * raises this gate. App.tsx keeps AuthScreen mounted while consentPending is
+   * true (same mechanism as recovery / deletion), AuthScreen forces the
+   * ConsentGateModal, and only after consent is recorded does it clear.
+   *
+   * This also retroactively brings any consent-less legacy account into
+   * compliance the next time it signs in — the COPPA-correct posture.
+   */
+  consentPending: boolean;
+
+  /** Called by App.tsx when a session has no consent metadata. */
+  beginConsentGate: () => void;
+
+  /** Called by AuthScreen after consent is recorded, or on sign-out. */
+  clearConsentGate: () => void;
+
+  /**
+   * Provider display name captured during social sign-in (Google always; Apple
+   * only on first authorization). Consumed once by AuthScreen.performOAuthConsent
+   * to stamp the parent's display_name, then cleared with the gate.
+   */
+  pendingDisplayName: string | null;
+  setPendingDisplayName: (name: string) => void;
 }
 
 export const useAuthFlow = create<AuthFlowState>((set) => ({
@@ -82,6 +115,13 @@ export const useAuthFlow = create<AuthFlowState>((set) => ({
   deletionScheduledAt: null,
   beginDeletionGate: (scheduledAt: string) => set({ deletionScheduledAt: scheduledAt }),
   clearDeletionGate: () => set({ deletionScheduledAt: null }),
+
+  consentPending: false,
+  beginConsentGate: () => set({ consentPending: true }),
+  clearConsentGate: () => set({ consentPending: false, pendingDisplayName: null }),
+
+  pendingDisplayName: null,
+  setPendingDisplayName: (name: string) => set({ pendingDisplayName: name }),
 }));
 
 /**

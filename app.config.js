@@ -166,6 +166,30 @@ if (!IDENTIFIERS[VARIANT]) {
 
 const sentryEnv = VARIANT === 'production' ? 'production' : VARIANT === 'staging' ? 'staging' : 'development';
 
+// ── Google Sign-In iOS URL scheme (reversed iOS OAuth client ID) ─────────────
+//
+// Build-time only. The native @react-native-google-signin config plugin needs
+// this to register the iOS URL type that receives the Google auth callback.
+// Format (from Google Cloud iOS OAuth client):
+//   com.googleusercontent.apps.<REVERSED_IOS_CLIENT_ID>
+//
+// When unset (a build where OAuth isn't configured yet), the Google plugin is
+// omitted so `expo prebuild` still succeeds. This mirrors the runtime contract
+// in lib/socialAuth.ts, which independently no-ops Google via isGoogleEnabled()
+// when no webClientId is present. Apple is unaffected — it needs no scheme.
+const googleIosUrlScheme = (process.env.EXPO_PUBLIC_GOOGLE_IOS_URL_SCHEME ?? '').trim();
+
+const googleSignInPlugin = googleIosUrlScheme
+  ? [['@react-native-google-signin/google-signin', { iosUrlScheme: googleIosUrlScheme }]]
+  : [];
+
+if (!googleIosUrlScheme) {
+  console.warn(
+    '[app.config] EXPO_PUBLIC_GOOGLE_IOS_URL_SCHEME unset — Google Sign-In ' +
+    'iOS plugin omitted from this build. Set it before an OAuth-enabled archive.',
+  );
+}
+
 export default {
   expo: {
     name: id.name,
@@ -194,6 +218,10 @@ export default {
       // only affects EAS cloud builds, not local archives — this wins here.)
       buildNumber: '40',
       supportsTablet: true,
+      // Adds the "Sign in with Apple" capability/entitlement at prebuild.
+      // Required for expo-apple-authentication to function and for App Store
+      // Guideline 4.8 compliance (third-party login present → Apple offered).
+      usesAppleSignIn: true,
       entitlements: {
         'aps-environment': VARIANT === 'production' ? 'production' : 'development',
       },
@@ -236,6 +264,11 @@ export default {
 	  './plugins/withReleaseSigningConfig.js',
 	  './plugins/withGradleMemory.js',
 	  './plugins/withXcode26Compat.js',
+      // Native social sign-in. Google plugin is spread in only when an iOS URL
+      // scheme is configured (see googleSignInPlugin above); Apple needs no
+      // config block — usesAppleSignIn:true on the ios block adds its entitlement.
+      ...googleSignInPlugin,
+      'expo-apple-authentication',
       [
         'expo-build-properties',
         {
@@ -257,6 +290,24 @@ export default {
             // precompiled-binary code signing fix and we've validated it):
             //   remove the buildReactNativeFromSource line, or set to false.
             buildReactNativeFromSource: true,
+
+            // ── OAuth (Jun 2026) — Google Sign-In SDK modular headers ────────
+            //
+            // @react-native-google-signin/google-signin pulls the GoogleSignIn
+            // iOS SDK (8.x), which depends on AppCheckCore → GoogleUtilities +
+            // RecaptchaInterop. Those pods don't define module maps, so as
+            // static libraries CocoaPods fails with:
+            //   "The Swift pod `AppCheckCore` depends upon `GoogleUtilities`
+            //    and `RecaptchaInterop`, which do not define modules."
+            //
+            // Fix: opt those specific transitive pods into modular headers.
+            // Targeted (not `use_modular_headers!` globally — that breaks RN
+            // core pods). Survives `prebuild --clean`; the Podfile is CNG.
+            extraPods: [
+              { name: 'GoogleUtilities', modular_headers: true },
+              { name: 'RecaptchaInterop', modular_headers: true },
+              { name: 'AppCheckCore', modular_headers: true },
+            ],
           },
         },
       ],
