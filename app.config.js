@@ -194,7 +194,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.40',
+    version: '1.0.41',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -216,7 +216,7 @@ export default {
       // archive. Must be unique + higher than any build already uploaded for
       // the current `version` string. (appVersionSource:"remote" in eas.json
       // only affects EAS cloud builds, not local archives — this wins here.)
-      buildNumber: '40',
+      buildNumber: '41',
       supportsTablet: true,
       // Adds the "Sign in with Apple" capability/entitlement at prebuild.
       // Required for expo-apple-authentication to function and for App Store
