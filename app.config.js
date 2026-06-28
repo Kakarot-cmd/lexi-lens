@@ -256,7 +256,13 @@ export default {
       softwareKeyboardLayoutMode: 'resize',
       predictiveBackGestureEnabled: false,
       permissions: ['android.permission.CAMERA'],
-      blockedPermissions: ['android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK'],
+      // expo-audio declares both FOREGROUND_SERVICE (base) and _MEDIA_PLAYBACK.
+      // Skanlore plays audio only in the foreground, so both are blocked to avoid
+      // Google Play's foreground-service declaration requirement (Android 14+).
+      blockedPermissions: [
+        'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK',
+        'android.permission.FOREGROUND_SERVICE',
+      ],
       package: id.androidPackage,
     },
 
