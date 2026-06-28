@@ -194,7 +194,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.41',
+    version: '1.0.42',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -216,7 +216,7 @@ export default {
       // archive. Must be unique + higher than any build already uploaded for
       // the current `version` string. (appVersionSource:"remote" in eas.json
       // only affects EAS cloud builds, not local archives — this wins here.)
-      buildNumber: '41',
+      buildNumber: '42',
       // iPhone-only. Set false so App Store Connect does NOT require a separate
       // iPad 13" (2064x2752) screenshot set, and so the phone-portrait UI is
       // never shown stretched on iPad (Guideline 2.3.1 / 4.0 quality risk).
@@ -256,12 +256,16 @@ export default {
       softwareKeyboardLayoutMode: 'resize',
       predictiveBackGestureEnabled: false,
       permissions: ['android.permission.CAMERA'],
-      // expo-audio declares both FOREGROUND_SERVICE (base) and _MEDIA_PLAYBACK.
-      // Skanlore plays audio only in the foreground, so both are blocked to avoid
-      // Google Play's foreground-service declaration requirement (Android 14+).
+      // expo-audio declares FOREGROUND_SERVICE (base) + _MEDIA_PLAYBACK + RECORD_AUDIO.
+      // Skanlore plays audio only in the foreground and never records (grep-confirmed),
+      // so all three are blocked: the two FGS perms clear Google Play's foreground-service
+      // declaration (Android 14+), and removing RECORD_AUDIO keeps the mic off a
+      // children's-app listing / Data Safety form. expo-notifications declares no FGS
+      // (verified), so it is unaffected; MODIFY_AUDIO_SETTINGS stays (needed for playback).
       blockedPermissions: [
         'android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK',
         'android.permission.FOREGROUND_SERVICE',
+        'android.permission.RECORD_AUDIO',
       ],
       package: id.androidPackage,
     },
