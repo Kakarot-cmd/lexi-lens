@@ -104,7 +104,7 @@ export async function scheduleDailyQuestReminder(
     await N.scheduleNotificationAsync({
       identifier: REMINDER_ID_KEY,
       content: {
-        title: "⚔ Daily Quest awaits!",
+        title: "✦ Daily Quest awaits!",
         body:  childName
           ? `${childName}'s streak is waiting — defeat today's enemy!`
           : "Keep your streak alive — a new dungeon foe needs defeating!",

@@ -98,7 +98,7 @@ const STEPS = [
   },
   {
     title: "Pick a Quest",
-    body:  "Tap a quest to meet its monster. It gives you word clues — then scan real objects that match each clue to win the battle!",
+    body:  "Tap a quest to meet its monster. It gives you word clues — then scan real objects that match each clue to win the quest!",
     cta:   "Next →",
   },
   {

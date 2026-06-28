@@ -359,7 +359,7 @@ function DetailModal({
             <Text style={styles.modalFlavour}>
               {unlocked && spell.spellDescription
                 ? `"${spell.spellDescription}"`
-                : `Defeat ${spell.enemyEmoji} ${spell.enemyName} to unlock this spell.`}
+                : `Clear ${spell.enemyEmoji} ${spell.enemyName} to unlock this spell.`}
             </Text>
 
             {/* Stats */}

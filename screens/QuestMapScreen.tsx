@@ -153,7 +153,7 @@ function TierHeader({
         onPress: onToggle,
         activeOpacity: 0.7,
         accessibilityRole: "button" as const,
-        accessibilityLabel: `${meta.label} tier, all conquered. ${collapsed ? "Tap to show quests." : "Tap to hide quests."}`,
+        accessibilityLabel: `${meta.label} tier, all cleared. ${collapsed ? "Tap to show quests." : "Tap to hide quests."}`,
       }
     : {};
 
@@ -424,7 +424,7 @@ function QuestCard({
 
             {isHardBeaten && (
               <View style={styles.hardBeatenRow}>
-                <Text style={styles.hardBeatenText}>👑 Hard mode conquered!</Text>
+                <Text style={styles.hardBeatenText}>👑 Hard mode cleared!</Text>
               </View>
             )}
           </>
