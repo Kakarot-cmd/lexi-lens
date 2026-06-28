@@ -217,7 +217,12 @@ export default {
       // the current `version` string. (appVersionSource:"remote" in eas.json
       // only affects EAS cloud builds, not local archives — this wins here.)
       buildNumber: '41',
-      supportsTablet: true,
+      // iPhone-only. Set false so App Store Connect does NOT require a separate
+      // iPad 13" (2064x2752) screenshot set, and so the phone-portrait UI is
+      // never shown stretched on iPad (Guideline 2.3.1 / 4.0 quality risk).
+      // Bakes UIDeviceFamily=[1] at prebuild → requires a fresh archive to take
+      // effect. Android is unaffected (Play tablet availability is independent).
+      supportsTablet: false,
       // Adds the "Sign in with Apple" capability/entitlement at prebuild.
       // Required for expo-apple-authentication to function and for App Store
       // Guideline 4.8 compliance (third-party login present → Apple offered).

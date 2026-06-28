@@ -63,7 +63,7 @@ const T = {
   normal: {
     bg:         "#052e16",
     burst:      "rgba(34,197,94,0.35)",
-    weapon:     "⚔️",
+    weapon:     "✨",
     trophy:     "🏆",
     xpColor:    "#22c55e",
     xpBg:       "rgba(34,197,94,0.15)",
@@ -80,7 +80,7 @@ const T = {
   hard: {
     bg:         "#1a0505",
     burst:      "rgba(239,68,68,0.35)",
-    weapon:     "🗡️",
+    weapon:     "💫",
     trophy:     "👑",
     xpColor:    "#fca5a5",
     xpBg:       "rgba(127,29,29,0.25)",
@@ -342,7 +342,7 @@ function VictoryContent({
           {isHardMode ? "Hard mode cleared!" : "Dungeon cleared!"}
         </Text>
         <Text style={[styles.sub, { color: theme.subColor }]}>
-          {quest.enemy_name} defeated{isHardMode ? " (Hard Mode)" : ""}
+          {quest.enemy_name} cleared{isHardMode ? " (Hard Mode)" : ""}
         </Text>
 
         <View style={[styles.xpBadge, { backgroundColor: theme.xpBg, borderColor: theme.xpBorder }]}>
