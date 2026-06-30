@@ -167,16 +167,16 @@ describe("selectIsQuestLocked", () => {
 });
 
 describe("ageFloorIndex", () => {
-  test("ages 5–7 floor at Apprentice (0)", () => {
+  test("ages 5–6 floor at Apprentice (0)", () => {
     expect(ageFloorIndex(5)).toBe(0);
-    expect(ageFloorIndex(7)).toBe(0);
+    expect(ageFloorIndex(6)).toBe(0);
   });
-  test("ages 8–9 floor at Scholar (1)", () => {
+  test("ages 7–8 floor at Scholar (1)", () => {
+    expect(ageFloorIndex(7)).toBe(1);
     expect(ageFloorIndex(8)).toBe(1);
-    expect(ageFloorIndex(9)).toBe(1);
   });
-  test("ages 10–12 floor at Sage (2)", () => {
-    expect(ageFloorIndex(10)).toBe(2);
+  test("ages 9–12 floor at Sage (2)", () => {
+    expect(ageFloorIndex(9)).toBe(2);
     expect(ageFloorIndex(12)).toBe(2);
   });
   test("missing age defaults to Apprentice floor", () => {

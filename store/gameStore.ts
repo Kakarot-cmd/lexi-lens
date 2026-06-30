@@ -1201,11 +1201,19 @@ export const useGameStore = create<GameState>()(
         // 3. Last-resort fallback: deterministic round-robin from local cache.
         // Only fires if the DB read AND the Edge Function both failed.
         if (!questId) {
-          const { questLibrary } = get();
-          const activeQuests = questLibrary.filter((q) => (q as any).is_active !== false && !(q as any).is_daily);
-          if (activeQuests.length > 0) {
-            const dayIndex = daysSinceEpoch() % activeQuests.length;
-            questId = activeQuests[dayIndex].id;
+          const { questLibrary, activeChild } = get();
+          const active = questLibrary.filter((q) => (q as any).is_active !== false && !(q as any).is_daily);
+          // v7.x — prefer the child's own level so a young child can't be handed
+          // a far-above-level daily on a total backend failure. min_age_band is
+          // a difficulty tag now; fall back to the full pool if their band is
+          // empty in the local cache (rare, since this path is already a
+          // triple-failure last resort).
+          const band     = activeChild?.age_band;
+          const atLevel  = band ? active.filter((q) => q.min_age_band === band) : [];
+          const pool     = atLevel.length > 0 ? atLevel : active;
+          if (pool.length > 0) {
+            const dayIndex = daysSinceEpoch() % pool.length;
+            questId = pool[dayIndex].id;
           }
         }
 
@@ -1445,9 +1453,9 @@ export const selectQuestComplete = (state: GameState): boolean =>
 // Archmage as climb-only and is never granted by an age floor.
 const ageFloorIndex = (age?: number): number => {
   if (age == null) return 0;
-  if (age <= 7) return 0; // Apprentice
-  if (age <= 9) return 1; // Scholar
-  return 2;               // Sage (ages 10–12); Archmage is always earned
+  if (age <= 6) return 0; // 5–6  → Apprentice
+  if (age <= 8) return 1; // 7–8  → Scholar
+  return 2;               // 9–12 → Sage (Archmage stays climb-only)
 };
 
 export const selectUnlockedTiers = (state: GameState): QuestTier[] => {

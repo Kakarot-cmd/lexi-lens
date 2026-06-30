@@ -111,9 +111,9 @@ export const selectIsQuestLocked = (
 // Nothing is locked TO an age. Children are 5–12, so Archmage is climb-only.
 export const ageFloorIndex = (age?: number): number => {
   if (age == null) return 0;
-  if (age <= 7) return 0; // Apprentice
-  if (age <= 9) return 1; // Scholar
-  return 2;               // Sage (10–12); Archmage is always earned
+  if (age <= 6) return 0; // 5–6  → Apprentice
+  if (age <= 8) return 1; // 7–8  → Scholar
+  return 2;               // 9–12 → Sage (Archmage stays climb-only)
 };
 
 export const selectUnlockedTiers = (state: MinimalState): QuestTier[] => {
