@@ -1074,6 +1074,44 @@ serve(async (req: Request) => {
     return jsonResponse({ error: "Missing required fields" }, 400);
   }
 
+  // ── 1b. Verify the caller owns this child ──────────────────────────────────
+  //   evaluate runs on the service role (RLS-exempt) and trusts childId from
+  //   the request body. Exactly like report-verdict / export-word-tome, we must
+  //   re-implement the parent-ownership check the service role bypasses —
+  //   otherwise any caller could submit scans, read context, or write
+  //   scan_attempts for another family's child. This ADDS a gate; it changes
+  //   nothing downstream (childId, properties, routing, cache, feedback voice
+  //   all flow exactly as before). Placed BEFORE get_evaluate_context so a
+  //   foreign childId is rejected ahead of any context fetch or model spend —
+  //   same "never touches their counter" ordering as export-word-tome.
+  const authHeader = req.headers.get("Authorization") ?? "";
+  if (!authHeader.toLowerCase().startsWith("bearer ")) {
+    return jsonResponse({ error: "Unauthorised" }, 401);
+  }
+  // anon key + the caller's JWT so getUser() returns the signed-in parent
+  // (not service-role context). SUPABASE_ANON_KEY is runtime-provided.
+  const userScoped = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_ANON_KEY")!,
+    { global: { headers: { Authorization: authHeader } }, auth: { persistSession: false } },
+  );
+  const { data: { user: caller }, error: callerErr } = await userScoped.auth.getUser();
+  if (callerErr || !caller) {
+    return jsonResponse({ error: "Unauthorised" }, 401);
+  }
+  // Service-role read (the `supabase` client above) fetches the row regardless
+  // of owner; the .eq(parent_id) makes it return a row ONLY when the caller
+  // owns this child. 403 (not 404) so we never confirm an unrelated childId.
+  const { data: ownRow, error: ownErr } = await supabase
+    .from("child_profiles")
+    .select("id")
+    .eq("id", childId)
+    .eq("parent_id", caller.id)
+    .single();
+  if (ownErr || !ownRow) {
+    return jsonResponse({ error: "Not your child" }, 403);
+  }
+
   // v6.2 Phase 2 — Snapshot the cc1_enabled flag so the response can echo
   // it back to the client. Client uses this to refresh its session-bound
   // CC1-on/off cache without a separate /cc1?probe=1 round-trip. Cheap:
