@@ -52,12 +52,18 @@ const DEFAULT_MODEL_VARIANT = "gemini-2.5-flash-lite";
 const API_BASE              = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_MAX_TOKENS    = 700;
 const DEFAULT_TIMEOUT_MS    = 30_000;
-// v7.x — retry budget for transient Gemini errors (503/UNAVAILABLE etc.).
-// Per-attempt cap is kept tight so MAX_ATTEMPTS × this + backoff stays under
-// the client's evaluate timeout (EVALUATE_ATTEMPT_TIMEOUT_MS in
-// hooks/useLexiEvaluate.ts, raised to match in the same change). A healthy
-// flash-lite vision scan returns in 2–6s, so 9s/attempt rarely bites.
-const RETRY_ATTEMPT_TIMEOUT_MS = 9_000;
+// v7.x — transient Gemini errors (503/UNAVAILABLE, overloaded) are Google-side
+// capacity blips. We retry with backoff, but the WHOLE retry sequence must
+// finish inside the client's hard 15s evaluate cutoff
+// (EVALUATE_ATTEMPT_TIMEOUT_MS) — a child must never watch an indefinite
+// spinner. So retries are gated on a wall-clock budget: we only start another
+// attempt while time remains, and we shrink the per-attempt timeout to the
+// budget left. Fast blips (503 in 1–2s) get retried-to-success well within
+// budget; a slow first failure gives up cleanly (no wasted in-flight call)
+// and the child's existing manual "tap to retry" prompt takes over.
+const RETRY_ATTEMPT_TIMEOUT_MS = 9_000;   // per-attempt cap (healthy scan ~7s)
+const TOTAL_RETRY_BUDGET_MS    = 13_000;  // wall-clock ceiling, < client 15s
+const MIN_ATTEMPT_MS           = 2_500;   // don't start an attempt with less left
 const MAX_MODEL_ATTEMPTS       = 3;
 const RETRYABLE_STATUS         = new Set([408, 429, 500, 502, 503, 504]);
 
@@ -200,16 +206,24 @@ export const geminiAdapter: ModelAdapter = {
     // the Gemini endpoint are Google-side capacity blips, not our bug. Per
     // Google's guidance the fix is bounded exponential-backoff retry on the
     // SAME model (a 503 is rejected before generation, so a retried-then-
-    // failed attempt costs ~0 output tokens). This silently absorbs brief
-    // blips; a *sustained* capacity event can still exhaust all attempts and
-    // surface the error to the caller's existing retry path.
-    const perAttemptTimeoutMs = Math.min(
-      opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      RETRY_ATTEMPT_TIMEOUT_MS,
-    );
+    // failed attempt costs ~0 output tokens). The whole retry sequence is
+    // wall-clock-bounded to TOTAL_RETRY_BUDGET_MS so it always finishes inside
+    // the client's hard 15s cutoff — fast blips get retried-to-success, a slow
+    // first failure gives up cleanly (no wasted in-flight call), and the
+    // child's manual retry prompt covers sustained outages.
+    const budgetLeft = () => TOTAL_RETRY_BUDGET_MS - (Date.now() - startedAt);
+    const canRetry   = (attempt: number) =>
+      attempt < MAX_MODEL_ATTEMPTS && budgetLeft() >= MIN_ATTEMPT_MS;
 
     let response!: Response;
     for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt++) {
+      // Per-attempt timeout = min(cap, budget remaining). First attempt gets
+      // the full cap; later attempts shrink to whatever budget is left.
+      const perAttemptTimeoutMs = Math.min(
+        opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        RETRY_ATTEMPT_TIMEOUT_MS,
+        Math.max(budgetLeft(), MIN_ATTEMPT_MS),
+      );
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), perAttemptTimeoutMs);
 
@@ -236,9 +250,9 @@ export const geminiAdapter: ModelAdapter = {
         clearTimeout(timeout);
       }
 
-      // Transport error / aborted attempt — retry, then give up.
+      // Transport error / aborted attempt — retry if budget allows, else give up.
       if (transportErr) {
-        if (attempt < MAX_MODEL_ATTEMPTS) { await sleepBackoff(attempt); continue; }
+        if (canRetry(attempt)) { await sleepBackoff(attempt); continue; }
         throw new ModelCallError(
           modelId,
           null,
@@ -251,10 +265,10 @@ export const geminiAdapter: ModelAdapter = {
 
       // Non-OK. Retry transient server-side statuses; surface everything else.
       const errText = await response.text().catch(() => "(unreadable)");
-      if (RETRYABLE_STATUS.has(response.status) && attempt < MAX_MODEL_ATTEMPTS) {
+      if (RETRYABLE_STATUS.has(response.status) && canRetry(attempt)) {
         console.warn(
           `[gemini] ${response.status} on attempt ${attempt}/${MAX_MODEL_ATTEMPTS} ` +
-          `(${modelId}) — retrying with backoff`,
+          `(${modelId}) — retrying (≈${Math.max(budgetLeft(), 0)}ms budget left)`,
         );
         await sleepBackoff(attempt);
         continue;

@@ -213,13 +213,11 @@ const EDGE_FUNCTION_NAME     = "evaluate";
 // 15s bounds the worst case while staying generous for a cold start + a slow
 // Gemini eval (~7s observed) + LTE upload of the frame.
 //
-// v7.x — raised 15s → 24s to fit the server-side Gemini retry budget. The
-// adapter now retries transient 503s up to 3× (≈ 3 × 9s cap + ~1.2s backoff).
-// At 15s the client bailed mid-retry and the child saw an error even when the
-// retry was about to succeed — wasting an already-billed call. The typical
-// (first-attempt-success) path is unchanged at ~5s; only the rare retry path
-// uses the extra headroom.
-const EVALUATE_ATTEMPT_TIMEOUT_MS = 24000;
+// v7.x — kept at 15s (hard cutoff for kids; never an indefinite spinner). The
+// server-side Gemini retry self-bounds to TOTAL_RETRY_BUDGET_MS (13s) so the
+// full retry sequence finishes inside this wall with ~2s of margin. A child
+// never waits past 15s; fast 503 blips are retried-to-success well before it.
+const EVALUATE_ATTEMPT_TIMEOUT_MS = 15000;
 
 // ─── v6.2 Phase 2 — CC1 session cache ────────────────────────────────────────
 //
