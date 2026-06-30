@@ -2,7 +2,9 @@
  * gameStoreLogic.ts — pure-logic extract of store/gameStore.ts
  *
  * Extracts:
- *   • Helpers: buildComponents, calcEnemyHp, ageBandOrder, childMinAgeBandOk
+ *   • Helpers: buildComponents, calcEnemyHp
+ *   • Ladder (v7.x): TIER_ORDER, selectIsQuestLocked, ageFloorIndex,
+ *     selectUnlockedTiers, selectTierCleared, selectQuestsGroupedByTier
  *   • Selectors (rewritten as pure functions taking state)
  *   • Reducer functions extracted from the set() callbacks of each action
  *     (so we can test them without instantiating Zustand)
@@ -35,6 +37,8 @@ export interface Quest {
   hard_mode_properties?:  PropertyRequirement[];
   age_band_properties?:   Record<string, PropertyRequirement[]>;
   is_active?:             boolean;
+  is_daily?:              boolean;
+  min_subscription_tier?: "free" | "paid";
 }
 
 export interface ActiveQuest {
@@ -50,6 +54,7 @@ export interface ChildSession {
   id:        string;
   total_xp:  number;
   level:     number;
+  age?:      number;
 }
 
 export interface StreakData {
@@ -68,6 +73,7 @@ export interface MinimalState {
   completedQuestIds:  string[];
   hardCompletedQuestIds: string[];
   dailyQuest:         { questId: string | null; questDate: string; isLoaded: boolean };
+  parentSubscriptionTier?: "free" | "paid" | null;
 }
 
 // ─── Helpers (verbatim) ───────────────────────────────────────────────────────
@@ -88,13 +94,88 @@ export function calcEnemyHp(components: ComponentProgress[]): number {
   return Math.round(((components.length - foundCount) / components.length) * 100);
 }
 
-export function ageBandOrder(band: string): number {
-  return ({ "5-6": 0, "7-8": 1, "9-10": 2, "11-12": 3, "13-14": 4 } as Record<string, number>)[band] ?? 99;
+// ─── Proficiency ladder (verbatim from store/gameStore.ts v7.x) ───────────────
+
+export const TIER_ORDER: QuestTier[] = ["apprentice", "scholar", "sage", "archmage"];
+
+export const selectIsQuestLocked = (
+  quest:      Quest,
+  parentTier: MinimalState["parentSubscriptionTier"],
+): boolean => {
+  const questNeeds = quest.min_subscription_tier ?? "free";
+  if (questNeeds !== "paid") return false;
+  return parentTier !== "paid"; // null or 'free' both lock
+};
+
+// Age PLACES the child on a starting rung; proficiency CLIMBS from there.
+// Nothing is locked TO an age. Children are 5–12, so Archmage is climb-only.
+export const ageFloorIndex = (age?: number): number => {
+  if (age == null) return 0;
+  if (age <= 7) return 0; // Apprentice
+  if (age <= 9) return 1; // Scholar
+  return 2;               // Sage (10–12); Archmage is always earned
+};
+
+export const selectUnlockedTiers = (state: MinimalState): QuestTier[] => {
+  const completed = new Set(state.completedQuestIds);
+  const floorIdx  = ageFloorIndex(state.activeChild?.age);
+  const unlocked: QuestTier[] = [];
+
+  const playableCleared = (tier: QuestTier): boolean => {
+    const tq = state.questLibrary.filter(
+      (q) =>
+        q.tier === tier &&
+        !q.is_daily &&
+        !selectIsQuestLocked(q, state.parentSubscriptionTier),
+    );
+    return tq.length > 0 && tq.every((q) => completed.has(q.id));
+  };
+
+  for (let i = 0; i < TIER_ORDER.length; i++) {
+    if (i <= floorIdx || playableCleared(TIER_ORDER[i - 1])) {
+      unlocked.push(TIER_ORDER[i]);
+    } else {
+      break;
+    }
+  }
+  return unlocked;
+};
+
+export const selectTierCleared = (tier: QuestTier) => (state: MinimalState): boolean => {
+  const completed = new Set(state.completedQuestIds);
+  const playable  = state.questLibrary.filter(
+    (q) =>
+      q.tier === tier &&
+      !q.is_daily &&
+      !selectIsQuestLocked(q, state.parentSubscriptionTier),
+  );
+  return playable.length > 0 && playable.every((q) => completed.has(q.id));
+};
+
+export interface TierGroup {
+  tier:     QuestTier;
+  quests:   Quest[];
+  unlocked: boolean;
+  cleared:  boolean;
 }
 
-export function childMinAgeBandOk(childBand: string, questMinBand: string): boolean {
-  return ageBandOrder(childBand) >= ageBandOrder(questMinBand);
-}
+export const selectQuestsGroupedByTier = (state: MinimalState): TierGroup[] => {
+  const completed     = new Set(state.completedQuestIds);
+  const unlockedTiers = selectUnlockedTiers(state);
+
+  return TIER_ORDER.map((tier) => {
+    const tierQuests = state.questLibrary.filter((q) => q.tier === tier && !q.is_daily);
+    const playable   = tierQuests.filter(
+      (q) => !selectIsQuestLocked(q, state.parentSubscriptionTier),
+    );
+    return {
+      tier,
+      quests:   tierQuests,
+      unlocked: unlockedTiers.includes(tier),
+      cleared:  playable.length > 0 && playable.every((q) => completed.has(q.id)),
+    };
+  });
+};
 
 // ─── Selectors (verbatim) ─────────────────────────────────────────────────────
 
@@ -141,20 +222,11 @@ export const selectLevelProgress = (state: MinimalState): number => {
 
 export function getDisplayProperties(
   quest: Quest,
-  ageBand: string
+  _ageBand: string
 ): PropertyRequirement[] {
-  const ageBandProps = quest.age_band_properties?.[ageBand];
-  if (!ageBandProps || ageBandProps.length === 0) return quest.required_properties;
-
-  const enriched = ageBandProps.map((p) => {
-    if (p.definition?.trim()) return p;
-    const canonical = quest.required_properties.find((r) => r.word === p.word);
-    return canonical
-      ? { ...p, definition: canonical.definition, evaluationHints: p.evaluationHints ?? canonical.evaluationHints }
-      : p;
-  });
-
-  return enriched;
+  // v7.x — native properties only (proficiency ladder). age_band_properties no
+  // longer shifts difficulty by the child's band. Param kept for callers.
+  return quest.required_properties;
 }
 
 // ─── Reducer extractions (the set() callback bodies) ──────────────────────────

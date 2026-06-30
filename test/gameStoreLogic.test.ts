@@ -5,7 +5,7 @@
  * Coverage:
  *   1. buildComponents              — initial component shape
  *   2. calcEnemyHp                  — 100 → 0 ramp, edge cases
- *   3. ageBandOrder + childMinAgeBandOk — gating logic
+ *   3. selectUnlockedTiers + selectIsQuestLocked — proficiency ladder
  *   4. selectCurrentComponent       — first unfound
  *   5. selectCurrentAttempts        — per-component attempts
  *   6. selectQuestComplete          — every-vs-some
@@ -14,7 +14,7 @@
  *   9. selectQuestCompletionMode    — hard wins over normal
  *  10. selectHasHardMode            — array shape check
  *  11. selectLevelProgress          — XP curve formula
- *  12. getDisplayProperties         — age-band merging
+ *  12. getDisplayProperties         — native properties (ladder)
  *  13. recordComponentFoundReducer  — single-property unlock + enemyHp recalc
  *  14. recordComponentsFoundReducer — the atomic batch race-fix
  *  15. recordMissedScanReducer      — attempt counter
@@ -23,8 +23,11 @@
 import {
   buildComponents,
   calcEnemyHp,
-  ageBandOrder,
-  childMinAgeBandOk,
+  selectUnlockedTiers,
+  selectIsQuestLocked,
+  selectTierCleared,
+  selectQuestsGroupedByTier,
+  ageFloorIndex,
   selectCurrentComponent,
   selectCurrentAttempts,
   selectQuestComplete,
@@ -42,6 +45,7 @@ import {
   MinimalState,
   PropertyRequirement,
   Quest,
+  QuestTier,
 } from "./gameStoreLogic";
 
 // ─── factories ────────────────────────────────────────────────────────────────
@@ -136,35 +140,135 @@ describe("calcEnemyHp", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 3. ageBandOrder + childMinAgeBandOk
+// 3. Proficiency ladder — selectIsQuestLocked / ageFloorIndex / selectUnlockedTiers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("ageBandOrder", () => {
-  test("known bands 0..4 in order", () => {
-    expect(ageBandOrder("5-6")).toBe(0);
-    expect(ageBandOrder("7-8")).toBe(1);
-    expect(ageBandOrder("9-10")).toBe(2);
-    expect(ageBandOrder("11-12")).toBe(3);
-    expect(ageBandOrder("13-14")).toBe(4);
-  });
+// Ladder quest factory: tier + free/paid in one call.
+const lq = (id: string, tier: QuestTier, paid = false): Quest =>
+  makeQuest({ id, tier, min_subscription_tier: paid ? "paid" : "free" });
 
-  test("unknown band returns 99 (defensive sentinel)", () => {
-    expect(ageBandOrder("3-4")).toBe(99);
-    expect(ageBandOrder("")).toBe(99);
+// Two quests per tier so "cleared" needs both.
+const fullLadder = (): Quest[] =>
+  (["apprentice", "scholar", "sage", "archmage"] as QuestTier[]).flatMap((t) => [
+    lq(`${t}-1`, t),
+    lq(`${t}-2`, t),
+  ]);
+
+describe("selectIsQuestLocked", () => {
+  test("free quest is never locked", () => {
+    expect(selectIsQuestLocked(lq("a", "apprentice", false), "free")).toBe(false);
+    expect(selectIsQuestLocked(lq("a", "apprentice", false), null)).toBe(false);
+  });
+  test("paid quest locks for free/null parent, opens for paid parent", () => {
+    expect(selectIsQuestLocked(lq("a", "sage", true), "free")).toBe(true);
+    expect(selectIsQuestLocked(lq("a", "sage", true), null)).toBe(true);
+    expect(selectIsQuestLocked(lq("a", "sage", true), "paid")).toBe(false);
   });
 });
 
-describe("childMinAgeBandOk", () => {
-  test("older child meets older quest requirement", () => {
-    expect(childMinAgeBandOk("11-12", "7-8")).toBe(true);
+describe("ageFloorIndex", () => {
+  test("ages 5–7 floor at Apprentice (0)", () => {
+    expect(ageFloorIndex(5)).toBe(0);
+    expect(ageFloorIndex(7)).toBe(0);
   });
-
-  test("same band passes", () => {
-    expect(childMinAgeBandOk("7-8", "7-8")).toBe(true);
+  test("ages 8–9 floor at Scholar (1)", () => {
+    expect(ageFloorIndex(8)).toBe(1);
+    expect(ageFloorIndex(9)).toBe(1);
   });
+  test("ages 10–12 floor at Sage (2)", () => {
+    expect(ageFloorIndex(10)).toBe(2);
+    expect(ageFloorIndex(12)).toBe(2);
+  });
+  test("missing age defaults to Apprentice floor", () => {
+    expect(ageFloorIndex(undefined)).toBe(0);
+  });
+});
 
-  test("younger child fails", () => {
-    expect(childMinAgeBandOk("5-6", "9-10")).toBe(false);
+describe("selectUnlockedTiers — age places, proficiency climbs", () => {
+  const stateFor = (age: number, over: Partial<MinimalState> = {}) =>
+    makeState({
+      activeChild: { id: "c1", total_xp: 0, level: 1, age },
+      questLibrary: fullLadder(),
+      parentSubscriptionTier: "paid", // playable = everything unless overridden
+      ...over,
+    });
+
+  test("age seeds the rung: 5yo with no completions → Apprentice only", () => {
+    expect(selectUnlockedTiers(stateFor(5))).toEqual(["apprentice"]);
+  });
+  test("8yo opens through Scholar", () => {
+    expect(selectUnlockedTiers(stateFor(8))).toEqual(["apprentice", "scholar"]);
+  });
+  test("11yo opens through Sage", () => {
+    expect(selectUnlockedTiers(stateFor(11))).toEqual(["apprentice", "scholar", "sage"]);
+  });
+  test("nothing is locked TO an age: Archmage is never floor-granted", () => {
+    expect(selectUnlockedTiers(stateFor(12))).not.toContain("archmage");
+  });
+  test("clearing the rung below climbs: 12yo clears Sage → Archmage", () => {
+    expect(
+      selectUnlockedTiers(stateFor(12, { completedQuestIds: ["sage-1", "sage-2"] })),
+    ).toContain("archmage");
+  });
+  test("a 5yo can climb all the way to Archmage by completion (no vocab cap)", () => {
+    const s = stateFor(5, {
+      completedQuestIds: [
+        "apprentice-1", "apprentice-2",
+        "scholar-1", "scholar-2",
+        "sage-1", "sage-2",
+      ],
+    });
+    expect(selectUnlockedTiers(s)).toEqual(["apprentice", "scholar", "sage", "archmage"]);
+  });
+});
+
+describe("selectUnlockedTiers — paid quests never trap free users", () => {
+  // Apprentice = 1 free + 1 paid; a free user can only complete the free one.
+  const mixed: Quest[] = [
+    lq("ap-free", "apprentice", false),
+    lq("ap-paid", "apprentice", true),
+    lq("sc-free", "scholar", false),
+  ];
+  const freeState = (over: Partial<MinimalState> = {}) =>
+    makeState({
+      activeChild: { id: "c1", total_xp: 0, level: 1, age: 6 },
+      questLibrary: mixed,
+      parentSubscriptionTier: "free",
+      ...over,
+    });
+
+  test("clearing the FREE apprentice quest unlocks Scholar (the regression fix)", () => {
+    const s = freeState({ completedQuestIds: ["ap-free"] }); // paid one is impossible
+    expect(selectUnlockedTiers(s)).toEqual(["apprentice", "scholar"]);
+  });
+  test("without completing the free quest, Scholar stays locked", () => {
+    expect(selectUnlockedTiers(freeState({ completedQuestIds: [] }))).toEqual(["apprentice"]);
+  });
+});
+
+describe("selectTierCleared + grouped cleared — playable-consistent", () => {
+  const mixed: Quest[] = [
+    lq("ap-free", "apprentice", false),
+    lq("ap-paid", "apprentice", true),
+  ];
+  test("free user who did the free quest: Apprentice cleared, tile count still full", () => {
+    const s = makeState({
+      questLibrary: mixed,
+      parentSubscriptionTier: "free",
+      completedQuestIds: ["ap-free"],
+    });
+    expect(selectTierCleared("apprentice")(s)).toBe(true);
+    const grp = selectQuestsGroupedByTier(s).find((g) => g.tier === "apprentice")!;
+    expect(grp.cleared).toBe(true);
+    expect(grp.quests.length).toBe(2); // aspirational count unaffected by the playable filter
+  });
+  test("paid user must complete the paid quest too", () => {
+    const s = makeState({
+      questLibrary: mixed,
+      parentSubscriptionTier: "paid",
+      completedQuestIds: ["ap-free"], // paid one still outstanding
+    });
+    expect(selectTierCleared("apprentice")(s)).toBe(false);
   });
 });
 
@@ -357,60 +461,26 @@ describe("selectLevelProgress", () => {
 // 12. getDisplayProperties
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe("getDisplayProperties — age-band merging", () => {
-  test("falls back to required_properties when no age band match", () => {
-    const quest = makeQuest({
-      required_properties: props("translucent", "rigid"),
-    });
+describe("getDisplayProperties — native properties (ladder)", () => {
+  test("returns required_properties as-is", () => {
+    const quest = makeQuest({ required_properties: props("translucent", "rigid") });
     expect(getDisplayProperties(quest, "5-6")).toEqual(props("translucent", "rigid"));
   });
 
-  test("uses age-band properties when present", () => {
+  test("ignores age_band_properties entirely (v7.x — no band shifting)", () => {
     const quest = makeQuest({
       required_properties: props("translucent"),
       age_band_properties: {
         "5-6": [{ word: "see-through", definition: "you can see through it" }],
       },
     });
-    const result = getDisplayProperties(quest, "5-6");
-    expect(result[0].word).toBe("see-through");
+    // Native difficulty: the band override is NOT applied.
+    expect(getDisplayProperties(quest, "5-6")).toEqual(props("translucent"));
   });
 
-  test("enriches age-band props with canonical definition when blank", () => {
-    const quest = makeQuest({
-      required_properties: [{ word: "translucent", definition: "lets some light through" }],
-      age_band_properties: {
-        "5-6": [{ word: "translucent", definition: "  " }], // blank
-      },
-    });
-    const result = getDisplayProperties(quest, "5-6");
-    expect(result[0].definition).toBe("lets some light through");
-  });
-
-  test("preserves age-band evaluationHints over canonical when both present", () => {
-    const quest = makeQuest({
-      required_properties: [{
-        word: "translucent",
-        definition: "x",
-        evaluationHints: "canonical-hint",
-      }],
-      age_band_properties: {
-        "5-6": [{
-          word: "translucent",
-          definition: "kid-def",
-          evaluationHints: "kid-hint",
-        }],
-      },
-    });
-    expect(getDisplayProperties(quest, "5-6")[0].evaluationHints).toBe("kid-hint");
-  });
-
-  test("empty age-band array falls back to required_properties", () => {
-    const quest = makeQuest({
-      required_properties: props("a"),
-      age_band_properties: { "5-6": [] },
-    });
-    expect(getDisplayProperties(quest, "5-6")).toEqual(props("a"));
+  test("same result regardless of the ageBand argument (difficulty = the quest)", () => {
+    const quest = makeQuest({ required_properties: props("ferromagnetic") });
+    expect(getDisplayProperties(quest, "5-6")).toEqual(getDisplayProperties(quest, "13-14"));
   });
 });
 
