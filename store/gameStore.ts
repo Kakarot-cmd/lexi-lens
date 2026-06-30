@@ -1487,24 +1487,38 @@ export const selectQuestsGroupedByTier = (state: GameState): TierGroup[] => {
 
   return TIER_ORDER.map((tier) => {
     const tierQuests = state.questLibrary.filter((q) => q.tier === tier && !q.is_daily);
+    // v7.x — "cleared" must mirror the unlock gate: a tier is cleared when every
+    // PLAYABLE quest (free, or owned) is done. Otherwise a free user who unlocked
+    // the next tier (via playable-clear in selectUnlockedTiers) would still see
+    // THIS tier as not-cleared because of paid quests they can't complete —
+    // contradicting the unlock. The tile COUNT (quests) stays the FULL set so
+    // locked tiles render real aspirational numbers.
+    const playable = tierQuests.filter(
+      (q) => !selectIsQuestLocked(q, state.parentSubscriptionTier),
+    );
     return {
       tier,
       quests:   tierQuests,
       unlocked: unlockedTiers.includes(tier),
-      // An EMPTY tier is NOT "cleared". [].every() === true (vacuous truth)
-      // rendered unseeded Scholar/Sage/Archmage tiers as "Cleared / 0
-      // quests await", which reads as data loss to a paying parent.
-      // Mirrors selectTierCleared's length guard. (audit 2026-05-17)
-      cleared:  tierQuests.length > 0 &&
-                tierQuests.every((q) => completed.has(q.id)),
+      // An EMPTY (of playable) tier is NOT "cleared". [].every() === true
+      // (vacuous truth) rendered unseeded tiers as "Cleared / 0 quests await",
+      // which reads as data loss to a paying parent. (audit 2026-05-17)
+      cleared:  playable.length > 0 &&
+                playable.every((q) => completed.has(q.id)),
     };
   });
 };
 
 export const selectTierCleared = (tier: QuestTier) => (state: GameState): boolean => {
-  const tierQuests = state.questLibrary.filter((q) => q.tier === tier && !q.is_daily);
-  const completed  = new Set(state.completedQuestIds);
-  return tierQuests.length > 0 && tierQuests.every((q) => completed.has(q.id));
+  // v7.x — playable-only, mirrors selectUnlockedTiers + selectQuestsGroupedByTier.
+  const completed = new Set(state.completedQuestIds);
+  const playable  = state.questLibrary.filter(
+    (q) =>
+      q.tier === tier &&
+      !q.is_daily &&
+      !selectIsQuestLocked(q, state.parentSubscriptionTier),
+  );
+  return playable.length > 0 && playable.every((q) => completed.has(q.id));
 };
 
 export const selectStreakMultiplier = (state: GameState): number =>
