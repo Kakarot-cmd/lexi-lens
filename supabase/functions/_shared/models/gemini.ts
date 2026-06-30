@@ -52,6 +52,22 @@ const DEFAULT_MODEL_VARIANT = "gemini-2.5-flash-lite";
 const API_BASE              = "https://generativelanguage.googleapis.com/v1beta/models";
 const DEFAULT_MAX_TOKENS    = 700;
 const DEFAULT_TIMEOUT_MS    = 30_000;
+// v7.x — retry budget for transient Gemini errors (503/UNAVAILABLE etc.).
+// Per-attempt cap is kept tight so MAX_ATTEMPTS × this + backoff stays under
+// the client's evaluate timeout (EVALUATE_ATTEMPT_TIMEOUT_MS in
+// hooks/useLexiEvaluate.ts, raised to match in the same change). A healthy
+// flash-lite vision scan returns in 2–6s, so 9s/attempt rarely bites.
+const RETRY_ATTEMPT_TIMEOUT_MS = 9_000;
+const MAX_MODEL_ATTEMPTS       = 3;
+const RETRYABLE_STATUS         = new Set([408, 429, 500, 502, 503, 504]);
+
+// Exponential backoff with jitter. attempt is 1-based: ~400ms, ~800ms (+ up
+// to 250ms jitter) before attempts 2 and 3.
+function sleepBackoff(attempt: number): Promise<void> {
+  const base   = 400 * Math.pow(2, attempt - 1);
+  const jitter = Math.floor(Math.random() * 250);
+  return new Promise((r) => setTimeout(r, base + jitter));
+}
 
 // ─── Native safety filters (v6.9) ────────────────────────────────────────────
 //
@@ -179,47 +195,75 @@ export const geminiAdapter: ModelAdapter = {
 
     const url = `${API_BASE}/${variant}:generateContent?key=${apiKey}`;
     const startedAt = Date.now();
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(),
+
+    // v7.x — A 503 ("model is overloaded") and other transient statuses from
+    // the Gemini endpoint are Google-side capacity blips, not our bug. Per
+    // Google's guidance the fix is bounded exponential-backoff retry on the
+    // SAME model (a 503 is rejected before generation, so a retried-then-
+    // failed attempt costs ~0 output tokens). This silently absorbs brief
+    // blips; a *sustained* capacity event can still exhaust all attempts and
+    // surface the error to the caller's existing retry path.
+    const perAttemptTimeoutMs = Math.min(
       opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      RETRY_ATTEMPT_TIMEOUT_MS,
     );
 
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: opts.systemPrompt }] },
-          contents:          [{ role: "user", parts }],
-          generationConfig,
-          // v6.9 — strictest configurable thresholds. See SAFETY_SETTINGS
-          // block at the top of this file for rationale and refusal-path
-          // notes. Independent of CHILD_SAFETY_PREFIX in the system
-          // prompt; the two are belt-and-braces.
-          safetySettings: SAFETY_SETTINGS,
-        }),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      clearTimeout(timeout);
-      throw new ModelCallError(
-        modelId,
-        null,
-        String(err instanceof Error ? err.message : err).slice(0, 200),
-        "Gemini transport error or timeout",
-      );
-    }
-    clearTimeout(timeout);
+    let response!: Response;
+    for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), perAttemptTimeoutMs);
 
-    if (!response.ok) {
+      let transportErr: unknown = null;
+      try {
+        response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: opts.systemPrompt }] },
+            contents:          [{ role: "user", parts }],
+            generationConfig,
+            // v6.9 — strictest configurable thresholds. See SAFETY_SETTINGS
+            // block at the top of this file for rationale and refusal-path
+            // notes. Independent of CHILD_SAFETY_PREFIX in the system
+            // prompt; the two are belt-and-braces.
+            safetySettings: SAFETY_SETTINGS,
+          }),
+          signal: controller.signal,
+        });
+      } catch (err) {
+        transportErr = err;
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      // Transport error / aborted attempt — retry, then give up.
+      if (transportErr) {
+        if (attempt < MAX_MODEL_ATTEMPTS) { await sleepBackoff(attempt); continue; }
+        throw new ModelCallError(
+          modelId,
+          null,
+          String(transportErr instanceof Error ? transportErr.message : transportErr).slice(0, 200),
+          "Gemini transport error or timeout (after retries)",
+        );
+      }
+
+      if (response.ok) break; // success — leave the retry loop
+
+      // Non-OK. Retry transient server-side statuses; surface everything else.
       const errText = await response.text().catch(() => "(unreadable)");
+      if (RETRYABLE_STATUS.has(response.status) && attempt < MAX_MODEL_ATTEMPTS) {
+        console.warn(
+          `[gemini] ${response.status} on attempt ${attempt}/${MAX_MODEL_ATTEMPTS} ` +
+          `(${modelId}) — retrying with backoff`,
+        );
+        await sleepBackoff(attempt);
+        continue;
+      }
       throw new ModelCallError(
         modelId,
         response.status,
         errText.slice(0, 500),
-        `Gemini API error ${response.status}`,
+        `Gemini API error ${response.status}${attempt > 1 ? ` (after ${attempt} attempts)` : ""}`,
       );
     }
 

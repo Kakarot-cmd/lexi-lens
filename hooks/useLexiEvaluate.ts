@@ -212,7 +212,14 @@ const EDGE_FUNCTION_NAME     = "evaluate";
 // stuck on "evaluating" (Lumi spins forever; only an app restart recovers).
 // 15s bounds the worst case while staying generous for a cold start + a slow
 // Gemini eval (~7s observed) + LTE upload of the frame.
-const EVALUATE_ATTEMPT_TIMEOUT_MS = 15000;
+//
+// v7.x — raised 15s → 24s to fit the server-side Gemini retry budget. The
+// adapter now retries transient 503s up to 3× (≈ 3 × 9s cap + ~1.2s backoff).
+// At 15s the client bailed mid-retry and the child saw an error even when the
+// retry was about to succeed — wasting an already-billed call. The typical
+// (first-attempt-success) path is unchanged at ~5s; only the rare retry path
+// uses the extra headroom.
+const EVALUATE_ATTEMPT_TIMEOUT_MS = 24000;
 
 // ─── v6.2 Phase 2 — CC1 session cache ────────────────────────────────────────
 //
