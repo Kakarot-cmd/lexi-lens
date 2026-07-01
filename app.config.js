@@ -194,7 +194,7 @@ export default {
   expo: {
     name: id.name,
     slug: 'lexi-lens',
-    version: '1.0.43',
+    version: '1.0.44',
     orientation: 'portrait',
     icon: './assets/icon.png',
     userInterfaceStyle: 'light',
@@ -216,7 +216,7 @@ export default {
       // archive. Must be unique + higher than any build already uploaded for
       // the current `version` string. (appVersionSource:"remote" in eas.json
       // only affects EAS cloud builds, not local archives — this wins here.)
-      buildNumber: '43',
+      buildNumber: '44',
       // iPhone-only. Set false so App Store Connect does NOT require a separate
       // iPad 13" (2064x2752) screenshot set, and so the phone-portrait UI is
       // never shown stretched on iPad (Guideline 2.3.1 / 4.0 quality risk).
