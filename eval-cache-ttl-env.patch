@@ -1,0 +1,21 @@
+diff --git a/supabase/functions/evaluate/index.ts b/supabase/functions/evaluate/index.ts
+index 2d751f9..97f0feb 100644
+--- a/supabase/functions/evaluate/index.ts
++++ b/supabase/functions/evaluate/index.ts
+@@ -196,7 +196,15 @@ const BASKET_LABELS = new Set([
+ 
+ const REDIS_URL   = Deno.env.get("UPSTASH_REDIS_REST_URL")   ?? "";
+ const REDIS_TOKEN = Deno.env.get("UPSTASH_REDIS_REST_TOKEN") ?? "";
+-const CACHE_TTL_S = 14 * 24 * 60 * 60; // 14 days, organic-write path
++const CACHE_TTL_S: number = (() => {
++  // Env-tunable so PROD can run a longer TTL than staging without a redeploy.
++  // Set EVAL_CACHE_TTL_DAYS as a Supabase secret (e.g. 365 on prod). Unset/invalid → 14.
++  const raw  = Deno.env.get("EVAL_CACHE_TTL_DAYS")?.trim();
++  const days = raw ? Number(raw) : NaN;
++  if (Number.isInteger(days) && days >= 1 && days <= 365) return days * 24 * 60 * 60;
++  if (raw) console.warn(`[evaluate] EVAL_CACHE_TTL_DAYS='${raw}' invalid (need integer 1-365) — using 14.`);
++  return 14 * 24 * 60 * 60; // default 14 days, organic-write path
++})();
+ 
+ const ENV_NAME: string = (() => {
+   const fromEnv = Deno.env.get("CACHE_ENV_NAMESPACE")?.trim().toLowerCase();
