@@ -66,7 +66,7 @@ export const MODEL_PRICING: Record<ModelId, ModelPricing> = {
   "gemma-4-26b":           { inputPerMillion: 0.00, outputPerMillion: 0.00, pricedAt: "2026-05-09", note: "Google AI Studio free tier" },
   "gemma-4-31b":           { inputPerMillion: 0.00, outputPerMillion: 0.00, pricedAt: "2026-05-09", note: "Google AI Studio free tier" },
   "gemini-3-1-flash":      { inputPerMillion: 0.30, outputPerMillion: 2.50, pricedAt: "2026-05-09", note: "Preview rates" },
-  "gemini-3-1-flash-lite": { inputPerMillion: 0.10, outputPerMillion: 0.40, pricedAt: "2026-05-09", note: "Preview rates" },
+  "gemini-3-1-flash-lite": { inputPerMillion: 0.25, outputPerMillion: 1.50, pricedAt: "2026-07-01", note: "GA rates (preview was $0.10/$0.40)" },
   "gemini-2-5-flash":      { inputPerMillion: 0.30, outputPerMillion: 2.50, pricedAt: "2026-05-09" },
   "gemini-2-5-flash-lite": { inputPerMillion: 0.10, outputPerMillion: 0.40, pricedAt: "2026-05-09" },
   "gpt-4-1-nano":          { inputPerMillion: 0.10, outputPerMillion: 0.40, pricedAt: "2026-05-09" },

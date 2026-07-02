@@ -118,13 +118,15 @@ const SAFETY_SETTINGS = [
 // Naming notes:
 //   • Gemma variants embed the architecture in the name: -a4b- = MoE with
 //     4B active params. The literal string "gemma-4-26b-it" returns 404.
-//   • Gemini 3.1 Flash variants are still in -preview; check the Google
-//     release notes if you see deprecation 410s.
+//   • The -preview 3.1 endpoints shut down 2026-05-25; the GA wire names
+//     (no -preview suffix) are the live ones and map to the same modelIds.
 const VARIANT_TO_MODEL_ID: Record<string, ModelId> = {
   "gemma-4-26b-a4b-it":              "gemma-4-26b",
   "gemma-4-31b-it":                  "gemma-4-31b",
-  "gemini-3.1-flash-preview":        "gemini-3-1-flash",
-  "gemini-3.1-flash-lite-preview":   "gemini-3-1-flash-lite",
+  "gemini-3.1-flash-preview":        "gemini-3-1-flash",       // dead preview (kept for logs)
+  "gemini-3.1-flash-lite-preview":   "gemini-3-1-flash-lite",  // dead preview (kept for logs)
+  "gemini-3.1-flash":                "gemini-3-1-flash",       // GA
+  "gemini-3.1-flash-lite":           "gemini-3-1-flash-lite",  // GA — recommended
   "gemini-2.5-flash":                "gemini-2-5-flash",
   "gemini-2.5-flash-lite":           "gemini-2-5-flash-lite",
 };
@@ -192,6 +194,10 @@ export const geminiAdapter: ModelAdapter = {
     const generationConfig: Record<string, unknown> = {
       maxOutputTokens: opts.maxTokens ?? DEFAULT_MAX_TOKENS,
       temperature:     0.2, // matches the deterministic-eval bias we want
+      // 3.x models default "thinking" ON, which adds latency and bills thought
+      // tokens separately (uncounted by candidatesTokenCount → cost under-read).
+      // Deterministic property eval needs no reasoning trace. 2.5 ignores this.
+      thinkingConfig:  { thinkingBudget: 0 },
     };
     if (opts.jsonMode) {
       generationConfig.responseMimeType = "application/json";
