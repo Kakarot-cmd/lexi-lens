@@ -324,7 +324,7 @@ export function PrivacyPolicyScreen({ onClose }: Props) {
         <View style={styles.hero}>
           <Text style={styles.heroEmoji}>🛡️</Text>
           <Text style={styles.heroTitle}>Your privacy matters</Text>
-          <Text style={styles.heroSub}>Version 1.0 · April 2025</Text>
+          <Text style={styles.heroSub}>Version 1.0 · July 2026</Text>
         </View>
 
         {/* Plain-English summary banner */}
@@ -359,7 +359,7 @@ export function PrivacyPolicyScreen({ onClose }: Props) {
         </TouchableOpacity>
 
         <Text style={styles.footer}>
-          This privacy policy is effective as of April 2025 and applies to all
+          This privacy policy is effective as of July 2026 and applies to all
           users of the Skanlore mobile application on iOS and Android.{"\n"}
           Policy version 1.0.
         </Text>
