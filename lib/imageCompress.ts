@@ -29,7 +29,9 @@
  * needed: lazy-require succeeds and compression kicks in automatically.
  */
 
-const TARGET_MAX_DIMENSION = 1024;
+const TARGET_MAX_DIMENSION = 768;  // was 1024 — 768 = single Gemini image tile
+                                   // (fewer input tokens + faster upload). Only
+                                   // affects the Gemini eval image, NOT ML Kit detection.
 const JPEG_QUALITY         = 0.85;
 
 // Lazy-cached references. `null` = not yet attempted. `false` = attempted
