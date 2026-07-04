@@ -71,7 +71,7 @@ interface Props {
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-export const CURRENT_POLICY_VERSION = "1.0";
+export const CURRENT_POLICY_VERSION = "1.2";
 
 const GATE_MAX_ATTEMPTS  = 3;
 const GATE_LOCKOUT_SECS  = 30;
