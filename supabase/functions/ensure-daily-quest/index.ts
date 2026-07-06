@@ -702,14 +702,25 @@ Deno.serve(async (req: Request) => {
   let attempt = 0;
   let lastFailReason = "";
 
-  // Property model: pick the (optional) category once so all retry candidates
-  // share it. null when noun_target_rate_pct is 0 or the roll misses.
-  const dailyCategory = await pickCategory(supabase, DAILY_AGE_BAND);
-
-  // Read the rotation window + strictness (flag-driven, ask #4).
+  // Read the rotation window + strictness (flag-driven, ask #4). Computed
+  // BEFORE the category pick (moved up from below `pickCategory` — 2026-07)
+  // so the category draw can exclude words already in the window instead of
+  // just being checked against it after the fact. wordsInRecentWindow() does
+  // not filter by `kind`, so it already contains any recent category words
+  // (e.g. "vehicle") alongside adjectives — reusing it here needs no new query.
   const windowDays  = await readIntFlag(supabase, WORD_WINDOW_FLAG, WORD_WINDOW_DEFAULT);
   const baseMaxShared = await readIntFlag(supabase, MAX_SHARED_FLAG, MAX_SHARED_DEFAULT);
   const windowWords = await wordsInRecentWindow(supabase, windowDays);
+
+  // Property model: pick the (optional) category once so all retry candidates
+  // share it. null when noun_target_rate_pct is 0 or the roll misses.
+  // Excludes categories seen in the rotation window (2026-07) — previously
+  // this had no memory of recent picks, so with only 6 categories at the 7-8
+  // band a repeat (e.g. "vehicle" 3 dailies running) was close to guaranteed;
+  // the word-overlap check below could only detect that collision, never
+  // avoid it, since the category is force-written into every retry attempt
+  // via enforceCategoryProperty() before this loop even starts.
+  const dailyCategory = await pickCategory(supabase, DAILY_AGE_BAND, windowWords);
 
   // Lever B — bench axes that dominated recent dailies (flag-gated; 0 = off).
   // Reuses the word-window fetch when the axis window matches, else fetches its own.

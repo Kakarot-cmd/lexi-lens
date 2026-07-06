@@ -195,6 +195,26 @@ export const TAXONOMY: Record<string, {
       { category: "vehicle",   examples: ["toy car", "truck", "bus", "bike"], escalates: false },
       { category: "furniture", examples: ["chair", "table", "stool"],         escalates: false },
       { category: "fruit",     examples: ["apple", "grape", "lemon"],         escalates: false },
+      // 2026-07 addition (ask: "no overlap of words for at least 10 days"):
+      // the category axis was capped at 6 options while pickCategory() draws
+      // uniformly at random with no memory of recent picks — with only 6
+      // choices, a repeat inside a 10-day window is close to guaranteed by
+      // pigeonhole, no matter how the picking logic is fixed. Grown to 15 here
+      // so the pool has the same kind of headroom the adjective axis was
+      // deliberately sized for (45 words / 6 axes → ~1.5x the 30 needed over
+      // 10 days). 15 vs. a strict minimum of 10 gives the same ~1.5x buffer.
+      // Paired with the pickCategory(...,excludeCategories) change in
+      // nounTarget.ts — pool size alone doesn't enforce anything; the caller
+      // has to actually consult recent history too.
+      { category: "toy",       examples: ["ball", "block", "doll", "toy car"],          escalates: false },
+      { category: "bag",       examples: ["backpack", "purse", "pouch", "tote bag"],    escalates: false },
+      { category: "book",      examples: ["book", "notebook", "magazine"],              escalates: false },
+      { category: "shoe",      examples: ["shoe", "sandal", "boot", "slipper"],         escalates: true,  harder: "footwear" },
+      { category: "tool",      examples: ["hammer", "screwdriver", "wrench", "pliers"], escalates: true,  harder: "implement" },
+      { category: "gadget",    examples: ["remote control", "calculator", "tablet"],    escalates: true,  harder: "device" },
+      { category: "plant",     examples: ["potted plant", "flower", "houseplant"],      escalates: false },
+      { category: "cookware",  examples: ["pot", "pan", "tray", "lid"],                 escalates: false },
+      { category: "pillow",    examples: ["pillow", "cushion", "throw pillow"],         escalates: false },
     ],
     // RETIRED from 7-8: the old `physical-state` axis (flexible, rigid, hollow,
     // solid, fragile, durable, elastic) — flexibility/durability cannot be read

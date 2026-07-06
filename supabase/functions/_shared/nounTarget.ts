@@ -50,10 +50,23 @@ export interface CategoryAwareProp {
  * Reads the rate flag (0–100), rolls once, and on a hit returns a curated
  * category for the band. Never throws — any failure resolves to null
  * (adjective-only quest). Caller picks ONCE per quest (1 category max).
+ *
+ * `excludeCategories` (2026-07): category words to steer away from — e.g. the
+ * daily quest's 10-day word-rotation window. Previously this function had NO
+ * memory of recent picks, so a small taxonomy (6 options at the 7-8 band)
+ * meant the SAME category (e.g. "vehicle") could get force-written into
+ * required_properties via enforceCategoryProperty() days in a row, bypassing
+ * the word-rotation check entirely: that check runs against the model's
+ * candidate AFTER the category is already fixed, so it could only ever detect
+ * the collision, never avoid it. Filtering the pool before the random draw
+ * fixes that. Fails open — if every category is excluded (pool exhausted),
+ * falls back to the unfiltered list rather than ever returning null and
+ * silently dropping the category feature for a day.
  */
 export async function pickCategory(
   supabase: SupabaseClient,
   ageBand:  string,
+  excludeCategories: Set<string> = new Set(),
 ): Promise<PickedCategory | null> {
   let ratePct = 0;
   try {
@@ -67,7 +80,12 @@ export async function pickCategory(
   const cats = TAXONOMY[ageBand]?.nounCategories ?? TAXONOMY["7-8"]?.nounCategories;
   if (!cats || cats.length === 0) return null;
 
-  const pick = cats[Math.floor(Math.random() * cats.length)];
+  const available = excludeCategories.size > 0
+    ? cats.filter((c) => !excludeCategories.has(c.category.toLowerCase()))
+    : cats;
+  const pool = available.length > 0 ? available : cats; // fail-open on exhaustion
+
+  const pick = pool[Math.floor(Math.random() * pool.length)];
   if (!pick?.category) return null;
 
   return {
