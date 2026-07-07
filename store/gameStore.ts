@@ -790,7 +790,7 @@ export const useGameStore = create<GameState>()(
         set((state) => {
           if (!state.activeQuest || updates.length === 0) return state;
 
-          const updateMap = new Map(
+          const updateMap = new Map<string, { propertyWord: string; objectUsed: string; xpAwarded: number; attemptCount: number }>(
             updates.map((u) => [u.propertyWord.toLowerCase().trim(), u])
           );
 

@@ -53,6 +53,7 @@ import {
   selectCurrentAttempts,
   selectQuestComplete,
   selectStreakMultiplier,
+  type PropertyRequirement,
 } from "../store/gameStore";
 import { VerdictCard }                           from "../components/VerdictCard";
 import { StatusBanner }                          from "../components/StatusBanner";
@@ -649,8 +650,13 @@ export function ScanScreen({ route, navigation }: Props) {
       const alreadyFound = new Set(
         (aq.components ?? []).filter((c) => c.found).map((c) => c.propertyWord.toLowerCase().trim())
       );
-      const canonicalMap = new Map(
-        (aq.effectiveProperties ?? []).map((p) => [p.word.toLowerCase().trim(), p.word])
+      // Map lowercased+trimmed key → the full PropertyRequirement. Holding
+      // the whole requirement (not just p.word) lets the definition lookup
+      // below be an O(1) map hit instead of a linear .find() over
+      // effectiveProperties per passing word. Value type is pinned to
+      // PropertyRequirement so nothing downstream degrades to `unknown`.
+      const canonicalMap = new Map<string, PropertyRequirement>(
+        (aq.effectiveProperties ?? []).map((p) => [p.word.toLowerCase().trim(), p])
       );
       const newlyPassing = (result.properties ?? []).filter((p) => {
         const key = p.word.toLowerCase().trim();
@@ -689,7 +695,7 @@ export function ScanScreen({ route, navigation }: Props) {
 
         recordComponentsFound(
           newlyPassing.map((p) => ({
-            propertyWord: canonicalMap.get(p.word.toLowerCase().trim()) ?? p.word,
+            propertyWord: canonicalMap.get(p.word.toLowerCase().trim())?.word ?? p.word,
             objectUsed:   result.resolvedObjectName,
             xpAwarded:    xpEach,
             attemptCount: currentAttempts + 1,
@@ -697,13 +703,12 @@ export function ScanScreen({ route, navigation }: Props) {
         );
 
         newlyPassing.forEach((p) => {
-          const canonicalWord = canonicalMap.get(p.word.toLowerCase().trim()) ?? p.word;
-          const req = (aq.effectiveProperties ?? []).find(
-            (r) => r.word.toLowerCase().trim() === canonicalWord.toLowerCase().trim()
-          );
+          // Single map hit gives both the canonical word AND its requirement
+          // (definition etc.) — replaces the prior get() + linear .find() pair.
+          const req = canonicalMap.get(p.word.toLowerCase().trim());
           if (req) {
             addWordToTome({
-              word:            canonicalWord,
+              word:            req.word,
               definition:      req.definition,
               exemplar_object: result.resolvedObjectName,
               times_used:      1,
