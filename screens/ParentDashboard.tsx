@@ -63,6 +63,12 @@ import {
   setLumiHapticsEnabled,
   isLumiAudioAvailable,
 } from "../components/Lumi";
+// 2026-07 — badge-notification opt-in now lives here (parent-gated), not
+// as an implicit request the first time a child earns a badge mid-play.
+import {
+  getBadgeNotificationsEnabled,
+  setBadgeNotificationsEnabled,
+} from "../lib/notifications";
 
 import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "ParentDashboard">;
@@ -490,6 +496,7 @@ function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
   const [soundOn,    setSoundOn]    = useState(false);
   const [hapticsOn,  setHapticsOn]  = useState(true);
   const [showReplay, setShowReplay] = useState(false);
+  const [badgeNotifsOn, setBadgeNotifsOn] = useState(false);
   const audioAvailable = isLumiAudioAvailable();
 
   // Hydrate from AsyncStorage on mount
@@ -497,13 +504,15 @@ function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
     let cancelled = false;
     (async () => {
       try {
-        const [s, h] = await Promise.all([
+        const [s, h, b] = await Promise.all([
           isLumiSoundEnabled(),
           isLumiHapticsEnabled(),
+          getBadgeNotificationsEnabled(),
         ]);
         if (!cancelled) {
           setSoundOn(s);
           setHapticsOn(h);
+          setBadgeNotifsOn(b);
         }
       } catch {
         // Use defaults
@@ -521,6 +530,20 @@ function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
     setHapticsOn(val);
     try { await setLumiHapticsEnabled(val); } catch { /* non-fatal */ }
     if (val) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  // 2026-07 — turning this on requests the OS notification permission right
+  // here (parent-gated screen). If the OS prompt is denied, snap the switch
+  // back to off rather than showing an "on" state that won't actually fire.
+  const onToggleBadgeNotifs = async (val: boolean) => {
+    const actual = await setBadgeNotificationsEnabled(val);
+    setBadgeNotifsOn(actual);
+    if (val && !actual) {
+      Alert.alert(
+        "Notifications blocked",
+        "Badge notifications need permission in your device Settings to turn on.",
+      );
+    }
   };
 
   return (
@@ -594,6 +617,33 @@ function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
           </View>
           <Text style={styles.lumiReplayChevron}>›</Text>
         </TouchableOpacity>
+      </View>
+
+      {/* 2026-07 — badge notifications, moved here from an implicit request
+          inside sendBadgeNotification(). This is the only place that
+          permission is ever requested now — explicit, parent-gated, opt-in. */}
+      <View style={[styles.section, { marginTop: 20 }]}>
+        <Text style={styles.sectionTitle}>Notifications</Text>
+        <Text style={styles.sectionDesc}>
+          A gentle nudge when your child earns a badge. Off by default.
+        </Text>
+        <View style={styles.lumiCard}>
+          <View style={styles.lumiRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.lumiRowLabel}>Badge notifications</Text>
+              <Text style={styles.lumiRowSub}>
+                A short local notification when a badge is unlocked
+              </Text>
+            </View>
+            <Switch
+              value={badgeNotifsOn}
+              onValueChange={onToggleBadgeNotifs}
+              trackColor={{ false: P.warmBorder, true: P.amberAccent }}
+              thumbColor={badgeNotifsOn ? P.inkBrown : P.parchment}
+              ios_backgroundColor={P.warmBorder}
+            />
+          </View>
+        </View>
       </View>
 
       {/* Full-screen modal. Backstory screen owns the viewport while

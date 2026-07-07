@@ -440,7 +440,21 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     }
   }, [startChildSession, loadQuests, loadCompletedQuests, navigation]);
 
-  const handleDelete = useCallback((id: string) => {
+  // 2026-07 — child-profile deletion now requires the parent PIN gate first.
+  // Previously handleDelete went straight to a plain Alert.alert confirm,
+  // reachable with zero PIN because ChildSwitcher is the app's un-gated
+  // cold-start screen (first <AppNav.Screen> in App.tsx, no initialRouteName
+  // override — anyone with the phone lands here, not just a parent). A kid
+  // could tap "x" next to a sibling's name and tap through a confirm dialog
+  // exactly like any other, permanently destroying that sibling's progress
+  // with no parent involved. The PIN gate now runs first; the destructive
+  // confirm Alert (unchanged wording) still runs after, as a second,
+  // separate "did you mean to tap that" check once the PIN has already
+  // proven it's a parent holding the phone.
+  type PendingAction = { type: "dashboard" } | { type: "delete"; id: string };
+  const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
+
+  const performDelete = useCallback((id: string) => {
     Alert.alert(
       "Remove child?",
       "This removes all data for this child profile. This cannot be undone.",
@@ -476,6 +490,11 @@ export function ChildSwitcherScreen({ navigation }: Props) {
     );
   }, [fetchChildren, endChildSession]);
 
+  const handleDelete = useCallback((id: string) => {
+    setPendingAction({ type: "delete", id });
+    setPinVisible(true);
+  }, []);
+
   const handleSignOut = useCallback(async () => {
     setSigningOut(true);
     try {
@@ -501,7 +520,10 @@ export function ChildSwitcherScreen({ navigation }: Props) {
         <View style={styles.headerActions}>
           <TouchableOpacity
             style={styles.dashboardBtn}
-            onPress={() => setPinVisible(true)}
+            onPress={() => {
+              setPendingAction({ type: "dashboard" });
+              setPinVisible(true);
+            }}
             accessibilityLabel="Parent dashboard"
           >
             <Text style={styles.dashboardBtnText}>📊 Word Tome</Text>
@@ -557,9 +579,17 @@ export function ChildSwitcherScreen({ navigation }: Props) {
               parentEmail={parentEmail}
               onSuccess={() => {
                 setPinVisible(false);
-                navigation.navigate("ParentDashboard");
+                if (pendingAction?.type === "delete") {
+                  performDelete(pendingAction.id);
+                } else {
+                  navigation.navigate("ParentDashboard");
+                }
+                setPendingAction(null);
               }}
-              onDismiss={() => setPinVisible(false)}
+              onDismiss={() => {
+                setPinVisible(false);
+                setPendingAction(null);
+              }}
             />
 
             {showForm ? (

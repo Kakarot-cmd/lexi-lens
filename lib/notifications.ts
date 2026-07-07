@@ -19,10 +19,20 @@
  */
 
 import { Platform } from "react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const CHANNEL_ID      = "daily-quest";
 const REMINDER_ID_KEY = "lexi-daily-reminder";
 const BADGE_CHANNEL_ID = "lexi-achievements";
+
+// 2026-07 — explicit parent opt-in for badge notifications. Previously
+// sendBadgeNotification() called requestNotificationPermission() itself,
+// which meant the OS permission dialog could fire the first time a CHILD
+// earned a badge mid-gameplay — not from any parent-facing toggle, despite
+// this file's own original comment saying the intent was "only when the
+// parent actually toggles the reminder." Naming mirrors the existing
+// lexilens.lumi.* keys in components/Lumi/lumiSounds.ts.
+const KEY_BADGE_NOTIFS_ENABLED = "lexilens.notifications.badgeEnabled";
 
 /** Lazily load expo-notifications — never at module init time. */
 async function getNotifications() {
@@ -162,6 +172,41 @@ export async function registerNotificationTapHandler(
  *
  * @param badge — Badge object from achievementService.ts
  */
+/**
+ * Reads the stored preference. If the parent has never explicitly toggled
+ * it, falls back to the current OS permission grant — this is the
+ * non-disruptive path for anyone upgrading from the old always-request
+ * behaviour: if they'd already granted permission under the old flow,
+ * badges keep working with no re-opt-in; if they hadn't, badges simply
+ * stay silent until a parent turns this on in ParentDashboard.
+ */
+export async function getBadgeNotificationsEnabled(): Promise<boolean> {
+  try {
+    const stored = await AsyncStorage.getItem(KEY_BADGE_NOTIFS_ENABLED);
+    if (stored !== null) return JSON.parse(stored);
+    const N = await getNotifications();
+    const { status } = await N.getPermissionsAsync();
+    return status === "granted";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parent-initiated toggle (ParentDashboard only). Turning ON asks the OS
+ * permission dialog here, explicitly, from a gated parent-facing screen —
+ * turning OFF just persists the preference, no need to touch OS state.
+ * Returns the actual resulting state so the UI can snap back if the OS
+ * permission was denied.
+ */
+export async function setBadgeNotificationsEnabled(on: boolean): Promise<boolean> {
+  const actual = on ? await requestNotificationPermission() : false;
+  try {
+    await AsyncStorage.setItem(KEY_BADGE_NOTIFS_ENABLED, JSON.stringify(actual));
+  } catch { /* non-fatal */ }
+  return actual;
+}
+
 export async function sendBadgeNotification(badge: {
   emoji:       string;
   name:        string;
@@ -169,8 +214,12 @@ export async function sendBadgeNotification(badge: {
   rarity:      string;
 }): Promise<void> {
   try {
-    const granted = await requestNotificationPermission();
-    if (!granted) return;
+    // 2026-07 — check-only. No permission request here anymore; that only
+    // ever happens from setBadgeNotificationsEnabled() above, behind the
+    // ParentDashboard PIN gate. If the parent hasn't opted in, badges are
+    // earned and stored as normal — this function just stays silent.
+    const enabled = await getBadgeNotificationsEnabled();
+    if (!enabled) return;
 
     const N = await getNotifications();
 

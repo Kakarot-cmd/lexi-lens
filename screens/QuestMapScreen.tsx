@@ -61,6 +61,8 @@ import { RecentDailiesRow } from "../components/RecentDailiesRow";
 import { PremiumTeaserRow } from "../components/PremiumTeaserRow";
 import { StreakBar }         from "../components/StreakBar";
 import { LumiHUD }           from "../components/Lumi";
+import { ParentPinGateModal } from "../components/ParentPinGateModal";
+import { supabase }          from "../lib/supabase";
 
 import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "QuestMap">;
@@ -464,6 +466,25 @@ export function QuestMapScreen({ navigation }: Props) {
   const loadDailyQuest = useGameStore((s) => s.loadDailyQuest);
   const dailyQuestObj  = useGameStore(selectDailyQuest);
 
+  // 2026-07 — parental gate in front of the Paywall. Previously a locked-quest
+  // tap went straight to PaywallScreen (a real purchasePackage() call one tap
+  // away) with nothing in between — reachable by the child directly from the
+  // dungeon map. Reusing the same ParentPinGateModal ChildSwitcherScreen
+  // already gates ParentDashboard access with, rather than inventing a new
+  // gate mechanism.
+  const [pinGateVisible, setPinGateVisible] = useState(false);
+  const [parentId, setParentId]       = useState("");
+  const [parentEmail, setParentEmail] = useState("");
+
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (user) {
+        setParentId(user.id);
+        setParentEmail(user.email ?? "");
+      }
+    });
+  }, []);
+
   // v2.1 — derive tier groups
   const tierGroups = useMemo(
     () => selectQuestsGroupedByTier({ questLibrary, completedQuestIds } as any),
@@ -565,9 +586,12 @@ export function QuestMapScreen({ navigation }: Props) {
 
   // Phase 4.4 — locked premium quest tap → PaywallScreen modal. Lifted here
   // (vs inside QuestCard) so navigation is in scope. Haptic fires in the card.
+  // 2026-07 — now opens the parental PIN gate first; Paywall only opens
+  // from the gate's onSuccess. This is the only change to this handler —
+  // the actual navigation call is unchanged, just moved behind the gate.
   const handleLockedTap = useCallback(() => {
-    navigation.navigate("Paywall", { reason: "quest-locked" });
-  }, [navigation]);
+    setPinGateVisible(true);
+  }, []);
 
   // Build SectionList sections from tier groups
   const sections = useMemo(() => {
@@ -748,6 +772,18 @@ export function QuestMapScreen({ navigation }: Props) {
 
       {/* ── Lumi mascot — ambient brand presence, bottom-right ─────────── */}
       <LumiHUD screen="quest-map" />
+
+      {/* 2026-07 — parental gate in front of the paywall (see handleLockedTap) */}
+      <ParentPinGateModal
+        visible={pinGateVisible}
+        parentId={parentId}
+        parentEmail={parentEmail}
+        onSuccess={() => {
+          setPinGateVisible(false);
+          navigation.navigate("Paywall", { reason: "quest-locked" });
+        }}
+        onDismiss={() => setPinGateVisible(false)}
+      />
     </View>
   );
 }
