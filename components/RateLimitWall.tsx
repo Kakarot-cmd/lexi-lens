@@ -43,6 +43,15 @@ interface RateLimitWallProps {
   dailyLimit:  number;
   resetsAt:    string | null;  // ISO UTC
   onBack:      () => void;
+  /**
+   * 2026-07 — optional. When provided AND the wall is in DAILY_QUOTA mode,
+   * renders an "Ask a Grown-Up" CTA that leads (via a parent PIN gate, owned
+   * by the caller) to the paywall. Deliberately NOT shown for IP_LIMIT: a
+   * 60-second cooldown isn't an out-of-scans moment, and surfacing an upgrade
+   * ask there would be a dark pattern (the scans come back for free in a
+   * minute). Absent → no CTA, wall behaves exactly as before.
+   */
+  onUpgrade?:  () => void;
 }
 
 interface ApproachingLimitBannerProps {
@@ -140,6 +149,7 @@ export function RateLimitWall({
   dailyLimit,
   resetsAt,
   onBack,
+  onUpgrade,
 }: RateLimitWallProps) {
   const [countdown, setCountdown] = useState(secondsUntil(resetsAt));
   const [pulse]                   = useState(new Animated.Value(1));
@@ -204,6 +214,17 @@ export function RateLimitWall({
             {scansToday} / {dailyLimit} scans used today
           </Text>
         </View>
+      )}
+
+      {/* Ask-a-Grown-Up CTA — daily quota only, and only when the caller
+          wired an onUpgrade (which routes through a parent PIN gate). Framed
+          as a request for an adult, not a direct "buy" — the child taps to
+          *ask*, the grown-up decides behind the gate. The midnight countdown
+          above stays the primary message; this is the secondary option. */}
+      {isDailyQuota && onUpgrade && (
+        <TouchableOpacity style={styles.upgradeBtn} onPress={onUpgrade}>
+          <Text style={styles.upgradeBtnText}>✨ Ask a grown-up for more adventures</Text>
+        </TouchableOpacity>
       )}
 
       {/* Parent note */}
@@ -324,5 +345,21 @@ const styles = StyleSheet.create({
     color:      "#c9a0ff",
     fontSize:   15,
     fontWeight: "600",
+  },
+  upgradeBtn: {
+    backgroundColor: "rgba(245,200,66,0.14)",
+    borderColor:     "rgba(245,200,66,0.45)",
+    borderWidth:     1,
+    borderRadius:    12,
+    paddingVertical:   13,
+    paddingHorizontal: 24,
+    marginBottom:      20,
+    maxWidth:          320,
+  },
+  upgradeBtnText: {
+    color:      "#f5c842",
+    fontSize:   15,
+    fontWeight: "700",
+    textAlign:  "center",
   },
 });

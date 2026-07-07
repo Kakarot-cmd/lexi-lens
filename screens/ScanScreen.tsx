@@ -60,6 +60,7 @@ import { VictoryFusionScreen }                   from "../components/VictoryFusi
 import { RateLimitWall, ApproachingLimitBanner } from "../components/RateLimitWall";
 import { LumiHUD }                               from "../components/Lumi";
 import { addGameBreadcrumb }                     from "../lib/sentry";
+import { useGatedPaywall }                       from "../hooks/useGatedPaywall";
 
 import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "Scan">;
@@ -463,6 +464,11 @@ function ScanButton({
 
 export function ScanScreen({ route, navigation }: Props) {
   const insets = useSafeAreaInsets();
+
+  // 2026-07 — shared parent-PIN-gated path to the paywall. Used by the daily-
+  // scan-cap wall below so a child who exhausts free scans can *ask* for more,
+  // but only a grown-up (past the PIN) can actually reach the purchase screen.
+  const { openGate, GateModal } = useGatedPaywall(navigation);
 
   // Warm the native TTS engine on mount so the first word a child taps speaks
   // immediately instead of paying the one-time engine cold-start. Silent + once.
@@ -1080,6 +1086,7 @@ export function ScanScreen({ route, navigation }: Props) {
             scansToday={scansToday}
             dailyLimit={dailyLimit}
             resetsAt={resetsAt}
+            onUpgrade={() => openGate("rate-limit-daily")}
             onBack={() => {
               resetEval();
               abandonQuest();
@@ -1159,6 +1166,10 @@ export function ScanScreen({ route, navigation }: Props) {
         }
         reticleCenter={reticleCenter}
       />
+
+      {/* 2026-07 — parent PIN gate for the rate-limit "ask a grown-up" CTA.
+          Owns its own visibility; renders nothing until openGate() is called. */}
+      <GateModal />
     </View>
   );
 }
