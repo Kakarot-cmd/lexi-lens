@@ -135,12 +135,12 @@ WE DO NOT USE DATA FOR:
     title: "How AI is used",
     body: `When a child scans an object with the camera, the camera frame is sent to our evaluation service, which forwards it to our AI provider — Google's Gemini — to identify the object and check whether it matches the vocabulary quest target.
 
-WHAT IS SENT TO CLAUDE AI:
+WHAT IS SENT TO THE AI PROVIDER:
 • The camera frame (image) captured for the scan
 • The quest target word and its vocabulary properties (e.g. "fruit, red, round")
 • The child's age band — used to calibrate the difficulty of feedback language (e.g. "7–8 years")
 
-WHAT IS NEVER SENT TO CLAUDE AI:
+WHAT IS NEVER SENT TO THE AI PROVIDER:
 • The child's name, exact age, or any personal identifier
 • The parent's email address or any account information
 • Device identifiers or location
