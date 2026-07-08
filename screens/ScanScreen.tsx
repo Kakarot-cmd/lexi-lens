@@ -62,6 +62,7 @@ import { RateLimitWall, ApproachingLimitBanner } from "../components/RateLimitWa
 import { LumiHUD }                               from "../components/Lumi";
 import { addGameBreadcrumb }                     from "../lib/sentry";
 import { useGatedPaywall }                       from "../hooks/useGatedPaywall";
+import { ParentPinGateModal }                    from "../components/ParentPinGateModal";
 
 import type { RootStackParamList } from "../types/navigation";
 type Props = NativeStackScreenProps<RootStackParamList, "Scan">;
@@ -469,7 +470,7 @@ export function ScanScreen({ route, navigation }: Props) {
   // 2026-07 — shared parent-PIN-gated path to the paywall. Used by the daily-
   // scan-cap wall below so a child who exhausts free scans can *ask* for more,
   // but only a grown-up (past the PIN) can actually reach the purchase screen.
-  const { openGate, GateModal } = useGatedPaywall(navigation);
+  const { openGate, gateProps } = useGatedPaywall(navigation);
 
   // Warm the native TTS engine on mount so the first word a child taps speaks
   // immediately instead of paying the one-time engine cold-start. Silent + once.
@@ -1173,8 +1174,10 @@ export function ScanScreen({ route, navigation }: Props) {
       />
 
       {/* 2026-07 — parent PIN gate for the rate-limit "ask a grown-up" CTA.
-          Owns its own visibility; renders nothing until openGate() is called. */}
-      <GateModal />
+          Single stable modal instance; gateProps.visible toggles it, openGate()
+          opens it. Rendered directly (not via a hook-returned component) so it
+          re-renders rather than remounts on open/close. */}
+      <ParentPinGateModal {...gateProps} />
     </View>
   );
 }

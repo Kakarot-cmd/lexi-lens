@@ -12,7 +12,7 @@
  * call. That gap has now been found twice (QuestMap locked-card tap; the
  * daily-scan-cap RateLimitWall). This hook makes the gated path the default
  * so a *future* upsell surface can't accidentally ship ungated — it wires
- * itself up with one call and one rendered element.
+ * itself up with one call plus the shared modal rendered once.
  *
  * WHAT IT GUARANTEES
  * ------------------
@@ -24,11 +24,27 @@
  *
  * USAGE
  * -----
- *   const { openGate, GateModal } = useGatedPaywall(navigation);
- *   // ...
+ *   const { openGate, gateProps } = useGatedPaywall(navigation);
+ *   // ...wire a child-facing button to open the gate:
  *   <Button onPress={() => openGate("rate-limit-daily")} />
- *   // ...at the end of the component's render tree:
- *   <GateModal />
+ *   // ...and render the SHARED, module-level modal once, anywhere in the
+ *   //    component's tree, spreading the gate props onto it:
+ *   <ParentPinGateModal {...gateProps} />
+ *
+ * WHY gateProps — AND NOT A RETURNED <GateModal/> COMPONENT
+ * --------------------------------------------------------
+ * An earlier version returned a `GateModal` component built with useCallback
+ * whose deps included `visible`. Rendering <GateModal/> then changed the
+ * element *type* on every open/close, so React unmounted + remounted the
+ * underlying ParentPinGateModal each time instead of just re-rendering it with
+ * a new `visible` prop. Two consequences: the modal's exit transition was
+ * skipped (abrupt dismiss / iOS flicker), and — the real hazard for a hook
+ * meant to be REUSED — any dep-identity change while the gate was open would
+ * remount it mid-entry and wipe the child's half-typed PIN. Returning plain
+ * props and letting the caller render the stable, module-level
+ * ParentPinGateModal directly (exactly how ChildSwitcherScreen/QuestMapScreen
+ * already do it) keeps a single mounted instance whose `visible` prop simply
+ * toggles.
  *
  * The `reason` string is passed through to PaywallScreen unchanged (it drives
  * paywall copy/analytics). Existing reasons in use: "quest-locked",
@@ -42,9 +58,8 @@
  * hook past the one job it does well. Left as-is on purpose.
  */
 
-import React, { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-import { ParentPinGateModal } from "../components/ParentPinGateModal";
 import { supabase } from "../lib/supabase";
 
 /**
@@ -59,6 +74,19 @@ type PaywallNavigator = {
   navigate: (screen: "Paywall", params: { reason?: string }) => void;
 };
 
+/**
+ * Props to spread onto the shared <ParentPinGateModal {...gateProps} />.
+ * Shape mirrors ParentPinGateModalProps structurally (kept inline so this hook
+ * doesn't force an export from the modal file).
+ */
+export interface GateProps {
+  visible:     boolean;
+  parentId:    string;
+  parentEmail: string;
+  onSuccess:   () => void;
+  onDismiss:   () => void;
+}
+
 export interface UseGatedPaywallResult {
   /**
    * Opens the parent PIN gate. On successful PIN entry, navigates to
@@ -68,10 +96,12 @@ export interface UseGatedPaywallResult {
    */
   openGate: (reason: string) => void;
   /**
-   * Render this once, anywhere in the component's tree (order doesn't matter —
-   * it's a modal). It owns the gate's visibility internally.
+   * Spread onto a single <ParentPinGateModal {...gateProps} /> rendered once
+   * in the caller's tree. The modal is a stable, module-level component, so a
+   * changing gateProps object re-renders that one instance rather than
+   * remounting it.
    */
-  GateModal: React.FC;
+  gateProps: GateProps;
 }
 
 export function useGatedPaywall(navigation: PaywallNavigator): UseGatedPaywallResult {
@@ -98,18 +128,17 @@ export function useGatedPaywall(navigation: PaywallNavigator): UseGatedPaywallRe
     setVisible(true);
   }, []);
 
-  const GateModal: React.FC = useCallback(() => (
-    <ParentPinGateModal
-      visible={visible}
-      parentId={parentId}
-      parentEmail={parentEmail}
-      onSuccess={() => {
-        setVisible(false);
-        navigation.navigate("Paywall", { reason });
-      }}
-      onDismiss={() => setVisible(false)}
-    />
-  ), [visible, parentId, parentEmail, reason, navigation]);
+  const onSuccess = useCallback(() => {
+    setVisible(false);
+    navigation.navigate("Paywall", { reason });
+  }, [navigation, reason]);
 
-  return { openGate, GateModal };
+  const onDismiss = useCallback(() => {
+    setVisible(false);
+  }, []);
+
+  return {
+    openGate,
+    gateProps: { visible, parentId, parentEmail, onSuccess, onDismiss },
+  };
 }
