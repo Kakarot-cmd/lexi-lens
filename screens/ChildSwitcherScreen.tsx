@@ -526,7 +526,7 @@ export function ChildSwitcherScreen({ navigation }: Props) {
             }}
             accessibilityLabel="Parent dashboard"
           >
-            <Text style={styles.dashboardBtnText}>📊 Word Tome</Text>
+            <Text style={styles.dashboardBtnText}>🧭 Parent Hub</Text>
           </TouchableOpacity>
           <TouchableOpacity
             style={styles.signOutBtn}

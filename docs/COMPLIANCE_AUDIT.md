@@ -33,9 +33,14 @@ brand "Lexi-Lens".
   list including Anthropic, Sentry, and Upstash by name with privacy
   responsibilities for each.
 - `data-deletion.html` — full rewrite, branded "Lexi-Lens", exact in-app
-  navigation path (`Parent Dashboard → Word Tome → Parent PIN → Request
-  Account Deletion`), explicit list of what is and is not deleted, plus the
-  30-day grace-period cancellation note.
+  navigation path (`ChildSwitcher → Parent Hub → Parent PIN → Parent
+  Dashboard → Account & Privacy → Delete Account & Data`), explicit list of
+  what is and is not deleted, plus the 30-day grace-period cancellation note.
+  **2026-07-08 correction:** the ChildSwitcher button was renamed from
+  "Word Tome" to "Parent Hub" (App Review discoverability fix, prompted by
+  the 5.1.1(v) / 2.1(b) rejections on build 47). The live `data-deletion.html`
+  on njlabs.app is hosted outside this repo and still needs a matching
+  manual edit to this navigation string.
 
 ### Manual step required
 After deploying the new HTML files to the public host, paste the same URLs

@@ -715,7 +715,7 @@ export function QuestMapScreen({ navigation }: Props) {
     <View style={[styles.root, { paddingTop: insets.top }]}>
       {/* ── Screen header ───────────────────────────────── */}
       <View style={styles.header}>
-        {/* Chart icon removed — ParentDashboard accessible via PIN-gated Word Tome on ChildSwitcher */}
+        {/* Chart icon removed — ParentDashboard accessible via PIN-gated Parent Hub button on ChildSwitcher */}
         <View style={styles.headerCenter}>
           <Text style={styles.headerTitle}>Dungeon Map</Text>
           {activeChild && (
