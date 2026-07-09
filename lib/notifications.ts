@@ -33,6 +33,13 @@ const BADGE_CHANNEL_ID = "lexi-achievements";
 // parent actually toggles the reminder." Naming mirrors the existing
 // lexilens.lumi.* keys in components/Lumi/lumiSounds.ts.
 const KEY_BADGE_NOTIFS_ENABLED = "lexilens.notifications.badgeEnabled";
+// 2026-07 — parent-chosen reminder time. Stored as "HH:MM" (24-hour, local).
+// The DAILY trigger fires at this hour/minute in the device's OWN local
+// timezone, so a stored "18:00" is 6 PM wherever the user is — there is no
+// global/UTC anchor and no cross-timezone midnight risk.
+const KEY_REMINDER_TIME       = "lexilens.notifications.reminderTime";
+const DEFAULT_REMINDER_HOUR   = 17;
+const DEFAULT_REMINDER_MINUTE = 0;
 
 /** Lazily load expo-notifications — never at module init time. */
 async function getNotifications() {
@@ -142,6 +149,44 @@ export async function cancelDailyReminder(): Promise<void> {
   } catch {
     // Never scheduled — ignore
   }
+}
+
+// ─── Reminder-time preference ─────────────────────────────────────────────────
+
+export interface ReminderTime { hour: number; minute: number; }
+
+/**
+ * Parent-chosen daily-reminder time (local). Falls back to 18:00 (the prior
+ * hardcoded default) when nothing is stored or the stored value is malformed,
+ * so existing installs keep their current 6 PM behaviour until the parent
+ * changes it. Pure AsyncStorage read — never touches the native notifications
+ * module, so it's cheap to call on mount.
+ */
+export async function getReminderTime(): Promise<ReminderTime> {
+  try {
+    const stored = await AsyncStorage.getItem(KEY_REMINDER_TIME);
+    if (stored) {
+      const [h, m] = stored.split(":").map((n) => parseInt(n, 10));
+      if (Number.isInteger(h) && Number.isInteger(m) &&
+          h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+        return { hour: h, minute: m };
+      }
+    }
+  } catch { /* fall through to default */ }
+  return { hour: DEFAULT_REMINDER_HOUR, minute: DEFAULT_REMINDER_MINUTE };
+}
+
+/**
+ * Persists the chosen reminder time. Does NOT (re)schedule — the caller decides
+ * whether to reschedule (only meaningful while the reminder is enabled). Values
+ * are clamped to valid ranges defensively.
+ */
+export async function setReminderTime(hour: number, minute: number): Promise<void> {
+  const h = Math.min(23, Math.max(0, Math.floor(hour)));
+  const m = Math.min(59, Math.max(0, Math.floor(minute)));
+  try {
+    await AsyncStorage.setItem(KEY_REMINDER_TIME, `${h}:${m}`);
+  } catch { /* non-fatal */ }
 }
 
 // ─── Tap handler ──────────────────────────────────────────────────────────────

@@ -68,6 +68,8 @@ import {
 import {
   getBadgeNotificationsEnabled,
   setBadgeNotificationsEnabled,
+  getReminderTime,
+  setReminderTime,
 } from "../lib/notifications";
 
 import type { RootStackParamList } from "../types/navigation";
@@ -153,6 +155,19 @@ const P = {
   fireBg:       "#fff7ed",
   fireBorder:   "#fed7aa",
 };
+
+// Preset reminder times a parent can choose from: 7:00 AM → 9:00 PM in 30-min
+// steps. Kept as a fixed list (rather than a native time wheel) so no extra
+// native dependency is pulled in and behaviour is identical on iOS + Android.
+// Each entry is local time; the DAILY trigger fires it in the device's own zone.
+const REMINDER_TIME_OPTIONS: { hour: number; minute: number }[] = (() => {
+  const out: { hour: number; minute: number }[] = [];
+  for (let h = 7; h <= 21; h++) {
+    out.push({ hour: h, minute: 0 });
+    if (h !== 21) out.push({ hour: h, minute: 30 });
+  }
+  return out;
+})();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -504,15 +519,18 @@ function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
     let cancelled = false;
     (async () => {
       try {
-        const [s, h, b] = await Promise.all([
+        const [s, h, b, rt] = await Promise.all([
           isLumiSoundEnabled(),
           isLumiHapticsEnabled(),
           getBadgeNotificationsEnabled(),
+          getReminderTime(),
         ]);
         if (!cancelled) {
           setSoundOn(s);
           setHapticsOn(h);
           setBadgeNotifsOn(b);
+          setReminderHour(rt.hour);
+          setReminderMinute(rt.minute);
         }
       } catch {
         // Use defaults
@@ -679,6 +697,11 @@ export function ParentDashboard({ navigation }: Props) {
 
   const [streakInfo,          setStreakInfo]          = useState<StreakInfo>({ currentStreak: 0, longestStreak: 0 });
   const [notifEnabled,        setNotifEnabled]        = useState(false);
+  // Parent-chosen daily-reminder time (local). Default mirrors the prior
+  // hardcoded 6 PM until the parent picks another time.
+  const [reminderHour,        setReminderHour]        = useState(17);
+  const [reminderMinute,      setReminderMinute]      = useState(0);
+  const [timePickerVisible,   setTimePickerVisible]   = useState(false);
   const [showGenerator,       setShowGenerator]       = useState(false);
   const [showAudioSheet,      setShowAudioSheet]      = useState(false);
   const [showPrivacyPolicy,   setShowPrivacyPolicy]   = useState(false);
@@ -852,7 +875,7 @@ export function ParentDashboard({ navigation }: Props) {
     try {
       if (val) {
         const { scheduleDailyQuestReminder } = await import("../lib/notifications");
-        await scheduleDailyQuestReminder(18, 0, selectedChild?.display_name ?? "");
+        await scheduleDailyQuestReminder(reminderHour, reminderMinute, selectedChild?.display_name ?? "");
       } else {
         const { cancelDailyReminder } = await import("../lib/notifications");
         await cancelDailyReminder();
@@ -868,6 +891,32 @@ export function ParentDashboard({ navigation }: Props) {
           "Couldn't turn on reminders. Please allow notifications for Skanlore in your device Settings, then try again."
         );
       }
+    }
+  };
+
+  // Format a 24-hour time as a friendly 12-hour label, e.g. (18,0) → "6:00 PM".
+  const formatTime = (hour: number, minute: number): string => {
+    const period = hour >= 12 ? "PM" : "AM";
+    const h12    = hour % 12 === 0 ? 12 : hour % 12;
+    return `${h12}:${String(minute).padStart(2, "0")} ${period}`;
+  };
+
+  // Parent picked a new reminder time. Persist it, update local state, and — if
+  // the reminder is currently on — reschedule (scheduleDailyQuestReminder
+  // cancels the old one internally, so this is a clean replace). If the reminder
+  // is off, we only persist; it'll be used next time they enable it.
+  const handleTimeSelect = async (hour: number, minute: number) => {
+    setReminderHour(hour);
+    setReminderMinute(minute);
+    setTimePickerVisible(false);
+    try {
+      await setReminderTime(hour, minute);
+      if (notifEnabled) {
+        const { scheduleDailyQuestReminder } = await import("../lib/notifications");
+        await scheduleDailyQuestReminder(hour, minute, selectedChild?.display_name ?? "");
+      }
+    } catch (e) {
+      console.warn("[notifications] time change failed:", e);
     }
   };
 
@@ -1262,7 +1311,8 @@ export function ParentDashboard({ navigation }: Props) {
               <View style={{ flex: 1 }}>
                 <Text style={styles.notifLabel}>Daily Quest Reminder</Text>
                 <Text style={styles.notifSub}>
-                  Send {selectedChild?.display_name ?? "your child"} a nudge at 6:00 PM each day
+                  Send {selectedChild?.display_name ?? "your child"} a nudge at{" "}
+                  {formatTime(reminderHour, reminderMinute)} each day
                 </Text>
               </View>
               <Switch
@@ -1273,7 +1323,83 @@ export function ParentDashboard({ navigation }: Props) {
                 ios_backgroundColor={P.warmBorder}
               />
             </View>
+
+            {/* Time selector — only meaningful while the reminder is on. */}
+            {notifEnabled && (
+              <TouchableOpacity
+                style={styles.reminderTimeRow}
+                onPress={() => setTimePickerVisible(true)}
+                accessibilityRole="button"
+                accessibilityLabel={`Reminder time, currently ${formatTime(reminderHour, reminderMinute)}. Tap to change.`}
+              >
+                <Text style={styles.reminderTimeLabel}>Reminder time</Text>
+                <View style={styles.reminderTimeValueWrap}>
+                  <Text style={styles.reminderTimeValue}>
+                    ⏰ {formatTime(reminderHour, reminderMinute)}
+                  </Text>
+                  <Text style={styles.reminderTimeChevron}>›</Text>
+                </View>
+              </TouchableOpacity>
+            )}
           </View>
+
+          {/* ── Reminder-time picker modal ───────────────── */}
+          <Modal
+            visible={timePickerVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setTimePickerVisible(false)}
+          >
+            <TouchableOpacity
+              style={styles.timePickerBackdrop}
+              activeOpacity={1}
+              onPress={() => setTimePickerVisible(false)}
+            >
+              <TouchableOpacity style={styles.timePickerCard} activeOpacity={1}>
+                <Text style={styles.timePickerTitle}>Choose reminder time</Text>
+                <Text style={styles.timePickerSub}>
+                  Fires at this time in your local timezone.
+                </Text>
+                <ScrollView
+                  style={styles.timePickerList}
+                  showsVerticalScrollIndicator={false}
+                >
+                  {REMINDER_TIME_OPTIONS.map((opt) => {
+                    const selected =
+                      opt.hour === reminderHour && opt.minute === reminderMinute;
+                    return (
+                      <TouchableOpacity
+                        key={`${opt.hour}:${opt.minute}`}
+                        style={[
+                          styles.timeOption,
+                          selected && styles.timeOptionSelected,
+                        ]}
+                        onPress={() => handleTimeSelect(opt.hour, opt.minute)}
+                        accessibilityRole="button"
+                        accessibilityState={{ selected }}
+                      >
+                        <Text
+                          style={[
+                            styles.timeOptionText,
+                            selected && styles.timeOptionTextSelected,
+                          ]}
+                        >
+                          {formatTime(opt.hour, opt.minute)}
+                        </Text>
+                        {selected && <Text style={styles.timeOptionCheck}>✓</Text>}
+                      </TouchableOpacity>
+                    );
+                  })}
+                </ScrollView>
+                <TouchableOpacity
+                  style={styles.timePickerClose}
+                  onPress={() => setTimePickerVisible(false)}
+                >
+                  <Text style={styles.timePickerCloseText}>Close</Text>
+                </TouchableOpacity>
+              </TouchableOpacity>
+            </TouchableOpacity>
+          </Modal>
 
           {/* ── Deletion-pending banner ──────────────────── */}
           {deletionScheduledAt && (
@@ -1642,6 +1768,40 @@ const styles = StyleSheet.create({
   notifRow:     { flexDirection: "row", alignItems: "center", gap: 12 },
   notifLabel:   { fontSize: 15, fontWeight: "600", color: P.inkBrown },
   notifSub:     { fontSize: 12, color: P.inkLight, marginTop: 2, lineHeight: 17 },
+  reminderTimeRow: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    marginTop: 14, paddingTop: 14, borderTopWidth: 1, borderTopColor: P.warmBorder,
+  },
+  reminderTimeLabel:    { fontSize: 14, fontWeight: "600", color: P.inkMid },
+  reminderTimeValueWrap:{ flexDirection: "row", alignItems: "center", gap: 6 },
+  reminderTimeValue:    { fontSize: 14, fontWeight: "700", color: P.amberAccent },
+  reminderTimeChevron:  { fontSize: 20, color: P.inkFaint, marginTop: -2 },
+  timePickerBackdrop: {
+    flex: 1, backgroundColor: "rgba(61,42,15,0.45)",
+    justifyContent: "center", alignItems: "center", padding: 24,
+  },
+  timePickerCard: {
+    width: "100%", maxWidth: 340, maxHeight: "70%",
+    backgroundColor: P.cream, borderRadius: 18, padding: 20,
+    borderWidth: 1, borderColor: P.warmBorder,
+  },
+  timePickerTitle: { fontSize: 17, fontWeight: "700", color: P.inkBrown },
+  timePickerSub:   { fontSize: 12, color: P.inkLight, marginTop: 4, marginBottom: 12 },
+  timePickerList:  { flexGrow: 0 },
+  timeOption: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    paddingVertical: 12, paddingHorizontal: 14, borderRadius: 12, marginBottom: 6,
+    backgroundColor: P.parchment, borderWidth: 1, borderColor: P.warmBorder,
+  },
+  timeOptionSelected:     { backgroundColor: P.amberLight, borderColor: P.amberAccent },
+  timeOptionText:         { fontSize: 15, color: P.inkMid, fontWeight: "600" },
+  timeOptionTextSelected: { color: P.inkBrown, fontWeight: "700" },
+  timeOptionCheck:        { fontSize: 15, color: P.amberAccent, fontWeight: "700" },
+  timePickerClose: {
+    marginTop: 8, paddingVertical: 12, borderRadius: 12, alignItems: "center",
+    backgroundColor: P.parchment, borderWidth: 1, borderColor: P.warmBorder,
+  },
+  timePickerCloseText: { fontSize: 15, fontWeight: "700", color: P.inkBrown },
 
   deletionBanner: {
     margin:          20,
