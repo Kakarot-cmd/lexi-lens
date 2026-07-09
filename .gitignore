@@ -30,8 +30,17 @@ yarn-error.*
 .DS_Store
 *.pem
 
-# local env files
+# local env files — real values, NEVER commit.
+# The old ".env*.local" only matched names ENDING in ".local", so it silently
+# missed ".env.local.staging" (ends .staging) and "env.local.prod" (no leading
+# dot, ends .prod) — both of which got committed. The explicit globs below
+# catch every local env variant, while the negations keep the safe,
+# value-less placeholders tracked.
 .env*.local
+.env.local.*
+env.local.*
+!.env.local.template
+!.env.example
 
 # typescript
 *.tsbuildinfo
