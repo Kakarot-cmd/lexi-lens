@@ -151,6 +151,31 @@ export async function cancelDailyReminder(): Promise<void> {
   }
 }
 
+// ─── Is the daily reminder ACTUALLY scheduled? ────────────────────────────────
+
+/**
+ * Reads the OS's scheduled-notification list and looks for our stable
+ * REMINDER_ID_KEY identifier.
+ *
+ * WHY THIS EXISTS: ParentDashboard's `notifEnabled` was plain `useState(false)`
+ * with no hydration, so the toggle reset to OFF on every mount even when a
+ * reminder was genuinely scheduled — and because the reminder-time row only
+ * renders when `notifEnabled` is true, the parent's chosen time was invisible
+ * and un-editable after any app restart. Hydrating from AsyncStorage would only
+ * have moved the lie: the source of truth for "is a reminder on" is the OS's
+ * schedule, not a preference flag (the OS can revoke permission, the user can
+ * clear it in Settings, a reinstall wipes it). This asks the OS directly.
+ */
+export async function isDailyReminderScheduled(): Promise<boolean> {
+  try {
+    const N = await getNotifications();
+    const scheduled = await N.getAllScheduledNotificationsAsync();
+    return scheduled.some((n: { identifier?: string }) => n.identifier === REMINDER_ID_KEY);
+  } catch {
+    return false;
+  }
+}
+
 // ─── Reminder-time preference ─────────────────────────────────────────────────
 
 export interface ReminderTime { hour: number; minute: number; }

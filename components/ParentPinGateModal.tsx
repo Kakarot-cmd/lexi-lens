@@ -62,6 +62,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import * as Haptics from "expo-haptics";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { supabase } from "../lib/supabase";
+import { ParentalGateChallenge } from "./ParentalGateChallenge";
 
 // ─── Palette (matches the app's dark purple theme) ───────────────────────────
 
@@ -189,17 +190,79 @@ function ForgotPinView({
   onRecovered: () => void;
   onCancel:    () => void;
 }) {
+  // ── Which re-auth method does THIS account actually have? ───────────────────
+  //
+  // The original implementation hard-coded supabase.auth.signInWithPassword().
+  // That silently assumed every parent is an email/password signup. Since the
+  // native Google + Apple ID-token flow shipped (2026-06-23), OAuth parents
+  // have NO Supabase password at all — signInWithPassword returns "Invalid
+  // login credentials" for them no matter what they type, so a forgotten PIN
+  // locked them out of Parent Hub permanently, and with it out of
+  // "Account & Privacy → Delete Account & Data" (Guideline 5.1.1(v)).
+  //
+  // Fix: branch on the account's real identities.
+  //   • has an `email` identity  → password re-auth (unchanged; zero regression
+  //     on the path App Review uses, since the demo account is email/password)
+  //   • OAuth-only (google/apple) → one-time code emailed to the account address
+  //
+  // Why an emailed code and NOT "just re-run Google/Apple sign-in": the native
+  // provider sheet can be satisfied with a single tap on an already-signed-in
+  // account (and Apple's is satisfied by whatever face is enrolled on the
+  // device — which on a kid's iPad is the kid). That would make the PIN
+  // decorative: a child solves the arithmetic gate, taps "Forgot PIN", taps
+  // the Google chip, and resets the parent's PIN. Control of the parent's
+  // inbox is the ownership proof this app already relies on for COPPA consent,
+  // and a child does not have it.
+  type ReauthMethod = "loading" | "password" | "otp";
+
+  const [method,   setMethod]     = useState<ReauthMethod>("loading");
+  const [provider, setProvider]   = useState<string>("");
   const [password, setPassword]   = useState("");
+  const [code,     setCode]       = useState("");
+  const [codeSent, setCodeSent]   = useState(false);
+  const [cooldown, setCooldown]   = useState(0);
   const [loading,  setLoading]    = useState(false);
   const [error,    setError]      = useState<string | null>(null);
   const [success,  setSuccess]    = useState(false);
 
+  useEffect(() => {
+    let cancelled = false;
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (cancelled) return;
+      const identities = user?.identities ?? [];
+      const hasEmail =
+        identities.some((i) => i.provider === "email") ||
+        // Defensive: if identities is unavailable for any reason, fall back to
+        // the previous behaviour rather than locking an email user out.
+        identities.length === 0;
+      const social = identities.find((i) => i.provider !== "email");
+      setProvider(social?.provider === "apple" ? "Apple" : social?.provider === "google" ? "Google" : "");
+      setMethod(hasEmail ? "password" : "otp");
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Resend cooldown
+  useEffect(() => {
+    if (cooldown <= 0) return;
+    const id = setInterval(() => setCooldown((c) => (c <= 1 ? 0 : c - 1)), 1000);
+    return () => clearInterval(id);
+  }, [cooldown]);
+
+  const finish = useCallback(async () => {
+    await clearPin(parentId);
+    setSuccess(true);
+    setLoading(false);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    setTimeout(onRecovered, 900);
+  }, [parentId, onRecovered]);
+
+  // ── Path A: email/password accounts (unchanged behaviour) ───────────────────
   const handleRecover = async () => {
     if (!password) return;
     setLoading(true);
     setError(null);
 
-    // Re-authenticate to confirm identity
     const { error: authErr } = await supabase.auth.signInWithPassword({
       email:    parentEmail,
       password,
@@ -212,14 +275,61 @@ function ForgotPinView({
       return;
     }
 
-    // Clear the stored PIN — next open will be SET mode
-    await clearPin(parentId);
-    setSuccess(true);
-    setLoading(false);
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-
-    setTimeout(onRecovered, 900);
+    await finish();
   };
+
+  // ── Path B: OAuth-only accounts — emailed one-time code ─────────────────────
+  const handleSendCode = async () => {
+    if (!parentEmail) {
+      setError("No email address is attached to this account. Contact support.");
+      return;
+    }
+    setLoading(true);
+    setError(null);
+
+    // shouldCreateUser:false — this must never mint a new account, only
+    // re-verify the existing one.
+    const { error: otpErr } = await supabase.auth.signInWithOtp({
+      email:   parentEmail,
+      options: { shouldCreateUser: false },
+    });
+
+    setLoading(false);
+
+    if (otpErr) {
+      setError("Could not send the code. Please try again in a minute.");
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      return;
+    }
+
+    setCodeSent(true);
+    setCooldown(60);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  };
+
+  const handleVerifyCode = async () => {
+    if (code.length < 6) return;
+    setLoading(true);
+    setError(null);
+
+    const { error: verifyErr } = await supabase.auth.verifyOtp({
+      email: parentEmail,
+      token: code,
+      type:  "email",
+    });
+
+    if (verifyErr) {
+      setError("That code isn't right, or it has expired.");
+      setCode("");
+      setLoading(false);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      return;
+    }
+
+    await finish();
+  };
+
+  // ─── Render ─────────────────────────────────────────────────────────────────
 
   if (success) {
     return (
@@ -227,6 +337,91 @@ function ForgotPinView({
         <Text style={styles.successIcon}>✓</Text>
         <Text style={styles.forgotTitle}>Identity confirmed</Text>
         <Text style={styles.forgotSub}>You can now set a new PIN.</Text>
+      </View>
+    );
+  }
+
+  if (method === "loading") {
+    return (
+      <View style={styles.forgotWrap}>
+        <ActivityIndicator color={C.purpleLight} size="large" />
+      </View>
+    );
+  }
+
+  if (method === "otp") {
+    return (
+      <View style={styles.forgotWrap}>
+        <Text style={styles.forgotTitle}>Confirm your identity</Text>
+        <Text style={styles.forgotSub}>
+          {provider
+            ? `This account signs in with ${provider}, so it has no password. We'll email a one-time code instead.`
+            : "We'll email a one-time code to confirm it's you."}
+        </Text>
+
+        <Text style={styles.emailLabel}>{parentEmail}</Text>
+
+        {codeSent && (
+          <TextInput
+            style={styles.passwordInput}
+            placeholder="6-digit code"
+            placeholderTextColor={C.textDim}
+            keyboardType="number-pad"
+            maxLength={6}
+            value={code}
+            onChangeText={(t) => { setCode(t.replace(/[^0-9]/g, "")); setError(null); }}
+            autoFocus
+            editable={!loading}
+          />
+        )}
+
+        {error && <Text style={styles.errorText}>{error}</Text>}
+
+        {codeSent && (
+          <TouchableOpacity
+            style={styles.resendLink}
+            onPress={handleSendCode}
+            disabled={loading || cooldown > 0}
+          >
+            <Text style={styles.resendText}>
+              {cooldown > 0 ? `Resend code in ${cooldown}s` : "Resend code"}
+            </Text>
+          </TouchableOpacity>
+        )}
+
+        <View style={styles.forgotBtnRow}>
+          <TouchableOpacity
+            style={styles.forgotCancelBtn}
+            onPress={onCancel}
+            disabled={loading}
+          >
+            <Text style={styles.forgotCancelText}>Cancel</Text>
+          </TouchableOpacity>
+
+          {codeSent ? (
+            <TouchableOpacity
+              style={[styles.forgotConfirmBtn, code.length < 6 && styles.btnDisabled]}
+              onPress={handleVerifyCode}
+              disabled={loading || code.length < 6}
+            >
+              {loading
+                ? <ActivityIndicator color={C.bg} size="small" />
+                : <Text style={styles.forgotConfirmText}>Confirm</Text>
+              }
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              style={styles.forgotConfirmBtn}
+              onPress={handleSendCode}
+              disabled={loading}
+            >
+              {loading
+                ? <ActivityIndicator color={C.bg} size="small" />
+                : <Text style={styles.forgotConfirmText}>Email me a code</Text>
+              }
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
     );
   }
@@ -285,9 +480,30 @@ interface ParentPinGateModalProps {
   parentEmail: string;
   onSuccess:   () => void;
   onDismiss:   () => void;
+  /**
+   * APPLE GUIDELINE 1.3 (Kids Category) — commerce surfaces.
+   *
+   * When true, the randomised arithmetic ParentalGateChallenge runs on EVERY
+   * open and is the sole unlock; the PIN is never consulted. Set this on any
+   * surface that can reach a real purchase. Rationale: a PIN is a shared
+   * secret a child can watch a parent type, AND on a fresh install (the state
+   * App Review is always in) there is no PIN at all, so the modal would open
+   * in SET mode and let the user invent their own gate. A randomised
+   * challenge has no stored state, so it cannot be pre-satisfied, disabled,
+   * memorised, or reset by reinstalling.
+   *
+   * When false/absent (parent-only, non-commerce surfaces: Parent Hub entry,
+   * child-profile deletion) the PIN flow is kept, but the challenge is now
+   * mandatory before a PIN can be CREATED — closing the same fresh-install
+   * hole on those surfaces too.
+   */
+  alwaysChallenge?: boolean;
 }
 
-type ModalMode = "loading" | "set" | "confirm_set" | "verify" | "forgot";
+type ModalMode = "loading" | "challenge" | "set" | "confirm_set" | "verify" | "forgot";
+
+/** What happens once the arithmetic challenge is passed. */
+type ChallengeIntent = "unlock" | "set";
 
 export function ParentPinGateModal({
   visible,
@@ -295,6 +511,7 @@ export function ParentPinGateModal({
   parentEmail,
   onSuccess,
   onDismiss,
+  alwaysChallenge = false,
 }: ParentPinGateModalProps) {
   const insets = useSafeAreaInsets();
 
@@ -304,6 +521,7 @@ export function ParentPinGateModal({
   const [attempts,    setAttempts]    = useState(0);
   const [errorMsg,    setErrorMsg]    = useState<string | null>(null);
   const [locked,      setLocked]      = useState(false);
+  const [challengeIntent, setChallengeIntent] = useState<ChallengeIntent>("unlock");
 
   const shakeAnim  = useRef(new Animated.Value(0)).current;
   const fadeAnim   = useRef(new Animated.Value(0)).current;
@@ -319,19 +537,43 @@ export function ParentPinGateModal({
         setMode("loading");
         setAttempts(0);
         setLocked(false);
+        setChallengeIntent("unlock");
       }, 300);
       return;
     }
 
     setMode("loading");
-    loadStoredPin(parentId).then((stored) => {
-      setMode(stored ? "verify" : "set");
+
+    const reveal = () => {
       fadeAnim.setValue(0);
       Animated.timing(fadeAnim, {
         toValue: 1, duration: 220, useNativeDriver: true,
       }).start();
+    };
+
+    // Commerce surfaces: the challenge IS the gate, every time. No PIN read,
+    // no PIN write, no state that could make it a no-op.
+    if (alwaysChallenge) {
+      setChallengeIntent("unlock");
+      setMode("challenge");
+      reveal();
+      return;
+    }
+
+    loadStoredPin(parentId).then((stored) => {
+      if (stored) {
+        setMode("verify");
+      } else {
+        // No PIN yet. Previously this dropped straight into SET mode, which
+        // let ANY user (child or App Reviewer on a fresh install) define the
+        // gate themselves and walk through it. The challenge now stands in
+        // front of PIN creation.
+        setChallengeIntent("set");
+        setMode("challenge");
+      }
+      reveal();
     });
-  }, [visible, parentId]);
+  }, [visible, parentId, alwaysChallenge]);
 
   // ── Shake animation on wrong PIN ────────────────────────────────────────────
   const triggerShake = useCallback(() => {
@@ -418,13 +660,13 @@ export function ParentPinGateModal({
   }, [pin, mode, firstPin, parentId, attempts, locked, triggerShake, onSuccess]);
 
   // ── Labels per mode ─────────────────────────────────────────────────────────
-  const modeTitle: Record<Exclude<ModalMode, "loading" | "forgot">, string> = {
+  const modeTitle: Record<Exclude<ModalMode, "loading" | "forgot" | "challenge">, string> = {
     set:         "Create a parent PIN",
     confirm_set: "Confirm your PIN",
     verify:      "Parent access",
   };
 
-  const modeSub: Record<Exclude<ModalMode, "loading" | "forgot">, string> = {
+  const modeSub: Record<Exclude<ModalMode, "loading" | "forgot" | "challenge">, string> = {
     set:         "Set a 4-digit PIN to protect\nparent-only features.",
     confirm_set: "Enter the same PIN again\nto confirm.",
     verify:      "Enter your PIN to open\nthe AI Quest Creator.",
@@ -480,13 +722,34 @@ export function ParentPinGateModal({
               parentEmail={parentEmail}
               parentId={parentId}
               onRecovered={() => {
-                setMode("set");
+                // Recovery clears the stored PIN. Re-arm the challenge before a
+                // new PIN can be created, so the recovery path can't be used as
+                // a back door into an ungated SET screen.
+                setChallengeIntent("set");
+                setMode("challenge");
                 setPin("");
                 setAttempts(0);
                 setLocked(false);
                 setErrorMsg(null);
               }}
               onCancel={() => setMode("verify")}
+            />
+          )}
+
+          {/* Parental gate — randomised arithmetic, no off switch (Apple 1.3) */}
+          {mode === "challenge" && (
+            <ParentalGateChallenge
+              purpose={challengeIntent === "unlock" ? "commerce" : "setup"}
+              onPass={() => {
+                if (challengeIntent === "unlock") {
+                  setTimeout(onSuccess, 120);
+                } else {
+                  setPin("");
+                  setFirstPin("");
+                  setErrorMsg(null);
+                  setMode("set");
+                }
+              }}
             />
           )}
 
@@ -715,6 +978,17 @@ const styles = StyleSheet.create({
     marginBottom:     12,
     fontWeight:       "500",
   },
+  resendLink: {
+    marginTop:  10,
+    alignSelf:  "center",
+    paddingVertical: 6,
+  },
+  resendText: {
+    color:      C.purpleLight,
+    fontSize:   13,
+    fontWeight: "600",
+  },
+
   passwordInput: {
     width:            "100%",
     height:           52,

@@ -775,6 +775,7 @@ export function QuestMapScreen({ navigation }: Props) {
 
       {/* 2026-07 — parental gate in front of the paywall (see handleLockedTap) */}
       <ParentPinGateModal
+        alwaysChallenge
         visible={pinGateVisible}
         parentId={parentId}
         parentEmail={parentEmail}

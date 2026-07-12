@@ -85,6 +85,15 @@ export interface GateProps {
   parentEmail: string;
   onSuccess:   () => void;
   onDismiss:   () => void;
+  /**
+   * Always true here. Every surface that routes through this hook can reach a
+   * live purchasePackage(), so it gets the randomised arithmetic challenge on
+   * every open rather than the 4-digit PIN. See ParentPinGateModal's prop doc:
+   * on a fresh install (App Review's state, and every new child's) the PIN
+   * modal opened in SET mode and let the user define the gate themselves —
+   * i.e. no gate at all. Apple flagged exactly this under Guideline 1.3.
+   */
+  alwaysChallenge: true;
 }
 
 export interface UseGatedPaywallResult {
@@ -139,6 +148,6 @@ export function useGatedPaywall(navigation: PaywallNavigator): UseGatedPaywallRe
 
   return {
     openGate,
-    gateProps: { visible, parentId, parentEmail, onSuccess, onDismiss },
+    gateProps: { visible, parentId, parentEmail, onSuccess, onDismiss, alwaysChallenge: true },
   };
 }

@@ -50,6 +50,10 @@ import { PrivacyPolicyScreen }     from "../components/PrivacyPolicyScreen";
 import { RecentSessionsPanel }     from "../components/RecentSessionsPanel";
 import { MasteryRadarPanel }       from "../components/MasteryRadarPanel";
 import { usePdfExport }            from "../hooks/usePdfExport";
+// 2026-07 — Apple 1.3 (Kids Category): every route to PaywallScreen now runs
+// through the shared parental gate. See hooks/useGatedPaywall.
+import { useGatedPaywall }         from "../hooks/useGatedPaywall";
+import { ParentPinGateModal }      from "../components/ParentPinGateModal";
 import SiblingLeaderboard          from "../components/SiblingLeaderboard";
 // N4 — Achievement badge grid
 import { AchievementBadgeGrid }    from "../components/AchievementBadgeGrid";
@@ -70,6 +74,7 @@ import {
   setBadgeNotificationsEnabled,
   getReminderTime,
   setReminderTime,
+  isDailyReminderScheduled,
 } from "../lib/notifications";
 
 import type { RootStackParamList } from "../types/navigation";
@@ -316,10 +321,15 @@ function SubscriptionSection({
   const planLabel          = planLabelFromDetails(details);
   const renewalLabel       = renewalLabelFromDetails(details);
 
+  // Apple 1.3: reaching ParentDashboard already required the PIN gate, but the
+  // PIN is a secret a child can watch a parent type. Commerce gets its own
+  // randomised challenge every time — no exceptions, no stored "already done".
+  const { openGate, gateProps } = useGatedPaywall(navigation);
+
   const handleUpgrade = useCallback(() => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    navigation.navigate("Paywall", { reason: "parent-dashboard" });
-  }, [navigation]);
+    openGate("parent-dashboard");
+  }, [openGate]);
 
   const handleManage = useCallback(() => {
     // Store-managed subscription. RC also exposes `details.managementUrl` but
@@ -386,6 +396,9 @@ function SubscriptionSection({
           </Text>
         </TouchableOpacity>
       )}
+
+      {/* Parental gate in front of the upgrade CTA (Apple 1.3) */}
+      <ParentPinGateModal {...gateProps} />
     </View>
   );
 }
@@ -519,18 +532,21 @@ function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
     let cancelled = false;
     (async () => {
       try {
-        const [s, h, b, rt] = await Promise.all([
+        // NOTE: reminder-time hydration used to live here and called
+        // setReminderHour/setReminderMinute — setters that belong to
+        // ParentDashboard, not to this component. They were never in scope, so
+        // the call threw a ReferenceError that the catch below swallowed
+        // silently. Moved to ParentDashboard's own mount effect, where the
+        // state actually lives.
+        const [s, h, b] = await Promise.all([
           isLumiSoundEnabled(),
           isLumiHapticsEnabled(),
           getBadgeNotificationsEnabled(),
-          getReminderTime(),
         ]);
         if (!cancelled) {
           setSoundOn(s);
           setHapticsOn(h);
           setBadgeNotifsOn(b);
-          setReminderHour(rt.hour);
-          setReminderMinute(rt.minute);
         }
       } catch {
         // Use defaults
@@ -726,6 +742,43 @@ export function ParentDashboard({ navigation }: Props) {
   }, []);
   const [questsOpen,          setQuestsOpen]          = useState(false);
 
+  // Hydrate the daily-reminder block on mount.
+  //
+  //   notifEnabled  ← the OS's actual scheduled-notification list (NOT a stored
+  //                   preference flag — the OS is the only honest source of
+  //                   truth, and it can be revoked in Settings behind our back)
+  //   reminder time ← AsyncStorage
+  //
+  // Before this, both were session-only `useState` defaults. Two consequences,
+  // both live: the toggle read OFF on every app launch even with a reminder
+  // genuinely scheduled, and — because the time row only renders when the
+  // toggle is on — the parent's chosen reminder time was invisible and
+  // un-editable after any restart.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [scheduled, rt] = await Promise.all([
+          isDailyReminderScheduled(),
+          getReminderTime(),
+        ]);
+        if (cancelled) return;
+        setNotifEnabled(scheduled);
+        setReminderHour(rt.hour);
+        setReminderMinute(rt.minute);
+      } catch {
+        // Leave the defaults (off / 17:00) — non-fatal.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Apple 1.3 — the two remaining upsell exits from this screen (locked PDF
+  // export, locked AI quest generator) route through the parental gate rather
+  // than navigating straight to a live purchasePackage().
+  const { openGate: openPaywallGate, gateProps: paywallGateProps } =
+    useGatedPaywall(navigation);
+
   const {
     exportPdf,
     isExporting,
@@ -736,7 +789,7 @@ export function ParentDashboard({ navigation }: Props) {
   } = usePdfExport({
     onGate: (gate) => {
       if (gate.httpStatus === 402) {
-        navigation.navigate("Paywall", { reason: gate.reason ?? "export-tome-locked" });
+        openPaywallGate(gate.reason ?? "export-tome-locked");
       } else {
         Alert.alert("Monthly limit reached", gate.message);
       }
@@ -1009,9 +1062,12 @@ export function ParentDashboard({ navigation }: Props) {
         onClose={() => setShowGenerator(false)}
         onNeedPremium={(reason) => {
           setShowGenerator(false);
-          navigation.navigate("Paywall", { reason: reason ?? "generate-quest-locked" });
+          openPaywallGate(reason ?? "generate-quest-locked");
         }}
       />
+
+      {/* Parental gate for the two upsell exits above (Apple 1.3) */}
+      <ParentPinGateModal {...paywallGateProps} />
 
       {/* Sound & Music sheet (opened from the header 🎵) */}
       <AudioSettingsSheet
