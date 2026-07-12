@@ -1013,7 +1013,13 @@ export function ParentDashboard({ navigation }: Props) {
           <TouchableOpacity onPress={() => navigation.goBack()}>
             <Text style={styles.backArrow}>‹</Text>
           </TouchableOpacity>
-          <Text style={styles.headerTitle}>Word Tome</Text>
+          {/* Must match the ChildSwitcher entry button ("🧭 Parent Hub") and the
+              App Review notes. This header still read "Word Tome" while the
+              button that opens it was renamed — and account deletion (the
+              5.1.1(v) rejection) lives on this screen, so a reviewer hunting
+              for it followed "Parent Hub" and landed somewhere called
+              something else. */}
+          <Text style={styles.headerTitle}>Parent Hub</Text>
           <View style={styles.headerActions}>
             <TouchableOpacity
               style={styles.audioBtn}

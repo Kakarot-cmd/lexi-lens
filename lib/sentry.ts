@@ -206,6 +206,12 @@ export function initSentry(): string | null {
     replaysSessionSampleRate: 0,
     replaysOnErrorSampleRate: 0,
 
+    // Apple Guideline 1.3 (Kids Category) restricts what a kids app may send to
+    // third parties. Sentry's default for this is already false, but relying on
+    // an SDK default is not an argument you can make to a reviewer — state it.
+    // Suppresses client IP, user email/username, and request headers.
+    sendDefaultPii: false,
+
     // Minimal beforeSend — size guard + top-level scrub only.
     // Crucially, no deep object walking.
     beforeSend(event) {
