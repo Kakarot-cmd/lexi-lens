@@ -115,6 +115,19 @@ export interface ModelCallResult {
   usage?: {
     inputTokens?:  number;
     outputTokens?: number;
+    /**
+     * Gemini implicit-cache hit size (usageMetadata.cachedContentTokenCount).
+     *
+     * WHY: Gemini 2.5+/3.x implicitly caches a repeated request PREFIX and
+     * bills those tokens at a discount — but the discount is opportunistic,
+     * has a per-model minimum token floor Google does not publish for every
+     * variant, and Google's own docs disagree on whether 3.x passes the
+     * saving on at all. The ONLY way to know if it is working for us is to
+     * read this field. Undefined/absent on providers that don't report it,
+     * and 0 on a Gemini call that missed the cache — those two are different
+     * and both meaningful, so do NOT coalesce undefined to 0.
+     */
+    cachedTokens?: number;
   };
 }
 

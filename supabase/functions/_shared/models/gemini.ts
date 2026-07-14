@@ -295,8 +295,15 @@ export const geminiAdapter: ModelAdapter = {
         finishReason?: string;
       }>;
       usageMetadata?: {
-        promptTokenCount?:     number;
-        candidatesTokenCount?: number;
+        promptTokenCount?:        number;
+        candidatesTokenCount?:    number;
+        /**
+         * Implicit-cache hit size. Present (possibly 0) on Gemini 2.5+/3.x.
+         * promptTokenCount is the TOTAL input including this — cachedContent
+         * is a subset, not an addend. Billing: (prompt - cached) at full rate
+         * + cached at the discounted rate.
+         */
+        cachedContentTokenCount?: number;
       };
     };
 
@@ -334,6 +341,7 @@ export const geminiAdapter: ModelAdapter = {
       usage: {
         inputTokens:  apiResponse.usageMetadata?.promptTokenCount,
         outputTokens: apiResponse.usageMetadata?.candidatesTokenCount,
+        cachedTokens: apiResponse.usageMetadata?.cachedContentTokenCount,
       },
     };
   },

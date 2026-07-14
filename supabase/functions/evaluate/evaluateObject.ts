@@ -47,7 +47,7 @@
 
 import { CHILD_SAFETY_PREFIX } from "../_shared/childSafety.ts";
 import { ModelCallError }      from "../_shared/models/types.ts";
-import type { ModelAdapter }   from "../_shared/models/types.ts";
+import type { ModelAdapter, ModelCallResult } from "../_shared/models/types.ts";
 
 // ─── Types — public shape (unchanged for backward compat) ────────────────────
 
@@ -268,7 +268,7 @@ const FALLBACK_FAIL_FEEDBACK = "Hmm, not quite — try a different angle!";
 // where a borderline "fluffy" pillow scored 0.65 (passes:false) but the
 // model wrote kid_msg="This pillow is nice and fluffy, perfect for
 // resting your head." — header said "Almost…" while the body sentence
-// read as confirmation. The prompt change in buildSystemPrompt is the
+// read as confirmation. The prompt change in SYSTEM_PROMPT is the
 // durable solution; this prefix is the floor under that, ensuring a
 // child can never read the body as a pass when overallMatch is false.
 //
@@ -433,29 +433,53 @@ export function formatMasteryProfile(profile: MasteryEntry[] | undefined): strin
 
 // ─── System prompt (v6.0) ────────────────────────────────────────────────────
 
-function buildSystemPrompt(
-  childAge:        number,
-  questName?:      string,
-  masteryProfile?: MasteryEntry[],
-): string {
-  const masterySection = masteryProfile && masteryProfile.length > 0
-    ? `
-CHILD'S VOCABULARY MASTERY PROFILE:
-${formatMasteryProfile(masteryProfile)}
+// ─────────────────────────────────────────────────────────────────────────────
+// v7.1 — SYSTEM PROMPT IS NOW A STATIC CONSTANT. Read this before editing it.
+//
+// It used to be buildSystemPrompt(childAge, questName, masteryProfile), which
+// interpolated three per-child values directly into the system instruction. Two
+// problems with that, one architectural and one financial:
+//
+//   1. ARCHITECTURAL. Child age, quest name and mastery data are DATA, not
+//      INSTRUCTIONS. They belong in the user turn. The mastery profile was in
+//      fact already being sent twice — once here and again in buildUserText's
+//      `propertyMasteryContext` — so every scan paid for the same block of
+//      tokens twice over. That duplication is now gone: the HOW-TO-USE *rules*
+//      live here (static), the mastery *data* lives in the user message (dynamic).
+//
+//   2. FINANCIAL. Gemini 2.5+/3.x implicitly caches a repeated request PREFIX
+//      and discounts those tokens. `systemInstruction` is the natural prefix
+//      (see _shared/models/gemini.ts — it is a distinct top-level field sent
+//      ahead of `contents`). Interpolating childAge/questName/mastery made the
+//      prefix unique per child per quest, so it could never match a previous
+//      request and could never be cached. Now it is byte-identical on every
+//      call, which is the necessary condition for a cache hit.
+//
+// NOT A SUFFICIENT CONDITION — and do not assume it saved money. Implicit
+// caching is explicitly "no cost saving guarantee": it has an undocumented
+// per-model minimum token floor, needs a warm server hit within a short window
+// (so it favours dense traffic, which at launch volume we do not have), and
+// Google's own docs contradict each other on whether 3.x models pass the
+// discount on at all. The verdict is empirical, not theoretical: read
+// scan_attempts.cached_tokens. If it is 0 across a burst of scans, caching is
+// not paying and this refactor is worth exactly its architectural merit — which
+// is still positive, since it deleted a duplicated mastery block.
+//
+// RULE GOING FORWARD: nothing that varies per child, per quest, or per scan may
+// be interpolated into this constant. If you need to give the model something
+// dynamic, it goes in buildUserText().
+// ─────────────────────────────────────────────────────────────────────────────
 
-HOW TO USE THE MASTERY PROFILE:
+const SYSTEM_PROMPT = `${CHILD_SAFETY_PREFIX}
+
+You are an encouraging vocabulary coach for a child aged 5-12. The child's exact age, the quest name, and (when available) the child's vocabulary mastery profile are supplied in the user message.
+
+HOW TO USE THE MASTERY PROFILE (only when one is supplied in the user message):
 - NOVICE words: Use the simplest language in kid_msg. Be extra encouraging.
 - DEVELOPING words: Normal age-appropriate language. Affirm progress.
 - PROFICIENT words: Use slightly richer vocabulary in kid_msg.
 - EXPERT words: The child is nearly done with this word. Subtly introduce richer synonyms or related concepts in the kid_msg.
-`
-    : "";
 
-  return `${CHILD_SAFETY_PREFIX}
-
-You are an encouraging vocabulary coach for a child aged ${childAge}.
-${questName ? `Quest: "${questName}"` : ""}
-${masterySection}
 Your task: evaluate whether the detected object genuinely demonstrates each required vocabulary property, AND produce age-banded kid-voice messages for each verdict.
 
 CATEGORY PROPERTIES: a property tagged [CATEGORY] is judged differently — score whether the object BELONGS TO that noun category (is-a), not whether it has an attribute. Use everyday, child-reasonable categorization: a more specific object belongs to its broader category (a mug is a container, a bus is a vehicle, a spoon is a utensil). Score 1.0 (passes) if it is a member, 0.0 (fails) if not. A generic "object"/"thing" label, a person, a face, or a document is NOT a member of any category — score those 0.0.
@@ -526,7 +550,6 @@ CONSISTENCY (critical):
 - "Already won" words are skipped entirely — do NOT include them.
 
 Return only the JSON. No commentary, no markdown fences.`;
-}
 
 // ─── User message builder ────────────────────────────────────────────────────
 //
@@ -588,7 +611,16 @@ function buildUserText(opts: EvaluateObjectOptions): string {
 
   const failedAttempts = opts.failedAttempts ?? 0;
 
-  return `Look at the attached image. First identify what the object actually is — write the bare common noun in resolvedObjectName per the schema. Then evaluate that object — what you can SEE in the frame — against each property below. Trust your own perception, not any caption that may have arrived with the request.
+  // v7.1 — childAge and questName moved here out of the system prompt so the
+  // system prompt can stay byte-identical across every request (see the
+  // SYSTEM_PROMPT block above). Wording is preserved from the original so the
+  // model sees the same facts, just in the user turn instead of the system turn.
+  const childContext = `The child is ${opts.childAge} years old.`;
+  const questContext = opts.questName ? `\nQuest: "${opts.questName}"` : "";
+
+  return `${childContext}${questContext}
+
+Look at the attached image. First identify what the object actually is — write the bare common noun in resolvedObjectName per the schema. Then evaluate that object — what you can SEE in the frame — against each property below. Trust your own perception, not any caption that may have arrived with the request.
 
 Properties to evaluate THIS scan (one or more is enough — the quest tracks completion across multiple scans):
 ${propertyList}
@@ -785,6 +817,18 @@ export async function evaluateObject(
    * Already filtered/normalized; max 3; may be empty.
    */
   aliases:            string[];
+  /**
+   * v7.1 — token usage from the model call, forwarded verbatim to
+   * scan_attempts. `cachedTokens` is the Gemini implicit-cache hit size and is
+   * the only honest way to tell whether the static-prefix refactor is actually
+   * buying us anything. undefined = provider didn't report it; 0 = reported a
+   * cache MISS. Those mean different things — keep them distinct.
+   */
+  usage?: {
+    inputTokens?:  number;
+    outputTokens?: number;
+    cachedTokens?: number;
+  };
 }> {
 
   if (opts.requiredProperties.length === 0) {
@@ -795,15 +839,14 @@ export async function evaluateObject(
   }
 
   // ── 1. Build prompts ─────────────────────────────────────────────────────
-  const systemPrompt = buildSystemPrompt(
-    opts.childAge,
-    opts.questName,
-    opts.masteryProfile,
-  );
-  const userText = buildUserText(opts);
+  // SYSTEM_PROMPT is a static constant — deliberately. childAge, questName and
+  // the mastery profile now travel in userText. See the SYSTEM_PROMPT comment.
+  const systemPrompt = SYSTEM_PROMPT;
+  const userText     = buildUserText(opts);
 
   // ── 2. Call the model via adapter ────────────────────────────────────────
   let rawText: string;
+  let usage: ModelCallResult["usage"];
   try {
     const result = await adapter.call({
       systemPrompt,
@@ -813,6 +856,7 @@ export async function evaluateObject(
       jsonMode:    true,
     });
     rawText = result.rawText;
+    usage   = result.usage;
   } catch (e) {
     if (e instanceof ModelCallError) {
       throw new Error(`${e.modelId} API error ${e.httpStatus ?? ""}: ${e.bodyText.slice(0, 200) || e.message}`);
@@ -844,5 +888,6 @@ export async function evaluateObject(
     freshProperties:    validatedFresh,
     resolvedObjectName: parsed.resolvedObjectName,
     aliases:            parsed.aliases,
+    usage,
   };
 }

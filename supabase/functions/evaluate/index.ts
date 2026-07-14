@@ -839,6 +839,16 @@ async function logScanResult(
     claudeLatencyMs: number;
     modelId:         string;
     isPrimaryCall:   boolean;  // v6.3 — true if routed to evaluate_primary_provider
+    /**
+     * v7.1 — real token usage, straight from the provider's usageMetadata.
+     * Every per-scan cost figure we have ever quoted has been an estimate
+     * reverse-engineered from a billing dashboard. These three columns end
+     * that. cachedTokens is specifically the Gemini implicit-cache hit size:
+     * NULL = provider didn't report it, 0 = reported a cache MISS.
+     */
+    inputTokens?:    number;
+    outputTokens?:   number;
+    cachedTokens?:   number;
   },
 ): Promise<string | null> {
   try {
@@ -862,6 +872,9 @@ async function logScanResult(
       cc1_latency_ms:    opts.cc1LatencyMs  ?? null,
       cc1_skipped:       opts.cc1Skipped    ?? null,
       cc1_canonical:     opts.cc1Canonical  ?? null,
+      input_tokens:      opts.inputTokens   ?? null,
+      output_tokens:     opts.outputTokens  ?? null,
+      cached_tokens:     opts.cachedTokens  ?? null,
     }).select("id").single();
     if (error) {
       console.error("[evaluate] logScanResult INSERT error:", error.message);
@@ -1404,6 +1417,11 @@ serve(async (req: Request) => {
     freshProperties:    PropertyScoreV6[];
     resolvedObjectName: string;
     aliases:            string[];   // v6.2 — model-introspected synonyms
+    usage?: {                       // v7.1 — real token counts for scan_attempts
+      inputTokens?:  number;
+      outputTokens?: number;
+      cachedTokens?: number;
+    };
   };
 
   try {
@@ -1656,6 +1674,10 @@ serve(async (req: Request) => {
     confidence: confidence as number | undefined, ipHash,
     result: evaluation.result, claudeLatencyMs: modelLatencyMs, modelId,
     isPrimaryCall: routing.isPrimary,
+    // v7.1 — real usage from the provider. See logScanResult's doc comment.
+    inputTokens:   evaluation.usage?.inputTokens,
+    outputTokens:  evaluation.usage?.outputTokens,
+    cachedTokens:  evaluation.usage?.cachedTokens,
     ...cc1LogFields,
   });
 
