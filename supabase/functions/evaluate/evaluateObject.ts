@@ -297,12 +297,12 @@ const SAFETY_PLACEHOLDER_REASONING = /^\s*generic placeholder\.?\s*$/i;
 
 const SAFETY_REDIRECT: AgeBandedString = {
   young:
-    "Skanlore scans objects — things you can hold, like a toy, a cup, or a " +
-    "spoon! It's not for people, screens, or writing. Let's find a real " +
-    "object to scan! ✨",
+    "Skanlore scans objects you can find around you, like a toy, a cup, or a " +
+    "spoon! It's not for people (not even you!), screens, or writing. Let's " +
+    "find a real object to scan! ✨",
   older:
-    "Skanlore scans real objects you can hold or find around you — not " +
-    "people, screens, or writing. Point at an object and try again!",
+    "Skanlore scans real objects you can find around you — not people (not " +
+    "even you), screens, or writing. Point at an object and try again!",
 };
 
 function isNeutralPlaceholderVerdict(

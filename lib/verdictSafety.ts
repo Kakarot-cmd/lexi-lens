@@ -87,6 +87,6 @@ export const SAFETY_VERDICT = {
   title: "Let's scan an object!",
   message:
     "Skanlore scans objects you can find around you, like a " +
-    "toy, a cup, or a spoon. It's not for scanning people, screens, or " +
+    "toy, a cup, or a spoon. It's not for people (not even you!), screens, or " +
     "writing. Point at a real object and let's try again! ✨",
 } as const;
