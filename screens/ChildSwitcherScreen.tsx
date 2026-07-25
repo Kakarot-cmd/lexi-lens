@@ -43,6 +43,7 @@ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
 
 import { supabase, signOut }  from "../lib/supabase";
 import { ParentPinGateModal } from "../components/ParentPinGateModal";
+import { AudioSettingsSheet } from "../components/AudioSettingsSheet";
 import { useGameStore }       from "../store/gameStore";
 import { hasSeenBackstory }   from "../lib/backstoryGate";
 
@@ -359,6 +360,10 @@ export function ChildSwitcherScreen({ navigation }: Props) {
   const [parentId,   setParentId]   = useState("");
   const [parentEmail, setParentEmail] = useState("");
   const [pinVisible, setPinVisible] = useState(false);
+  // Gate-free Sound & Music access. ChildSwitcher is the un-gated landing
+  // screen every signed-in user hits, so muting must not require the parent
+  // PIN gate that fronts the Parent Hub. Opens the same consolidated sheet.
+  const [audioSheetOpen, setAudioSheetOpen] = useState(false);
 
   // v4.6 — select individual slices instead of destructuring the whole store.
   // `const { ... } = useGameStore()` subscribes this component to EVERY state
@@ -519,6 +524,15 @@ export function ChildSwitcherScreen({ navigation }: Props) {
         </View>
         <View style={styles.headerActions}>
           <TouchableOpacity
+            style={styles.audioBtn}
+            onPress={() => setAudioSheetOpen(true)}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel="Sound and music settings"
+          >
+            <Text style={styles.audioBtnText}>🎵</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
             style={styles.dashboardBtn}
             onPress={() => {
               setPendingAction({ type: "dashboard" });
@@ -592,6 +606,11 @@ export function ChildSwitcherScreen({ navigation }: Props) {
               }}
             />
 
+            <AudioSettingsSheet
+              visible={audioSheetOpen}
+              onClose={() => setAudioSheetOpen(false)}
+            />
+
             {showForm ? (
               <AddChildForm
                 onSaved={() => { setShowForm(false); fetchChildren(); }}
@@ -645,6 +664,19 @@ const styles = StyleSheet.create({
   headerSub:   { fontSize: 13, color: P.inkLight, marginTop: 2 },
 
   headerActions: { flexDirection: "row", alignItems: "center" },
+
+  audioBtn: {
+    backgroundColor:   P.parchment,
+    borderRadius:      20,
+    width:             34,
+    height:            34,
+    alignItems:        "center",
+    justifyContent:    "center",
+    borderWidth:       1,
+    borderColor:       P.warmBorder,
+    marginRight:       8,
+  },
+  audioBtnText: { fontSize: 16 },
 
   dashboardBtn: {
     backgroundColor:   P.purpleLight,

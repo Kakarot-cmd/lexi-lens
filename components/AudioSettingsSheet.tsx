@@ -28,6 +28,13 @@ import {
   setSfxEnabled,
   playSfx,
 } from '../lib/audio';
+import {
+  isLumiAudioAvailable,
+  isLumiSoundEnabled,
+  isLumiHapticsEnabled,
+  setLumiSoundEnabled,
+  setLumiHapticsEnabled,
+} from './Lumi';
 
 const P = {
   parchment:   '#f5edda',
@@ -46,16 +53,23 @@ interface Props {
 }
 
 export function AudioSettingsSheet({ visible, onClose }: Props) {
-  const audioAvailable = isGameAudioAvailable();
+  const audioAvailable     = isGameAudioAvailable();
+  const lumiAudioAvailable = isLumiAudioAvailable();
   const [musicOn, setMusicOn] = useState(true);
   const [sfxOn,   setSfxOn]   = useState(true);
+  const [lumiVoiceOn,   setLumiVoiceOn]   = useState(true);
+  const [lumiHapticsOn, setLumiHapticsOn] = useState(true);
 
-  // Re-sync from the engine each time the sheet opens.
+  // Re-sync from the engines each time the sheet opens. Reads the same
+  // in-memory prefs the audio modules hydrate from AsyncStorage at app start,
+  // so this is correct pre-auth too (init is not gated on session).
   useEffect(() => {
     if (!visible) return;
     try {
       setMusicOn(isMusicEnabled());
       setSfxOn(isSfxEnabled());
+      setLumiVoiceOn(isLumiSoundEnabled());
+      setLumiHapticsOn(isLumiHapticsEnabled());
     } catch { /* defaults */ }
   }, [visible]);
 
@@ -71,6 +85,17 @@ export function AudioSettingsSheet({ visible, onClose }: Props) {
       try { playSfx('tap'); } catch {}
       try { Haptics.selectionAsync(); } catch {}
     }
+  };
+
+  const onToggleLumiVoice = async (val: boolean) => {
+    setLumiVoiceOn(val);
+    try { await setLumiSoundEnabled(val); } catch { /* non-fatal */ }
+  };
+
+  const onToggleLumiHaptics = async (val: boolean) => {
+    setLumiHapticsOn(val);
+    try { await setLumiHapticsEnabled(val); } catch { /* non-fatal */ }
+    if (val) { try { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); } catch {} }
   };
 
   return (
@@ -94,7 +119,8 @@ export function AudioSettingsSheet({ visible, onClose }: Props) {
             </TouchableOpacity>
           </View>
           <Text style={styles.subtitle}>
-            The adventure's music bed and tap, success, and victory sounds.
+            Every sound in one place — the adventure's music bed, game effects,
+            and Lumi's own voice and buzz.
           </Text>
 
           <View style={styles.card}>
@@ -133,6 +159,41 @@ export function AudioSettingsSheet({ visible, onClose }: Props) {
             )}
           </View>
 
+          {/* ── Lumi the mascot — voice + haptics (consolidated here from the
+                 old Parent Dashboard "Lumi (Mascot)" card) ──────────────── */}
+          <Text style={styles.groupLabel}>Lumi the mascot</Text>
+          <View style={styles.card}>
+            {lumiAudioAvailable && (
+              <View style={styles.row}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.rowLabel}>Lumi's voice</Text>
+                  <Text style={styles.rowSub}>Soft chimes on greeting, success, and victory</Text>
+                </View>
+                <Switch
+                  value={lumiVoiceOn}
+                  onValueChange={onToggleLumiVoice}
+                  trackColor={{ false: P.warmBorder, true: P.amberAccent }}
+                  thumbColor={lumiVoiceOn ? P.inkBrown : P.parchment}
+                  ios_backgroundColor={P.warmBorder}
+                />
+              </View>
+            )}
+
+            <View style={[styles.row, lumiAudioAvailable && styles.rowDivider]}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.rowLabel}>Lumi's haptics</Text>
+                <Text style={styles.rowSub}>A tiny buzz on success — never on idle or fail</Text>
+              </View>
+              <Switch
+                value={lumiHapticsOn}
+                onValueChange={onToggleLumiHaptics}
+                trackColor={{ false: P.warmBorder, true: P.amberAccent }}
+                thumbColor={lumiHapticsOn ? P.inkBrown : P.parchment}
+                ios_backgroundColor={P.warmBorder}
+              />
+            </View>
+          </View>
+
           <Text style={styles.footnote}>
             Lumi's own voice has its own switch in the Lumi section below.
           </Text>
@@ -159,6 +220,7 @@ const styles = StyleSheet.create({
   title:     { fontSize: 19, fontWeight: '700', color: P.inkBrown },
   close:     { fontSize: 15, fontWeight: '700', color: P.amberAccent },
   subtitle:  { fontSize: 13, color: P.inkLight, marginTop: 4, marginBottom: 14, lineHeight: 18 },
+  groupLabel:{ fontSize: 12, fontWeight: '700', color: P.inkLight, letterSpacing: 0.4, textTransform: 'uppercase', marginTop: 18, marginBottom: 8 },
   card:      { backgroundColor: P.parchment, borderRadius: 16, borderWidth: 1, borderColor: P.warmBorder, overflow: 'hidden' },
   row:       { flexDirection: 'row', alignItems: 'center', padding: 16 },
   rowDivider:{ borderTopWidth: 1, borderTopColor: P.warmBorder },

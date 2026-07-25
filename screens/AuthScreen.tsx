@@ -55,6 +55,7 @@ import { useAuthFlow } from "../lib/authFlow";
 import { ConsentGateModal, ConsentMetadata } from "../components/ConsentGateModal";
 import { PrivacyPolicyScreen }               from "../components/PrivacyPolicyScreen";
 import { SocialAuthButtons }                 from "../components/SocialAuthButtons";
+import { AudioSettingsSheet }                from "../components/AudioSettingsSheet";
 import {
   signInWithGoogle,
   signInWithApple,
@@ -127,6 +128,10 @@ export function AuthScreen() {
 
   const [mode,    setMode]    = useState<AuthMode>("sign_in");
   const [loading, setLoading] = useState(false);
+  // Pre-auth Sound & Music access. The auth screen plays the 'menu' music bed,
+  // so parents need a mute control before signing in. Same self-contained sheet
+  // used inside the app (AsyncStorage-backed, no session required).
+  const [audioSheetOpen, setAudioSheetOpen] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
   const [success,  setSuccess]  = useState(false);
   const [emailConfirmed, setEmailConfirmed] = useState(false);
@@ -927,6 +932,17 @@ export function AuthScreen() {
           </Text>
       </KeyboardAwareScrollView>
 
+      {/* Pre-auth Sound & Music control — floats top-right over the scroll. */}
+      <TouchableOpacity
+        style={[styles.audioBtn, { top: insets.top + 8 }]}
+        onPress={() => setAudioSheetOpen(true)}
+        hitSlop={10}
+        accessibilityRole="button"
+        accessibilityLabel="Sound and music settings"
+      >
+        <Text style={styles.audioBtnText}>🎵</Text>
+      </TouchableOpacity>
+
       {/* COPPA Parental Gate + Consent.
           Serves two callers:
           1. Email sign-up  → showConsentGate, handleConsented (writes metadata
@@ -955,6 +971,12 @@ export function AuthScreen() {
       >
         <PrivacyPolicyScreen onClose={() => setShowPrivacyPolicy(false)} />
       </Modal>
+
+      {/* Sound & Music sheet (opened from the 🎵 button above) */}
+      <AudioSettingsSheet
+        visible={audioSheetOpen}
+        onClose={() => setAudioSheetOpen(false)}
+      />
     </>
   );
 }
@@ -964,6 +986,12 @@ export function AuthScreen() {
 const styles = StyleSheet.create({
   root:   { flex: 1, backgroundColor: P.cream },
   center: { alignItems: "center", justifyContent: "center", padding: 32 },
+  audioBtn: {
+    position: "absolute", right: 16, width: 40, height: 40, borderRadius: 20,
+    backgroundColor: P.parchment, borderWidth: 1, borderColor: P.warmBorder,
+    alignItems: "center", justifyContent: "center",
+  },
+  audioBtnText: { fontSize: 18 },
   scroll: { paddingHorizontal: 20 },
 
   // Wordmark

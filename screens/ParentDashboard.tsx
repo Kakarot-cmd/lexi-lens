@@ -59,14 +59,7 @@ import SiblingLeaderboard          from "../components/SiblingLeaderboard";
 import { AchievementBadgeGrid }    from "../components/AchievementBadgeGrid";
 import { AudioSettingsSheet }    from "../components/AudioSettingsSheet";
 // Lumi — settings + ambient mascot
-import {
-  LumiHUD,
-  isLumiSoundEnabled,
-  isLumiHapticsEnabled,
-  setLumiSoundEnabled,
-  setLumiHapticsEnabled,
-  isLumiAudioAvailable,
-} from "../components/Lumi";
+import { LumiHUD } from "../components/Lumi";
 // 2026-07 — badge-notification opt-in now lives here (parent-gated), not
 // as an implicit request the first time a child earns a badge mid-play.
 import {
@@ -521,50 +514,25 @@ interface LumiSettingsCardProps {
 }
 
 function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
-  const [soundOn,    setSoundOn]    = useState(false);
-  const [hapticsOn,  setHapticsOn]  = useState(true);
   const [showReplay, setShowReplay] = useState(false);
   const [badgeNotifsOn, setBadgeNotifsOn] = useState(false);
-  const audioAvailable = isLumiAudioAvailable();
 
-  // Hydrate from AsyncStorage on mount
+  // Hydrate from AsyncStorage on mount.
+  // NOTE: Lumi's voice + haptics toggles moved to the consolidated
+  // "Sound & Music" sheet (components/AudioSettingsSheet.tsx, opened from the
+  // 🎵 header button), so only badge-notification state is hydrated here now.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        // NOTE: reminder-time hydration used to live here and called
-        // setReminderHour/setReminderMinute — setters that belong to
-        // ParentDashboard, not to this component. They were never in scope, so
-        // the call threw a ReferenceError that the catch below swallowed
-        // silently. Moved to ParentDashboard's own mount effect, where the
-        // state actually lives.
-        const [s, h, b] = await Promise.all([
-          isLumiSoundEnabled(),
-          isLumiHapticsEnabled(),
-          getBadgeNotificationsEnabled(),
-        ]);
-        if (!cancelled) {
-          setSoundOn(s);
-          setHapticsOn(h);
-          setBadgeNotifsOn(b);
-        }
+        const b = await getBadgeNotificationsEnabled();
+        if (!cancelled) setBadgeNotifsOn(b);
       } catch {
         // Use defaults
       }
     })();
     return () => { cancelled = true; };
   }, []);
-
-  const onToggleSound = async (val: boolean) => {
-    setSoundOn(val);
-    try { await setLumiSoundEnabled(val); } catch { /* non-fatal */ }
-  };
-
-  const onToggleHaptics = async (val: boolean) => {
-    setHapticsOn(val);
-    try { await setLumiHapticsEnabled(val); } catch { /* non-fatal */ }
-    if (val) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-  };
 
   // 2026-07 — turning this on requests the OS notification permission right
   // here (parent-gated screen). If the OS prompt is denied, snap the switch
@@ -584,52 +552,12 @@ function LumiSettingsCard({ selectedChildName }: LumiSettingsCardProps) {
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>Lumi (Mascot)</Text>
       <Text style={styles.sectionDesc}>
-        Lumi is the spark guide who lives inside the lens. Tune her sound and feel here.
+        Lumi is the spark guide who lives inside the lens. Her voice and haptics
+        now live with all the other sound settings — tap 🎵 at the top to open
+        Sound &amp; Music.
       </Text>
 
       <View style={styles.lumiCard}>
-        {/* Haptics row — always visible (expo-haptics ships with Expo) */}
-        <View style={styles.lumiRow}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.lumiRowLabel}>Lumi haptics</Text>
-            <Text style={styles.lumiRowSub}>
-              Tiny buzz on success — no buzz on idle or fail
-            </Text>
-          </View>
-          <Switch
-            value={hapticsOn}
-            onValueChange={onToggleHaptics}
-            trackColor={{ false: P.warmBorder, true: P.amberAccent }}
-            thumbColor={hapticsOn ? P.inkBrown : P.parchment}
-            ios_backgroundColor={P.warmBorder}
-          />
-        </View>
-
-        {/* Sound row — only if expo-audio available */}
-        {audioAvailable && (
-          <View style={[styles.lumiRow, styles.lumiRowDivider]}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.lumiRowLabel}>Lumi sound</Text>
-              <Text style={styles.lumiRowSub}>
-                Soft chimes on greeting, success, and victory
-              </Text>
-            </View>
-            <Switch
-              value={soundOn}
-              onValueChange={onToggleSound}
-              trackColor={{ false: P.warmBorder, true: P.amberAccent }}
-              thumbColor={soundOn ? P.inkBrown : P.parchment}
-              ios_backgroundColor={P.warmBorder}
-            />
-          </View>
-        )}
-
-        {!audioAvailable && (
-          <Text style={styles.lumiNote}>
-            Sound effects ship in a future update. Haptics work today.
-          </Text>
-        )}
-
         {/* v3.1 — Replay Lumi's story.
             Always rendered (no audio dep). Sits below sound/haptics
             because it's a less-frequent action than the toggles. */}
