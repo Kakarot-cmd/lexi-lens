@@ -34,6 +34,7 @@ import {
   isLumiHapticsEnabled,
   setLumiSoundEnabled,
   setLumiHapticsEnabled,
+  playLumiGreeting,
 } from './Lumi';
 
 const P = {
@@ -90,6 +91,10 @@ export function AudioSettingsSheet({ visible, onClose }: Props) {
   const onToggleLumiVoice = async (val: boolean) => {
     setLumiVoiceOn(val);
     try { await setLumiSoundEnabled(val); } catch { /* non-fatal */ }
+    // Preview on enable — same idea as music resuming and SFX playing a tap,
+    // so the parent hears what "Lumi's voice" sounds like. playLumiGreeting()
+    // is gated on the just-set sound flag, so it only fires when turning on.
+    if (val) { try { playLumiGreeting(); } catch {} }
   };
 
   const onToggleLumiHaptics = async (val: boolean) => {
@@ -193,10 +198,6 @@ export function AudioSettingsSheet({ visible, onClose }: Props) {
               />
             </View>
           </View>
-
-          <Text style={styles.footnote}>
-            Lumi's own voice has its own switch in the Lumi section below.
-          </Text>
         </Pressable>
       </Pressable>
     </Modal>
