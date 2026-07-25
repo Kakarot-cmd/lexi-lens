@@ -64,6 +64,7 @@
 import { useState, useCallback, useRef } from "react";
 import * as FileSystem from "expo-file-system";
 import { compressImageToBase64 } from "../lib/imageCompress";
+import { isSafetyVerdict } from "../lib/verdictSafety";
 // EncodingType is not re-exported from expo-file-system 19.x namespace;
 // use the string literal "base64" which the API accepts directly.
 import { supabase } from "../lib/supabase";
@@ -126,6 +127,10 @@ export interface EvaluationResult {
   childFeedback:      string;
   nudgeHint?:         string | null;
   xpAwarded:          number;
+  /** Neutral safety verdict (person/document/screen/etc.). Server may set this
+   *  explicitly; the client also detects it structurally via isSafetyVerdict()
+   *  so the redirect works from an OTA update alone. */
+  safetyBlock?:       boolean;
   /** v3.4 — true when result was served from Redis cache */
   _cacheHit?:         boolean;
   /** v3.5 — rate-limit telemetry from Edge Function */
@@ -690,7 +695,12 @@ export function useLexiEvaluate(): UseLexiEvaluateReturn {
       // used client-side for the retirement synonym fetch, and currentMastery
       // for the optimistic local calc. Runs in parallel so the verdict isn't
       // delayed by N sequential round-trips.
-      const evaluatedWords = evaluationResult.properties ?? [];
+      // A neutral safety verdict (person/document/screen/etc.) is NOT a scoring
+      // event: the "properties" are placeholders, so writing mastery here would
+      // record a false failed attempt against every real quest word. Skip it.
+      const evaluatedWords = isSafetyVerdict(evaluationResult)
+        ? []
+        : (evaluationResult.properties ?? []);
       if (evaluatedWords.length > 0) {
         const results = await Promise.all(
           evaluatedWords.map((prop) => {

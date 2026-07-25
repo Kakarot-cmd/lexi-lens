@@ -54,6 +54,7 @@ import type { MasteryUpdateResult } from "../services/MasteryService";
 import { supabase } from "../lib/supabase";
 import { ENV } from "../lib/env";
 import { addGameBreadcrumb, captureVerdictReport } from "../lib/sentry";
+import { isSafetyVerdict, SAFETY_VERDICT } from "../lib/verdictSafety";
 
 interface VerdictCardProps {
   status:         Extract<EvaluateStatus, "match" | "no-match" | "error">;
@@ -424,6 +425,10 @@ export function VerdictCard({
   const somethingFound = passingProps.length > 0;
   const totalXpEarned  = result?.xpAwarded ?? 0;
 
+  // Neutral safety verdict (person / document / screen / etc.): rendered as a
+  // distinct, non-shaming redirect — never as a near-miss with placeholder rows.
+  const isSafety = isSafetyVerdict(result);
+
   return (
     <Animated.View
       style={[
@@ -464,8 +469,26 @@ export function VerdictCard({
             </>
           )}
 
+          {/* ── Neutral safety verdict (person/document/screen/etc.) ── */}
+          {result && (status === "match" || status === "no-match") && isSafety && (
+            <>
+              <View style={styles.header}>
+                <Text style={styles.headerEmoji}>{SAFETY_VERDICT.emoji}</Text>
+                <Text style={[styles.headerTitle, { color: P.textPrimary }]}>
+                  {SAFETY_VERDICT.title}
+                </Text>
+              </View>
+              <View style={styles.feedbackBox}>
+                <Text style={styles.feedbackText}>{SAFETY_VERDICT.message}</Text>
+              </View>
+              <TouchableOpacity style={styles.retryBtn} onPress={onTryAgain}>
+                <Text style={styles.retryBtnText}>Try another object</Text>
+              </TouchableOpacity>
+            </>
+          )}
+
           {/* ── Has result (match or no-match) ──────────────── */}
-          {result && (status === "match" || status === "no-match") && (
+          {result && (status === "match" || status === "no-match") && !isSafety && (
             <>
               {/* Header */}
               <View style={styles.header}>

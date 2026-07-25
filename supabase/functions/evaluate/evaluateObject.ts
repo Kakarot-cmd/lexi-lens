@@ -79,6 +79,9 @@ export interface EvaluationResult {
   childFeedback:      string;
   nudgeHint?:         string | null;
   xpAwarded:          number;
+  /** Neutral safety verdict (person/document/screen/etc.). When true the client
+   *  shows a fixed redirect and skips property rows, XP, and mastery writes. */
+  safetyBlock?:       boolean;
 }
 
 // ─── Types — v6 internal shape (kid_msg, nudge per property) ─────────────────
@@ -280,13 +283,63 @@ const FALLBACK_FAIL_FEEDBACK = "Hmm, not quite — try a different angle!";
 const NEAR_MISS_PREFIX = "Almost — ";
 const SOFT_OPENERS = /^(almost|hmm|close|nice try|oops|not quite)\b/i;
 
+// ─── Neutral safety verdict detection ────────────────────────────────────────
+//
+// When the CHILD_SAFETY_PREFIX image fail-safe fires (person, face, hand,
+// document, screen, ID, etc.), the model returns resolvedObjectName="object"
+// and sets EVERY property to the placeholder { score:0, passes:false,
+// reasoning:"Generic placeholder." }. That is a content boundary, not a scored
+// near-miss, so we collapse it to ONE clear redirect, drop the placeholder
+// rows, and flag it for the client. Detection mirrors the client sniff in
+// lib/verdictSafety.ts — keep the two in sync.
+const SAFETY_GENERIC_NAMES = new Set(["", "object", "unknown", "thing", "item"]);
+const SAFETY_PLACEHOLDER_REASONING = /^\s*generic placeholder\.?\s*$/i;
+
+const SAFETY_REDIRECT: AgeBandedString = {
+  young:
+    "Skanlore scans objects — things you can hold, like a toy, a cup, or a " +
+    "spoon! It's not for people, screens, or writing. Let's find a real " +
+    "object to scan! ✨",
+  older:
+    "Skanlore scans real objects you can hold or find around you — not " +
+    "people, screens, or writing. Point at an object and try again!",
+};
+
+function isNeutralPlaceholderVerdict(
+  resolvedName: string,
+  properties:   PropertyScoreV6[],
+): boolean {
+  const name = (resolvedName ?? "").trim().toLowerCase();
+  if (!SAFETY_GENERIC_NAMES.has(name)) return false;
+  if (properties.length === 0) return false;
+  return properties.every(
+    (p) =>
+      p.passes === false &&
+      typeof p.reasoning === "string" &&
+      SAFETY_PLACEHOLDER_REASONING.test(p.reasoning),
+  );
+}
+
 function joinSentences(sentences: string[]): string {
   // Trim each, drop empties, join with single space. The model is prompted
   // to make per-property kid_msg strings that read naturally on their own
   // and chain naturally with siblings, so a space-join is sufficient.
+  //
+  // Dedupe exact repeats (case-insensitive, first occurrence kept). Two
+  // properties can legitimately carry the same short kid_msg — and the safety
+  // fail-safe deliberately sets an identical placeholder on every property —
+  // in which case repeating it verbatim reads as a stutter, never as extra
+  // information. This is a floor; the safety case is handled distinctly below.
+  const seen = new Set<string>();
   return sentences
     .map((s) => s.trim())
     .filter((s) => s.length > 0)
+    .filter((s) => {
+      const key = s.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
     .join(" ");
 }
 
@@ -368,6 +421,23 @@ export function composeFinalResult(opts: {
   xpRates?:             XpRates;
 }): EvaluationResult {
   const all          = [...opts.freshProperties, ...opts.cachedProperties];
+
+  // Neutral safety verdict: collapse to a single clear redirect, no rows, no XP.
+  const resolvedForSafety = (opts.resolvedName && opts.resolvedName.length > 0)
+    ? opts.resolvedName
+    : opts.detectedLabel;
+  if (isNeutralPlaceholderVerdict(resolvedForSafety, all)) {
+    return {
+      resolvedObjectName: "object",
+      properties:         [],
+      overallMatch:       false,
+      childFeedback:      SAFETY_REDIRECT[ageBandFor(opts.childAge)],
+      nudgeHint:          null,
+      xpAwarded:          0,
+      safetyBlock:        true,
+    };
+  }
+
   const overallMatch = all.some((p) => p.passes);
 
   const childFeedback = composeChildFeedback(

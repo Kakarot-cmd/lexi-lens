@@ -145,7 +145,10 @@ WHAT IS NEVER SENT TO THE AI PROVIDER:
 • The parent's email address or any account information
 • Device identifiers or location
 
-The camera frame is processed in real time and is not stored on our servers or written to your photo library. The provider's response (a structured JSON verdict) is returned immediately and displayed to the child. Google processes these requests under Google's API terms (policies.google.com/privacy); Anthropic, when used, processes requests under its own privacy policy (anthropic.com/privacy). Data submitted under our paid API agreements is not used to train either provider's models.`,
+The camera frame is processed in real time and is not stored on our servers or written to your photo library. The provider's response (a structured JSON verdict) is returned immediately and displayed to the child. Google processes these requests under Google's API terms (policies.google.com/privacy); Anthropic, when used, processes requests under its own privacy policy (anthropic.com/privacy). Data submitted under our paid API agreements is not used to train either provider's models.
+
+IMAGES OF PEOPLE, DOCUMENTS, OR SCREENS:
+Skanlore is built to scan everyday objects only. If a scan's main subject is a person (including the child), a face or body, another child, or a document, ID card, book, receipt, or any screen, the app does not evaluate it. The AI is instructed to return a neutral "let's scan a real object" response without describing, naming, or identifying what it saw — the child is simply guided back to scanning an object. This safeguard runs on every scan.`,
   },
   {
     id:    "sharing",
