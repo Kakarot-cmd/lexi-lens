@@ -1,0 +1,31 @@
+# supabase/config.toml
+# ─────────────────────────────────────────────────────────────────────────────
+# Supabase CLI project config. Read on EVERY `supabase functions deploy` —
+# including mass deploys with no function names (your usual workflow). This is
+# the single source of truth for per-function `verify_jwt`.
+#
+# WHY THIS FILE EXISTS
+#   Without a declared entry, a function deploys with the CLI default
+#   verify_jwt = true. RevenueCat cannot send a Supabase-signed JWT, so the
+#   webhook at verify_jwt = true is rejected with 401 before its code runs —
+#   a SILENT revenue outage (paid conversions stop syncing to the DB).
+#
+#   The revenuecat-webhook function authenticates itself against
+#   REVENUECAT_WEBHOOK_SECRET, so turning off the platform JWT gate for it is
+#   safe. It is the ONLY function that should have verify_jwt = false.
+#
+# RULE GOING FORWARD
+#   If any function ever needs verify_jwt = false, declare it HERE — never as a
+#   one-off `--no-verify-jwt` flag or dashboard toggle, both of which your next
+#   mass deploy overwrites.
+#
+# Everything not listed below correctly defaults to verify_jwt = true:
+#   • app-called functions (evaluate, generate-quest, export-word-tome,
+#     report-verdict, cancel-deletion, request-deletion) — the client sends a
+#     valid JWT via functions.invoke(), so the gate passes.
+#   • internal/cron functions (classify-words, retire-word, ensure-daily-quest,
+#     record-consent, cc1) — they RELY on the gate; leaving them at true is
+#     what keeps them from being callable by anyone.
+
+[functions.revenuecat-webhook]
+verify_jwt = false
